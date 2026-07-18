@@ -30,6 +30,9 @@ fn make_tss_descriptor(addr: u64, limit: u32) -> (u64, u64) {
 }
 
 static mut DF_STACK: [u8; 4096] = [0; 4096];
+static mut TIMER_STACK: [u8; 4096] = [0; 4096];
+static mut SYSCALL_STACK: [u8; 4096] = [0; 4096];
+static mut PF_STACK: [u8; 4096] = [0; 4096];
 static mut GDT: [u64; 7] = [
     0,                              // 0x00: null
     0x00209A0000000000,             // 0x08: ring0 code (64-bit, DPL=0)
@@ -56,7 +59,14 @@ pub fn set_tss_rsp0(rsp0: u64) {
 pub fn init() {
     unsafe {
         let df_top = DF_STACK.as_ptr() as u64 + DF_STACK.len() as u64;
-        TSS.ist[0] = df_top;
+        let timer_top = TIMER_STACK.as_ptr() as u64 + TIMER_STACK.len() as u64;
+        let syscall_top = SYSCALL_STACK.as_ptr() as u64 + SYSCALL_STACK.len() as u64;
+        let pf_top = PF_STACK.as_ptr() as u64 + PF_STACK.len() as u64;
+        
+        TSS.ist[0] = df_top;        // IST 1: Double Fault
+        TSS.ist[1] = timer_top;     // IST 2: Timer
+        TSS.ist[2] = syscall_top;   // IST 3: Syscall
+        TSS.ist[3] = pf_top;        // IST 4: Page Fault
 
         let tss_addr = &TSS as *const _ as u64;
         let (tsk_low, tss_high) = make_tss_descriptor(tss_addr, size_of::<TaskStateSegment>() as u32 - 1);

@@ -1,4 +1,5 @@
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PAGE_SIZE_4K: u64 = 4096;
 pub const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
@@ -15,6 +16,8 @@ pub const PTE_HUGE: u64 = 1 << 7;
 pub const PTE_GLOBAL: u64 = 1 << 8;
 pub const PTE_NO_EXECUTE: u64 = 1 << 63;
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C, align(4096))]
 pub struct PageTable([u64; 512]);
@@ -134,6 +137,68 @@ impl PageTableManager {
             new_pt as *mut PageTable
         };
 
+        let pte = unsafe { (*pt).0[vpn[3]] };
+        if pte & PTE_PRESENT != 0 {
+            return Err("already mapped");
+        }
+        unsafe { (*pt).0[vpn[3]] = phys | flags | PTE_PRESENT; }
+        Ok(())
+    }
+
+    // Map a page in kernel page tables (without PTE_USER on intermediate tables)
+    pub fn map_kernel_page(virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+        let vpn = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+
+        let pml4 = KERNEL_PML4.load(Ordering::Relaxed) as *mut PageTable;
+        if pml4.is_null() {
+            return Err("kernel PML4 not set");
+        }
+
+        // PML4
+        let pml4e = unsafe { (*pml4).0[vpn[0]] };
+        let pdpt = if pml4e & PTE_PRESENT != 0 {
+            (pml4e & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PDPT")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pml4e_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
+            unsafe { (*pml4).0[vpn[0]] = pml4e_val; }
+            new_pt as *mut PageTable
+        };
+
+        // PDPT
+        let pdpte = unsafe { (*pdpt).0[vpn[1]] };
+        let pd = if pdpte & PTE_PRESENT != 0 {
+            (pdpte & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PD")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pdpte_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
+            unsafe { (*pdpt).0[vpn[1]] = pdpte_val; }
+            new_pt as *mut PageTable
+        };
+
+        // PD
+        let pde = unsafe { (*pd).0[vpn[2]] };
+        let pt = if pde & PTE_PRESENT != 0 {
+            (pde & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PT")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
+            unsafe { (*pd).0[vpn[2]] = pde_val; }
+            new_pt as *mut PageTable
+        };
+
+        // PT
         let pte = unsafe { (*pt).0[vpn[3]] };
         if pte & PTE_PRESENT != 0 {
             return Err("already mapped");
@@ -288,6 +353,10 @@ impl PageTableManager {
     }
 }
 
+pub fn kernel_pml4() -> u64 {
+    KERNEL_PML4.load(Ordering::SeqCst)
+}
+
 static mut PT_MGR: PageTableManager = PageTableManager::new();
 
 pub fn pt_mgr() -> &'static mut PageTableManager {
@@ -310,6 +379,7 @@ pub fn init() {
     unsafe {
         let alloc = &mut *crate::memory::allocator();
         PT_MGR.kernel_pml4 = alloc.alloc(0).unwrap();
+        KERNEL_PML4.store(PT_MGR.kernel_pml4, Ordering::SeqCst);
         let pml4 = unsafe { &mut *(PT_MGR.kernel_pml4 as *mut PageTable) };
         pml4.clear();
 

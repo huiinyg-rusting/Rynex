@@ -23,6 +23,10 @@ mod pit;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 
+extern "C" {
+    fn syscall_entry();
+}
+
 core::arch::global_asm!(include_str!("context_switch.asm"));
 
 #[no_mangle]
@@ -44,7 +48,6 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
 
     pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
     pic::mask_all();
-    idt::register_irq(task::TIMER_IRQ_VECTOR, task::timer_interrupt_handler as u64);
     pic::unmask(0);
     vga::write_str("PIC: OK\n");
     serial::write_str("PIC: OK\n");
@@ -53,18 +56,31 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     vga::write_str("PIT: OK\n");
     serial::write_str("PIT: OK\n");
 
-    memory::init(_info);
+memory::init(_info);
     // Enable NX (No-Execute) in EFER MSR and setup syscall MSRs
     unsafe {
-        let mut efer: u64;
-        // Enable NXE (bit 11)
+        // Read current EFER
+        let mut efer: u64 = 0;
+        let mut efer_low: u32 = 0;
+        let mut efer_high: u32 = 0;
         core::arch::asm!(
             "mov ecx, 0xC0000080",
             "rdmsr",
-            "or eax, 0x800",
+            out("eax") efer_low,
+            out("edx") efer_high,
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
+        efer = ((efer_high as u64) << 32) | (efer_low as u64);
+        // Enable NXE (bit 11)
+        efer |= 0x800;
+        let efer_low = efer as u32;
+        let efer_high = (efer >> 32) as u32;
+        core::arch::asm!(
+            "mov ecx, 0xC0000080",
             "wrmsr",
-            inout("eax") efer as u32,
-            inout("edx") (efer >> 32) as u32,
+            in("eax") efer_low,
+            in("edx") efer_high,
             out("ecx") _,
             options(nostack, preserves_flags)
         );
@@ -82,8 +98,8 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
         core::arch::asm!(
             "mov ecx, 0xC0000082",
             "wrmsr",
-            in("eax") (task::syscall_entry as u64 & 0xFFFFFFFF) as u32,
-            in("edx") (task::syscall_entry as u64 >> 32) as u32,
+            in("eax") (syscall_entry as u64 & 0xFFFFFFFF) as u32,
+            in("edx") (syscall_entry as u64 >> 32) as u32,
             options(nostack, preserves_flags)
         );
         // FMASK: flags to clear on syscall (clear IF)
@@ -95,12 +111,15 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
             options(nostack, preserves_flags)
         );
         // Enable SCE bit (bit 0) in EFER
-        efer |= 1;
+        let mut efer2 = efer | 1;
+        let efer2_low = efer2 as u32;
+        let efer2_high = (efer2 >> 32) as u32;
         core::arch::asm!(
             "mov ecx, 0xC0000080",
             "wrmsr",
-            in("eax") efer as u32,
-            in("edx") (efer >> 32) as u32,
+            in("eax") efer2_low,
+            in("edx") efer2_high,
+            out("ecx") _,
             options(nostack, preserves_flags)
         );
     }
