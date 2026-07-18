@@ -35,3 +35,9 @@ pub fn init() {
 
     idt.load();
 }
+
+pub fn register_irq(vector: u8, handler_addr: u64) {
+    unsafe {
+        IDT[vector].set_handler_addr(x86_64::VirtAddr::new(handler_addr));
+    }
+}

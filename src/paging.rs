@@ -270,6 +270,96 @@ pub fn init() {
     crate::serial::write_str("PAGING: init done\n");
 }
 
+pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
+    let vpn = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+
+    let pml4 = pt_mgr().kernel_pml4() as *const PageTable;
+    let pml4e = unsafe { (*pml4).0[vpn[0]] };
+    if pml4e & PTE_PRESENT == 0 { return None; }
+
+    let pdpt = (pml4e & PTE_ADDR_MASK) as *const PageTable;
+    let pdpte = unsafe { (*pdpt).0[vpn[1]] };
+    if pdpte & PTE_PRESENT == 0 { return None; }
+
+    let pd = (pdpte & PTE_ADDR_MASK) as *const PageTable;
+    let pde = unsafe { (*pd).0[vpn[2]] };
+    if pde & PTE_PRESENT == 0 { return None; }
+    if pde & PTE_HUGE != 0 { return None; }
+
+    let pt = (pde & PTE_ADDR_MASK) as *const PageTable;
+    let pte = unsafe { &(*pt).0[vpn[3]] };
+    if *pte & PTE_PRESENT == 0 { return None; }
+
+    let pt_mut = (pde & PTE_ADDR_MASK) as *mut PageTable;
+    Some(unsafe { &mut (*pt_mut).0[vpn[3]] })
+}
+
+pub fn is_user_addr(addr: u64) -> bool {
+    addr < 0x0000_8000_0000_0000
+}
+
+pub fn cow_remap(virt: u64) -> bool {
+    let pte = match get_pte(virt) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if *pte & PTE_PRESENT == 0 { return false; }
+    if *pte & PTE_WRITABLE != 0 { return false; }
+
+    let old_phys = *pte & PTE_ADDR_MASK;
+    let flags = *pte & !PTE_ADDR_MASK;
+
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let new_phys = match alloc.alloc(0) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Copy old page content
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            old_phys as *const u8,
+            new_phys as *mut u8,
+            4096,
+        );
+    }
+
+    // Update PTE: new phys + writable
+    *pte = new_phys | flags | PTE_WRITABLE;
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }
+    true
+}
+
+pub fn page_fault_resolve(frame: &x86_64::structures::idt::InterruptStackFrame,
+                          code: x86_64::structures::idt::PageFaultErrorCode, cr2: u64) -> bool {
+    let cpl = frame.code_segment.bits() & 3;
+    let is_write = code.contains(x86_64::structures::idt::PageFaultErrorCode::CAUSED_BY_WRITE);
+    let is_viol = code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION);
+
+    // Write to a read-only user page → COW
+    if cpl == 3 && is_write && is_viol {
+        if cow_remap(cr2) {
+            crate::serial::write_str("  COW: copied page for 0x");
+            crate::serial::write_hex(cr2);
+            crate::serial::write_str("\n");
+            return true;
+        }
+    }
+
+    // User page not present → TODO: demand paging
+    if cpl == 3 && !is_viol {
+        return false;
+    }
+
+    false
+}
+
 pub fn test() {
     let mgr = pt_mgr();
 
