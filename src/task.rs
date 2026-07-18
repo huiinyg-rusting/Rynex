@@ -310,18 +310,14 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
 pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
     core::arch::naked_asm!(
         "cld",
-        // Switch to kernel CR3 immediately so we can access kernel data
-        "mov rax, cr3",
-        "push rax",           // save user CR3
-        "mov rax, {kernel_pml4}",
-        "mov cr3, rax",       // switch to kernel CR3
-
-        // Save ALL registers including the interrupt frame
-        // The interrupt frame (RIP, CS, RFLAGS, RSP, SS) is already on stack from CPU
-        // We need to save it along with GP registers to the current task
+        // With IST, CPU already switched to kernel stack and pushed interrupt frame
+        // Frame on stack (top to bottom = low to high addr):
+        //   SS, RSP, RFLAGS, CS, RIP (pushed by CPU)
+        
+        // Save RBP as frame pointer
         "push rbp",
-        "mov rbp, rsp",       // RBP = frame pointer to interrupt frame
-
+        "mov rbp, rsp",       // RBP points to saved RBP; interrupt frame at RBP+8
+        
         // Save GP registers (except RSP which is in frame)
         "push rax",
         "push rbx",
@@ -337,26 +333,24 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "push r13",
         "push r14",
         "push r15",
-
-        // RBP now points to the interrupt frame (RIP at [rbp], CS at [rbp+8], etc.)
-        // Save the interrupt frame to current task
-        "mov rdi, rbp",       // RDI = pointer to interrupt frame
+        
+        // RBP points to saved RBP; interrupt frame is at RBP+8
+        // Frame layout at RBP+8: [SS] [RSP] [RFLAGS] [CS] [RIP]
+        "mov rdi, rbp",
+        "add rdi, 8",         // RDI = pointer to interrupt frame (SS at [rdi])
         "call {save_context}",
-
-        // Switch CR3 back to user (will be switched again after schedule)
-        "pop rax",
-        "mov cr3, rax",
-
-        // Call scheduler to pick next task and switch context
+        
+        // Call scheduler - keep kernel CR3 active for timer_schedule
         "call {timer_schedule}",
-
-        // timer_schedule returns the new task's kernel stack pointer in RAX
-        // It also switches CR3 to the new task's page tables
+        
+        // timer_schedule returns new task's stack pointer in RAX
+        // (already switched CR3 to new task's page tables)
         "mov rsp, rax",
-
+        
         // Restore registers from new task
         "pop r15",
         "pop r14",
+        "pop r13",
         "pop r13",
         "pop r12",
         "pop r11",
@@ -369,14 +363,13 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rcx",
         "pop rbx",
         "pop rax",
-
-        // The interrupt frame (RIP, CS, RFLAGS, RSP, SS) is now at top of stack
+        
+        // The interrupt frame (SS, RSP, RFLAGS, CS, RIP) is now at top of stack
         // iretq will restore everything and return to the new task
         "iretq",
-
+        
         save_context = sym save_interrupt_context,
         timer_schedule = sym timer_schedule,
-        kernel_pml4 = sym crate::paging::KERNEL_PML4,
     )
 }
 
@@ -398,54 +391,68 @@ extern "C" fn resume_switch() -> ! {
 }
 
 #[no_mangle]
+pub extern "C" fn save_interrupt_context(frame: *mut u64) {
+    // `frame` points to the interrupt frame on the stack (user SS at offset 0).
+    // The GP registers were pushed before the frame, so they're at negative offsets.
+    // Stack layout at entry to this function (from frame = RBP+8):
+    //   frame[-15] = RAX, frame[-14] = RBX, frame[-13] = RCX, frame[-12] = RDX,
+    //   frame[-11] = RSI, frame[-10] = RDI, frame[-9] = RBP, frame[-8] = R8,
+    //   frame[-7] = R9, frame[-6] = R10, frame[-5] = R11, frame[-4] = R12,
+    //   frame[-3] = R13, frame[-2] = R14, frame[-1] = R15
+    //   frame[0] = SS, frame[1] = RSP, frame[2] = RFLAGS, frame[3] = CS, frame[4] = RIP
+    unsafe {
+        let current = CURRENT_TASK.load(Ordering::SeqCst);
+        if current == 0 {
+            return;
+        }
+        let task = &mut TASKS[(current % MAX_TASKS as u64) as usize];
+        let regs = &mut task.regs;
+
+        // GP registers are at frame[-15] .. frame[-1]
+        let gp = frame.sub(15);
+        regs.rax = *gp.add(0);
+        regs.rbx = *gp.add(1);
+        regs.rcx = *gp.add(2);
+        regs.rdx = *gp.add(3);
+        regs.rsi = *gp.add(4);
+        regs.rdi = *gp.add(5);
+        regs.rbp = *gp.add(6);
+        regs.r8  = *gp.add(7);
+        regs.r9  = *gp.add(8);
+        regs.r10 = *gp.add(9);
+        regs.r11 = *gp.add(10);
+        regs.r12 = *gp.add(11);
+        regs.r13 = *gp.add(12);
+        regs.r14 = *gp.add(13);
+        regs.r15 = *gp.add(14);
+
+        // Interrupt frame at frame[0..4]: SS, RSP, RFLAGS, CS, RIP
+        regs.ss    = *frame.add(0);
+        regs.rsp   = *frame.add(1);
+        regs.rflags = *frame.add(2);
+        regs.cs    = *frame.add(3);
+        regs.rip   = *frame.add(4);
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn inc_ticks() {
     crate::pit::TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[no_mangle]
-pub extern "C" fn timer_schedule(saved: *mut u64) -> u64 {
+pub extern "C" fn timer_schedule() -> u64 {
     crate::pic::send_eoi(0);
 
     let current = CURRENT_TASK.load(Ordering::SeqCst);
     if current == 0 {
-        return saved as u64;
+        return 0;
     }
 
     let task = unsafe { &mut TASKS[(current % MAX_TASKS as u64) as usize] };
 
     if task.state != TaskState::Running {
-        return saved as u64;
-    }
-
-    // `saved` points at the first pushed GP register (rax). The 15 GP registers
-    // occupy saved[0..15]; the 5-word hardware frame follows at saved[15..20]
-    // (rip, cs, rflags, rsp, ss). Save the full interrupted context.
-    unsafe {
-        let s = saved;
-        let regs = &mut task.regs;
-        regs.rax = *s.add(0);
-        regs.rcx = *s.add(1);
-        regs.rdx = *s.add(2);
-        regs.rbx = *s.add(3);
-        regs.rbp = *s.add(4);
-        regs.rsi = *s.add(5);
-        regs.rdi = *s.add(6);
-        regs.r8  = *s.add(7);
-        regs.r9  = *s.add(8);
-        regs.r10 = *s.add(9);
-        regs.r11 = *s.add(10);
-        regs.r12 = *s.add(11);
-        regs.r13 = *s.add(12);
-        regs.r14 = *s.add(13);
-        regs.r15 = *s.add(14);
-        regs.rip    = *s.add(15);
-        regs.cs     = *s.add(16);
-        regs.rflags = *s.add(17);
-        let is_user = (regs.cs & 3) != 0;
-        // For a user interrupt the true (user) RSP lives in the frame; for a
-        // kernel interrupt the resumption RSP is just past the 3-word frame.
-        regs.rsp = if is_user { *s.add(18) } else { (saved as u64) + 18 * 8 };
-        regs.ss  = if is_user { *s.add(19) } else { KERNEL_DATA_SELECTOR };
+        return task.kernel_stack;
     }
 
     let mut next_id = 0;
@@ -459,7 +466,7 @@ pub extern "C" fn timer_schedule(saved: *mut u64) -> u64 {
     }
 
     if next_id == 0 || next_id == current {
-        return saved as u64;
+        return task.kernel_stack;
     }
 
     task.state = TaskState::Ready;
@@ -467,22 +474,63 @@ pub extern "C" fn timer_schedule(saved: *mut u64) -> u64 {
     next_task.state = TaskState::Running;
     CURRENT_TASK.store(next_id, Ordering::SeqCst);
 
-    SWITCH_TARGET_ID.store(next_id, Ordering::SeqCst);
-    unsafe {
-        *saved.add(15) = resume_switch as *const () as u64;
-        let cs = *saved.add(16);
-        if cs & 3 != 0 {
-            // Returning to ring0 from a ring3 interrupt: the hardware frame
-            // still carries the user SS (RPL=3) and user RSP; rewrite them
-            // to valid ring0 values so the iretq enters resume_switch on a
-            // kernel stack.
-            *saved.add(16) = KERNEL_CODE_SELECTOR;
-            *saved.add(18) = next_task.kernel_stack; // RSP -> next task's kernel stack
-            *saved.add(19) = KERNEL_DATA_SELECTOR;
-        }
-    }
+    // Switch page tables
+    pt_mgr().switch_to(next_task.pml4);
+    // Update TSS for the new task
+    crate::gdt::set_tss_rsp0(next_task.kernel_stack);
 
-    saved as u64
+    // Build the full context frame on the new task's kernel stack
+    // Stack layout (growing down, RSP points to lowest address):
+    // offset 0:   R15
+    // offset 8:   R14
+    // offset 16:  R13
+    // offset 24:  R12
+    // offset 32:  R11
+    // offset 40:  R10
+    // offset 48:  R9
+    // offset 56:  R8
+    // offset 64:  RDI
+    // offset 72:  RSI
+    // offset 80:  RDX
+    // offset 88:  RCX
+    // offset 96:  RBX
+    // offset 104: RAX
+    // offset 112: RIP
+    // offset 120: CS
+    // offset 128: RFLAGS
+    // offset 136: RSP
+    // offset 144: SS
+    // Total: 19 qwords = 152 bytes
+    // RSP will point to offset 0 (R15) after setup
+    let stack_ptr = next_task.kernel_stack;
+    unsafe {
+        let sp = (stack_ptr as *mut u64).sub(19); // 14 GP regs + 5 iretq frame = 19 qwords
+        
+        // GP registers in pop order (handler pops: R15, R14, ..., RAX)
+        *sp.add(0)  = next_task.regs.r15;
+        *sp.add(1)  = next_task.regs.r14;
+        *sp.add(2)  = next_task.regs.r13;
+        *sp.add(3)  = next_task.regs.r12;
+        *sp.add(4)  = next_task.regs.r11;
+        *sp.add(5)  = next_task.regs.r10;
+        *sp.add(6)  = next_task.regs.r9;
+        *sp.add(7)  = next_task.regs.r8;
+        *sp.add(8)  = next_task.regs.rdi;
+        *sp.add(9)  = next_task.regs.rsi;
+        *sp.add(10) = next_task.regs.rdx;
+        *sp.add(11) = next_task.regs.rcx;
+        *sp.add(12) = next_task.regs.rbx;
+        *sp.add(13) = next_task.regs.rax;
+        
+        // iretq frame (popped by iretq instruction)
+        *sp.add(14) = next_task.regs.rip;
+        *sp.add(15) = next_task.regs.cs;
+        *sp.add(16) = next_task.regs.rflags;
+        *sp.add(17) = next_task.regs.rsp;
+        *sp.add(18) = next_task.regs.ss;
+        
+        sp as u64
+    }
 }
 
 #[no_mangle]
