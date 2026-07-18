@@ -89,6 +89,59 @@ impl PageTableManager {
         Some(pd)
     }
 
+    pub fn map_into(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+        let vpn = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+
+        let pml4 = pml4 as *mut PageTable;
+        let pml4e = unsafe { (*pml4).0[vpn[0]] };
+        let pdpt = if pml4e & PTE_PRESENT != 0 {
+            (pml4e & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PDPT")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pml4e_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            unsafe { (*pml4).0[vpn[0]] = pml4e_val; }
+            new_pt as *mut PageTable
+        };
+
+        let pdpte = unsafe { (*pdpt).0[vpn[1]] };
+        let pd = if pdpte & PTE_PRESENT != 0 {
+            (pdpte & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PD")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pdpte_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            unsafe { (*pdpt).0[vpn[1]] = pdpte_val; }
+            new_pt as *mut PageTable
+        };
+
+        let pde = unsafe { (*pd).0[vpn[2]] };
+        let pt = if pde & PTE_PRESENT != 0 {
+            (pde & PTE_ADDR_MASK) as *mut PageTable
+        } else {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let new_pt = alloc.alloc(0).ok_or("OOM: PT")?;
+            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+            let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            unsafe { (*pd).0[vpn[2]] = pde_val; }
+            new_pt as *mut PageTable
+        };
+
+        let pte = unsafe { (*pt).0[vpn[3]] };
+        if pte & PTE_PRESENT != 0 {
+            return Err("already mapped");
+        }
+        unsafe { (*pt).0[vpn[3]] = phys | flags | PTE_PRESENT; }
+        Ok(())
+    }
+
     pub fn map_page(&mut self, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
@@ -336,11 +389,9 @@ pub fn cow_remap(virt: u64) -> bool {
     true
 }
 
-pub fn page_fault_resolve(frame: &x86_64::structures::idt::InterruptStackFrame,
-                          code: x86_64::structures::idt::PageFaultErrorCode, cr2: u64) -> bool {
-    let cpl = frame.code_segment.bits() & 3;
-    let is_write = code.contains(x86_64::structures::idt::PageFaultErrorCode::CAUSED_BY_WRITE);
-    let is_viol = code.contains(x86_64::structures::idt::PageFaultErrorCode::PROTECTION_VIOLATION);
+pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
+    let is_write = code_bits & 2 != 0;
+    let is_viol = code_bits & 1 != 0;
 
     // Write to a read-only user page → COW
     if cpl == 3 && is_write && is_viol {

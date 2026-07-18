@@ -1,4 +1,3 @@
-use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 fn halt() -> ! {
@@ -43,7 +42,9 @@ fn decode_pf(code: PageFaultErrorCode) -> [&'static str; 8] {
 
 fn dump_pf(frame: &InterruptStackFrame, code: PageFaultErrorCode, cr2: u64) {
     let flags = decode_pf(code);
-    let cpl = frame.code_segment.bits() & 3;
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    let cpl = (cs & 3) as u64;
     crate::serial::write_str("EXC: PAGE_FAULT\n");
     crate::serial::write_str("  addr: 0x");
     crate::serial::write_hex(cr2);
@@ -134,9 +135,17 @@ pub extern "x86-interrupt" fn stack_fault(_frame: InterruptStackFrame, _code: u6
     halt();
 }
 
-pub extern "x86-interrupt" fn general_protection(_frame: InterruptStackFrame, code: u64) {
+pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_str("EXC: GPF code=0x");
     crate::serial::write_hex(code);
+    crate::serial::write_str(" rip=0x");
+    crate::serial::write_hex(frame.instruction_pointer.as_u64());
+    crate::serial::write_str(" cs=0x");
+    crate::serial::write_hex(cs as u64);
+    crate::serial::write_str(" rsp=0x");
+    crate::serial::write_hex(frame.stack_pointer.as_u64());
     crate::serial::write_str("\n");
     halt();
 }
@@ -153,7 +162,10 @@ pub extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageF
 
     dump_pf(&frame, code, cr2);
 
-    if crate::paging::page_fault_resolve(&frame, code, cr2) {
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    let cpl = (cs & 3) as u64;
+    if crate::paging::page_fault_resolve(cr2, code.bits() as u64, cpl) {
         crate::serial::write_str("  resolved\n");
         return;
     }

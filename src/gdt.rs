@@ -30,12 +30,14 @@ fn make_tss_descriptor(addr: u64, limit: u32) -> (u64, u64) {
 }
 
 static mut DF_STACK: [u8; 4096] = [0; 4096];
-static mut GDT: [u64; 5] = [
+static mut GDT: [u64; 7] = [
     0,                              // 0x00: null
-    0x00209A0000000000,             // 0x08: 64-bit code
-    0x0000920000000000,             // 0x10: 64-bit data
-    0,                              // 0x18: TSS low (filled in init)
-    0,                              // 0x20: TSS high (filled in init)
+    0x00209A0000000000,             // 0x08: ring0 code (64-bit, DPL=0)
+    0x0000920000000000,             // 0x10: ring0 data (DPL=0)
+    0x0000F20000000000,             // 0x18: ring3 data (DPL=3)
+    0x0020FA0000000000,             // 0x20: ring3 code (64-bit, DPL=3)
+    0,                              // 0x28: TSS low (filled in init)
+    0,                              // 0x30: TSS high (filled in init)
 ];
 static mut TSS: TaskStateSegment = TaskStateSegment {
     reserved1: 0,
@@ -47,6 +49,10 @@ static mut TSS: TaskStateSegment = TaskStateSegment {
     io_map_base: 0,
 };
 
+pub fn set_tss_rsp0(rsp0: u64) {
+    unsafe { TSS.rsp[0] = rsp0; }
+}
+
 pub fn init() {
     unsafe {
         let df_top = DF_STACK.as_ptr() as u64 + DF_STACK.len() as u64;
@@ -54,11 +60,11 @@ pub fn init() {
 
         let tss_addr = &TSS as *const _ as u64;
         let (tsk_low, tss_high) = make_tss_descriptor(tss_addr, size_of::<TaskStateSegment>() as u32 - 1);
-        GDT[3] = tsk_low;
-        GDT[4] = tss_high;
+        GDT[5] = tsk_low;
+        GDT[6] = tss_high;
 
         let gdtr = Gdtr {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: &GDT as *const _ as u64,
         };
 
@@ -81,7 +87,7 @@ pub fn init() {
             "xor ecx, ecx",
             "mov fs, cx",
             "mov gs, cx",
-            "mov r8w, 0x18",
+            "mov r8w, 0x28",
             "ltr r8w",
             out("rax") _,
             out("rcx") _,
