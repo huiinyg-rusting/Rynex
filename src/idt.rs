@@ -1,6 +1,7 @@
 #![allow(static_mut_refs)]
 use x86_64::structures::idt::InterruptDescriptorTable;
 use crate::interrupts;
+use crate::task;
 
 static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
@@ -19,14 +20,21 @@ pub fn init() {
     unsafe {
         idt.double_fault
             .set_handler_fn(interrupts::double_fault)
-            .set_stack_index(1);
+            .set_stack_index(1); // IST 1 (TSS.ist[0]) for Double Fault
+
+        idt[task::TIMER_IRQ_VECTOR]
+            .set_handler_addr(x86_64::VirtAddr::new(task::timer_interrupt_handler as u64))
+            .set_stack_index(2); // IST 2 (TSS.ist[1]) for Timer
+
+        idt.page_fault
+            .set_handler_fn(interrupts::page_fault)
+            .set_stack_index(4); // IST 4 (TSS.ist[3]) for Page Fault
     }
 
     idt.invalid_tss.set_handler_fn(interrupts::invalid_tss);
     idt.segment_not_present.set_handler_fn(interrupts::segment_not_present);
     idt.stack_segment_fault.set_handler_fn(interrupts::stack_fault);
     idt.general_protection_fault.set_handler_fn(interrupts::general_protection);
-    idt.page_fault.set_handler_fn(interrupts::page_fault);
     idt.x87_floating_point.set_handler_fn(interrupts::x87_fp);
     idt.alignment_check.set_handler_fn(interrupts::alignment_check);
     idt.machine_check.set_handler_fn(interrupts::machine_check);

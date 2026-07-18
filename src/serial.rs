@@ -33,6 +33,14 @@ pub fn write_str(s: &str) {
     }
 }
 
+pub fn write_char(c: char) {
+    let mut buf = [0u8; 4];
+    let encoded = c.encode_utf8(&mut buf);
+    for &b in encoded.as_bytes() {
+        write_byte(b);
+    }
+}
+
 pub fn write_dec(val: u64) {
     if val == 0 {
         write_byte(b'0');
