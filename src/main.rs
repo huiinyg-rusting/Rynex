@@ -17,6 +17,8 @@ mod memory;
 mod multiboot2;
 mod task;
 mod paging;
+mod pic;
+mod pit;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -40,11 +42,16 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     vga::write_str("IDT: OK\n");
     serial::write_str("IDT: OK\n");
 
-    unsafe {
-        core::arch::asm!("mov al, 0xFF", "out 0x21, al", options(nostack, nomem, preserves_flags));
-        core::arch::asm!("mov al, 0xFF", "out 0xA1, al", options(nostack, nomem, preserves_flags));
-    }
-    serial::write_str("PIC: masked\n");
+    pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
+    pic::mask_all();
+    idt::register_irq(task::TIMER_IRQ_VECTOR, task::timer_interrupt_handler as u64);
+    pic::unmask(0);
+    vga::write_str("PIC: OK\n");
+    serial::write_str("PIC: OK\n");
+
+    pit::init(100);
+    vga::write_str("PIT: OK\n");
+    serial::write_str("PIT: OK\n");
 
     memory::init(_info);
     paging::init();

@@ -7,6 +7,8 @@ use crate::serial;
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_PAGES: usize = 2;
 pub const USER_STACK_PAGES: usize = 8;
+pub const IRQ_BASE: u8 = 0x30;
+pub const TIMER_IRQ_VECTOR: u8 = IRQ_BASE + 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -161,9 +163,11 @@ pub fn init_scheduler() {
 }
 
 pub fn schedule() {
+    unsafe { core::arch::asm!("cli", options(nostack, nomem, preserves_flags)); }
+
     let current = CURRENT_TASK.load(Ordering::SeqCst);
     let mut next_id = 0;
-    
+
     for i in 1..=MAX_TASKS {
         let idx = ((current + i as u64 - 1) % MAX_TASKS as u64) + 1;
         let task = unsafe { &TASKS[(idx % MAX_TASKS as u64) as usize] };
@@ -172,25 +176,27 @@ pub fn schedule() {
             break;
         }
     }
-    
+
     if next_id == 0 {
+        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
         return;
     }
-    
+
     let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
     if old == next_id {
+        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
         return;
     }
-    
+
     let old_task = unsafe { &mut TASKS[(old % MAX_TASKS as u64) as usize] };
     let new_task = unsafe { &mut TASKS[(next_id % MAX_TASKS as u64) as usize] };
-    
+
     if old_task.state == TaskState::Running {
         old_task.state = TaskState::Ready;
     }
     new_task.state = TaskState::Running;
-    
-pt_mgr().switch_to(new_task.pml4);
+
+    pt_mgr().switch_to(new_task.pml4);
 
     serial::write_str("SCHED: switching to task ");
     serial::write_dec(next_id);
@@ -205,9 +211,18 @@ pt_mgr().switch_to(new_task.pml4);
     serial::write_str("\n");
 
     unsafe {
-        context_switch(&mut old_task.regs, &new_task.regs);
+        let old_ptr = &mut old_task.regs as *mut Registers;
+        let new_ptr = &new_task.regs as *const Registers;
+        core::arch::asm!(
+            "mov rdi, {old}",
+            "mov rsi, {new}",
+            "call {context_switch}",
+            old = in(reg) old_ptr,
+            new = in(reg) new_ptr,
+            context_switch = sym context_switch,
+            clobber_abi("C"),
+        );
     }
-    serial::write_str("SCHED: returned from context_switch\n");
 }
 
 pub fn yield_now() {
@@ -251,11 +266,13 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov [rdi + 0x78], r15",
         "pushfq",
         "pop rax",
+        "or rax, 0x200",
         "and rax, 0xFFFFFFFFFFFFFEFF",
         "mov [rdi + 0x88], rax",
         "mov [rdi + 0x90], cs",
         "mov [rdi + 0x98], ss",
         "mov rsp, [rsi + 0x38]",
+        "add rsp, 16",
         "mov rax, [rsi + 0x00]",
         "mov rbx, [rsi + 0x08]",
         "mov rcx, [rsi + 0x10]",
@@ -270,12 +287,142 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov r13, [rsi + 0x68]",
         "mov r14, [rsi + 0x70]",
         "mov r15, [rsi + 0x78]",
-        "push qword ptr [rsi + 0x80]",
+        "push qword ptr [rsi + 0x98]",
+        "push qword ptr [rsi + 0x38]",
         "push qword ptr [rsi + 0x88]",
+        "push qword ptr [rsi + 0x90]",
+        "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
-        "popfq",
-        "ret",
+        "iretq",
     )
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
+    core::arch::naked_asm!(
+        "cld",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call timer_schedule",
+        "xchg rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+    )
+}
+
+static SWITCH_TARGET_ID: AtomicU64 = AtomicU64::new(0);
+
+static mut TMP_REGS: Registers = Registers {
+    rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0, rsp: 0,
+    r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+    rip: 0, rflags: 0, cs: 0, ss: 0,
+};
+
+extern "C" fn resume_switch() -> ! {
+    unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
+    let next_id = SWITCH_TARGET_ID.swap(0, Ordering::SeqCst);
+    let next_task = unsafe { &mut TASKS[(next_id % MAX_TASKS as u64) as usize] };
+    unsafe {
+        context_switch(&mut TMP_REGS, &next_task.regs);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn timer_schedule(saved: *mut u64) -> u64 {
+    crate::pic::send_eoi(0);
+
+    let current = CURRENT_TASK.load(Ordering::SeqCst);
+    if current == 0 {
+        return saved as u64;
+    }
+
+    let task = unsafe { &mut TASKS[(current % MAX_TASKS as u64) as usize] };
+
+    if task.state != TaskState::Running {
+        return saved as u64;
+    }
+
+    let original_rsp = (saved as u64) + 18 * 8;
+
+    unsafe {
+        let regs = &mut task.regs;
+        let s = saved;
+        regs.r15 = *s.add(0);
+        regs.r14 = *s.add(1);
+        regs.r13 = *s.add(2);
+        regs.r12 = *s.add(3);
+        regs.r11 = *s.add(4);
+        regs.r10 = *s.add(5);
+        regs.r9  = *s.add(6);
+        regs.r8  = *s.add(7);
+        regs.rdi = *s.add(8);
+        regs.rsi = *s.add(9);
+        regs.rbp = *s.add(10);
+        regs.rbx = *s.add(11);
+        regs.rdx = *s.add(12);
+        regs.rcx = *s.add(13);
+        regs.rax = *s.add(14);
+        regs.rip = *s.add(15);
+        regs.cs  = *s.add(16);
+        regs.rflags = *s.add(17);
+        regs.rsp = original_rsp;
+        regs.ss  = 0x10;
+    }
+
+    let mut next_id = 0;
+    for i in 1..=MAX_TASKS {
+        let idx = ((current + i as u64 - 1) % MAX_TASKS as u64) + 1;
+        let t = unsafe { &TASKS[(idx % MAX_TASKS as u64) as usize] };
+        if t.state == TaskState::Ready && t.id != 0 {
+            next_id = t.id;
+            break;
+        }
+    }
+
+    if next_id == 0 || next_id == current {
+        return saved as u64;
+    }
+
+    task.state = TaskState::Ready;
+    let next_task = unsafe { &mut TASKS[(next_id % MAX_TASKS as u64) as usize] };
+    next_task.state = TaskState::Running;
+    CURRENT_TASK.store(next_id, Ordering::SeqCst);
+
+    SWITCH_TARGET_ID.store(next_id, Ordering::SeqCst);
+    unsafe {
+        *saved.add(15) = resume_switch as *const () as u64;
+    }
+
+    saved as u64
 }
 
 #[no_mangle]
@@ -314,6 +461,8 @@ extern "C" fn task_b() -> ! {
 }
 
 pub fn test() {
+    unsafe { core::arch::asm!("cli"); }
+
     serial::write_str("TASK: testing kernel task creation...\n");
 
     let tid1 = create_kernel_task(task_a as u64);
@@ -339,11 +488,24 @@ pub fn test() {
 
     serial::write_str("TASK: switching to task 1...\n");
 
+    unsafe { core::arch::asm!("cli"); }
+
     let new_task = unsafe { &mut TASKS[(1 % MAX_TASKS as u64) as usize] };
     new_task.state = TaskState::Running;
+    CURRENT_TASK.store(1, Ordering::SeqCst);
     pt_mgr().switch_to(new_task.pml4);
     unsafe {
-        context_switch(&mut TASKS[0].regs, &new_task.regs);
+        let old_ptr = &mut TASKS[0].regs as *mut Registers;
+        let new_ptr = &new_task.regs as *const Registers;
+        core::arch::asm!(
+            "mov rdi, {old}",
+            "mov rsi, {new}",
+            "call {context_switch}",
+            old = in(reg) old_ptr,
+            new = in(reg) new_ptr,
+            context_switch = sym context_switch,
+            clobber_abi("C"),
+        );
     }
 
     serial::write_str("TASK: back in task 0\n");
