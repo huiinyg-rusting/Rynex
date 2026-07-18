@@ -54,6 +54,56 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     serial::write_str("PIT: OK\n");
 
     memory::init(_info);
+    // Enable NX (No-Execute) in EFER MSR and setup syscall MSRs
+    unsafe {
+        let mut efer: u64;
+        // Enable NXE (bit 11)
+        core::arch::asm!(
+            "mov ecx, 0xC0000080",
+            "rdmsr",
+            "or eax, 0x800",
+            "wrmsr",
+            inout("eax") efer as u32,
+            inout("edx") (efer >> 32) as u32,
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
+        // Setup syscall MSRs
+        // STAR: [63:48] = user CS, [47:32] = kernel CS
+        let star: u64 = (task::USER_CODE_SELECTOR as u64) << 48 | (task::KERNEL_CODE_SELECTOR as u64) << 32;
+        core::arch::asm!(
+            "mov ecx, 0xC0000081",
+            "wrmsr",
+            in("eax") (star & 0xFFFFFFFF) as u32,
+            in("edx") (star >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+        // LSTAR: RIP of syscall entry
+        core::arch::asm!(
+            "mov ecx, 0xC0000082",
+            "wrmsr",
+            in("eax") (task::syscall_entry as u64 & 0xFFFFFFFF) as u32,
+            in("edx") (task::syscall_entry as u64 >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+        // FMASK: flags to clear on syscall (clear IF)
+        core::arch::asm!(
+            "mov ecx, 0xC0000084",
+            "wrmsr",
+            in("eax") 0x200u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags)
+        );
+        // Enable SCE bit (bit 0) in EFER
+        efer |= 1;
+        core::arch::asm!(
+            "mov ecx, 0xC0000080",
+            "wrmsr",
+            in("eax") efer as u32,
+            in("edx") (efer >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
     paging::init();
     let pages = memory::TOTAL_PAGES.load(core::sync::atomic::Ordering::SeqCst);
     vga::write_str("MEM: ");
