@@ -1,6 +1,7 @@
 use core::mem;
 
 const TAG_MMAP: u32 = 6;
+const TAG_MODULE: u32 = 3;
 const TAG_END: u32 = 0;
 const MMAP_USABLE: u32 = 1;
 
@@ -16,6 +17,49 @@ struct Info {
 struct TagHeader {
     typ: u32,
     size: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct ModuleTag {
+    typ: u32,
+    size: u32,
+    mod_start: u32,
+    mod_end: u32,
+    cmdline: [u8; 1],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleInfo {
+    pub start: u64,
+    pub end: u64,
+}
+
+pub fn find_modules(info_addr: u32, out: &mut [ModuleInfo]) -> usize {
+    let total = unsafe { (*(info_addr as *const Info)).total_size };
+    let mut count = 0;
+    let mut offset = mem::size_of::<Info>() as u32;
+
+    while offset + 8 <= total {
+        let p = (info_addr as u64 + offset as u64) as *const u8;
+        let typ = unsafe { core::ptr::read_unaligned(p as *const u32) };
+        if typ == TAG_END {
+            break;
+        }
+        let size = unsafe { core::ptr::read_unaligned(p.add(4) as *const u32) };
+        if size < 8 {
+            break;
+        }
+        if typ == TAG_MODULE && count < out.len() {
+            let start = unsafe { core::ptr::read_unaligned(p.add(8) as *const u32) } as u64;
+            let end = unsafe { core::ptr::read_unaligned(p.add(12) as *const u32) } as u64;
+            out[count] = ModuleInfo { start, end };
+            count += 1;
+        }
+        offset += size;
+        offset = (offset + 7) & !7;
+    }
+    count
 }
 
 #[derive(Clone, Copy)]
