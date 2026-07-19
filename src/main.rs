@@ -19,6 +19,8 @@ mod task;
 mod paging;
 mod pic;
 mod pit;
+mod ipc;
+mod elf;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;

@@ -20,7 +20,7 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C, align(4096))]
-pub struct PageTable([u64; 512]);
+pub struct PageTable(pub [u64; 512]);
 
 impl PageTable {
     fn get(&self, idx: usize) -> u64 {
