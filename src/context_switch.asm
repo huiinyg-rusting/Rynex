@@ -18,7 +18,7 @@ syscall_entry:
     
     swapgs
     mov r10, rsp          // Save user RSP
-    mov rsp, syscall_stack_top
+    lea rsp, [rip + syscall_stack_top]
     
     // Save callee-saved registers and RCX/R11
     push rbx

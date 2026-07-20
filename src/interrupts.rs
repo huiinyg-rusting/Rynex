@@ -175,8 +175,21 @@ pub extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageF
 }
 
 // Handlers that must diverge (!)
-pub extern "x86-interrupt" fn double_fault(_frame: InterruptStackFrame, _code: u64) -> ! {
+pub extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u64) -> ! {
+    let cr2: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem, preserves_flags)); }
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_str("EXC: Double Fault\n");
+    crate::serial::write_str("  rip=0x");
+    crate::serial::write_hex(frame.instruction_pointer.as_u64());
+    crate::serial::write_str(" cs=0x");
+    crate::serial::write_hex(cs as u64);
+    crate::serial::write_str(" rsp=0x");
+    crate::serial::write_hex(frame.stack_pointer.as_u64());
+    crate::serial::write_str(" cr2=0x");
+    crate::serial::write_hex(cr2);
+    crate::serial::write_str("\n");
     halt();
 }
 

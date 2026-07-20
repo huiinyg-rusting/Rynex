@@ -100,49 +100,56 @@ impl PageTableManager {
             ((virt >> 12) & 0x1FF) as usize,
         ];
 
-        let pml4 = pml4 as *mut PageTable;
-        let pml4e = unsafe { (*pml4).0[vpn[0]] };
-        let pdpt = if pml4e & PTE_PRESENT != 0 {
+        let pml4e = unsafe { (*(pml4 as *mut PageTable)).0[vpn[0]] };
+        let pdpt: *mut PageTable = if pml4e & PTE_PRESENT != 0 {
             (pml4e & PTE_ADDR_MASK) as *mut PageTable
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PDPT")?;
+            let new_pt = Self::alloc_page()?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-            let pml4e_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-            unsafe { (*pml4).0[vpn[0]] = pml4e_val; }
+            unsafe { (*(pml4 as *mut PageTable)).0[vpn[0]] = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
             new_pt as *mut PageTable
         };
 
         let pdpte = unsafe { (*pdpt).0[vpn[1]] };
-        let pd = if pdpte & PTE_PRESENT != 0 {
+        let pd: *mut PageTable = if pdpte & PTE_PRESENT != 0 {
             (pdpte & PTE_ADDR_MASK) as *mut PageTable
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PD")?;
-            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-            let pdpte_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-            unsafe { (*pdpt).0[vpn[1]] = pdpte_val; }
-            new_pt as *mut PageTable
+            let new_pd = Self::alloc_page()?;
+            unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
+            unsafe { (*pdpt).0[vpn[1]] = new_pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
+            new_pd as *mut PageTable
         };
 
         let pde = unsafe { (*pd).0[vpn[2]] };
-        let pt = if pde & PTE_PRESENT != 0 {
-            (pde & PTE_ADDR_MASK) as *mut PageTable
+        let pt: *mut PageTable = if pde & PTE_PRESENT != 0 {
+            if pde & PTE_HUGE != 0 {
+                // Split 2M huge page into 512 regular 4K entries
+                let new_pt = Self::alloc_page()?;
+                unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+                let huge_base = pde & PTE_ADDR_MASK;
+                let pte_flags = PTE_PRESENT | PTE_WRITABLE | (pde & (PTE_NO_EXECUTE | PTE_USER));
+                for i in 0..512u64 {
+                    unsafe { (*(new_pt as *mut [u64; 512]))[i as usize] = (huge_base + i * 4096) | pte_flags; }
+                }
+                unsafe { (*pd).0[vpn[2]] = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
+                new_pt as *mut PageTable
+            } else {
+                (pde & PTE_ADDR_MASK) as *mut PageTable
+            }
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PT")?;
+            let new_pt = Self::alloc_page()?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-            let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-            unsafe { (*pd).0[vpn[2]] = pde_val; }
+            unsafe { (*pd).0[vpn[2]] = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
             new_pt as *mut PageTable
         };
 
-        let pte = unsafe { (*pt).0[vpn[3]] };
-        if pte & PTE_PRESENT != 0 {
-            return Err("already mapped");
-        }
         unsafe { (*pt).0[vpn[3]] = phys | flags | PTE_PRESENT; }
         Ok(())
+    }
+
+    fn alloc_page() -> Result<u64, &'static str> {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        alloc.alloc(0).ok_or("OOM")
     }
 
     // Map a page in kernel page tables (without PTE_USER on intermediate tables)
