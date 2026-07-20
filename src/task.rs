@@ -387,28 +387,91 @@ pub fn schedule() {
         }
     }
 
-    let next_id = match dequeue_task() {
-        Some(id) => id,
-        None => {
-            unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
-            return;
+    let next_id = 'pick: {
+        let picked = dequeue_task();
+        match picked {
+            Some(id) if id == current => {
+                unsafe { enqueue_task(current, TASKS[task_idx(current)].prio); }
+                let prio = unsafe { TASKS[task_idx(current)].prio as usize };
+                unsafe { RUNQUEUE.bitmap &= !(1u64 << prio); }
+                let next = dequeue_task();
+                unsafe { RUNQUEUE.bitmap |= 1u64 << prio; }
+                match next {
+                    Some(id2) => { break 'pick id2; }
+                    None => {
+                        crate::serial::write_str(" schedule: only current task\n");
+                        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
+                        return;
+                    }
+                }
+            }
+            Some(id) => { break 'pick id; }
+            None => {
+                crate::serial::write_str(" schedule: no tasks\n");
+                unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
+                return;
+            }
         }
     };
 
+    let new_idx = task_idx(next_id);
+    crate::serial::write_str(" sched ");
+    crate::serial::write_dec(current);
+    crate::serial::write_str("->");
+    crate::serial::write_dec(next_id);
+    crate::serial::write_str(" pml4=0x");
+    crate::serial::write_hex(unsafe { TASKS[new_idx].pml4 });
+    crate::serial::write_str("\n");
+
+    unsafe { crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack); }
+
     let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
-    if old == next_id {
-        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
-        return;
-    }
 
     unsafe {
-        let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
         pt_mgr().switch_to(TASKS[new_idx].pml4);
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        crate::serial::write_str(" cr3=0x");
+        crate::serial::write_hex(cr3);
+        crate::serial::write_str(" ok ks=0x");
+        crate::serial::write_hex(TASKS[new_idx].kernel_stack);
+        crate::serial::write_str("\n");
 
         let old_idx = task_idx(old);
         let old_ptr = &mut TASKS[old_idx].regs as *mut Registers;
         let new_ptr = &TASKS[new_idx].regs as *const Registers;
+
+        // Debug: test write to user stack before context switch
+        let user_rsp = (*new_ptr).rsp;
+        crate::serial::write_str("  debug: new.rsp=0x");
+        crate::serial::write_hex(user_rsp);
+        crate::serial::write_str("\n");
+        let test_addr = user_rsp - 40;
+        unsafe {
+            core::ptr::write_volatile(test_addr as *mut u64, 0x42);
+            let val = core::ptr::read_volatile(test_addr as *const u64);
+            crate::serial::write_str("  debug: user stack RW test at 0x");
+            crate::serial::write_hex(test_addr);
+            crate::serial::write_str(" val=0x");
+            crate::serial::write_hex(val);
+            crate::serial::write_str("\n");
+        }
+
+        crate::serial::write_str("  dbg: oldp=0x");
+        crate::serial::write_hex(old_ptr as u64);
+        crate::serial::write_str(" newp=0x");
+        crate::serial::write_hex(new_ptr as u64);
+        crate::serial::write_str(" cs=0x");
+        crate::serial::write_hex((*new_ptr).cs);
+        crate::serial::write_str(" rip=0x");
+        crate::serial::write_hex((*new_ptr).rip);
+        crate::serial::write_str(" rsp=0x");
+        crate::serial::write_hex((*new_ptr).rsp);
+        crate::serial::write_str(" ss=0x");
+        crate::serial::write_hex((*new_ptr).ss);
+        crate::serial::write_str("\n");
+
         core::arch::asm!(
             "mov rdi, {old}",
             "mov rsi, {new}",
@@ -469,7 +532,6 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov [rdi + 0x20], rsi",
         "mov [rdi + 0x28], rdi",
         "mov [rdi + 0x30], rbp",
-        "mov [rdi + 0x38], rsp",
         "mov [rdi + 0x40], r8",
         "mov [rdi + 0x48], r9",
         "mov [rdi + 0x50], r10",
@@ -486,7 +548,6 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov [rdi + 0x90], cs",
         "mov [rdi + 0x98], ss",
         "mov rsp, [rsi + 0x38]",
-        "add rsp, 16",
         "mov rax, [rsi + 0x00]",
         "mov rbx, [rsi + 0x08]",
         "mov rcx, [rsi + 0x10]",
@@ -501,6 +562,16 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov r13, [rsi + 0x68]",
         "mov r14, [rsi + 0x70]",
         "mov r15, [rsi + 0x78]",
+        // Check if switching to a user task (CS != 0x08) or kernel task
+        "cmp qword ptr [rsi + 0x90], 8",
+        "jne 2f",
+        // Kernel → kernel: use ret (no 16-byte iretq mismatch)
+        "mov rax, [rsi + 0x80]",
+        "mov rsi, [rsi + 0x20]",
+        "push rax",
+        "ret",
+        "2:",
+        // Kernel → user: use iretq
         "push qword ptr [rsi + 0x98]",
         "push qword ptr [rsi + 0x38]",
         "push qword ptr [rsi + 0x88]",
@@ -538,11 +609,13 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "add rdi, 8",
         "call {save_context}",
         "call {timer_schedule}",
+        "test rax, rax",
+        "jz 3f",
         "mov rsp, rax",
+        "3:",
         "pop r15",
         "pop r14",
         "pop r13",
-        "pop rbp",
         "pop r12",
         "pop r11",
         "pop r10",
@@ -554,6 +627,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rcx",
         "pop rbx",
         "pop rax",
+        "pop rbp",
         "iretq",
 
         save_context = sym save_interrupt_context,
@@ -590,7 +664,7 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         regs.rip    = *frame.add(0);
         regs.cs     = *frame.add(1);
         regs.rflags = *frame.add(2);
-        regs.rsp    = (frame as u64) + 24;
+        regs.rsp    = *frame.add(3);
         regs.ss     = KERNEL_DATA_SELECTOR;
     }
 }
@@ -601,7 +675,15 @@ pub extern "C" fn inc_ticks() {
 }
 
 #[no_mangle]
+static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub extern "C" fn timer_schedule() -> u64 {
+    let c = SCHED_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if c < 3 {
+        crate::serial::write_str("SCHED: call ");
+        crate::serial::write_dec(c);
+        crate::serial::write_str("\n");
+    }
     crate::pic::send_eoi(0);
 
     let current = CURRENT_TASK.load(Ordering::SeqCst);
@@ -628,6 +710,9 @@ pub extern "C" fn timer_schedule() -> u64 {
         }
 
         // Time slice expired — requeue and pick next
+        crate::serial::write_str("SCHED: expire ");
+        crate::serial::write_dec(current);
+        crate::serial::write_str("\n");
         TASKS[idx].state = TaskState::Ready;
         TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
         enqueue_task(current, TASKS[idx].prio);
@@ -635,18 +720,28 @@ pub extern "C" fn timer_schedule() -> u64 {
         let next_id = match dequeue_task() {
             Some(id) => id,
             None => {
-                // Nothing to run — stay on current
+                crate::serial::write_str("SCHED: no task\n");
                 TASKS[idx].state = TaskState::Running;
                 return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
             }
         };
 
         if next_id == current {
+            crate::serial::write_str("SCHED: same ");
+            crate::serial::write_dec(next_id);
+            crate::serial::write_str("\n");
             TASKS[idx].state = TaskState::Running;
             return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         let new_idx = task_idx(next_id);
+        crate::serial::write_str("SCHED: ");
+        crate::serial::write_dec(current);
+        crate::serial::write_str(" -> ");
+        crate::serial::write_dec(next_id);
+        crate::serial::write_str(" (pml4=0x");
+        crate::serial::write_hex(TASKS[new_idx].pml4);
+        crate::serial::write_str(")\n");
         TASKS[new_idx].state = TaskState::Running;
         CURRENT_TASK.store(next_id, Ordering::SeqCst);
         pt_mgr().switch_to(TASKS[new_idx].pml4);
@@ -657,28 +752,25 @@ pub extern "C" fn timer_schedule() -> u64 {
 
 fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
-    let kernel = (regs.cs & 3) == 0;
     unsafe {
-        let base = if kernel {
-            (kernel_stack as *mut u64).sub(19)
-        } else {
-            (kernel_stack as *mut u64).sub(20)
-        };
+        let base = (kernel_stack as *mut u64).sub(20);
+        // Must match pop order in timer_interrupt_handler:
+        // pop r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rbx, rax, rbp
         *base.add(0)  = regs.r15;
         *base.add(1)  = regs.r14;
         *base.add(2)  = regs.r13;
-        *base.add(3)  = regs.rbp;
-        *base.add(4)  = regs.r12;
-        *base.add(5)  = regs.r11;
-        *base.add(6)  = regs.r10;
-        *base.add(7)  = regs.r9;
-        *base.add(8)  = regs.r8;
-        *base.add(9)  = regs.rdi;
-        *base.add(10) = regs.rsi;
-        *base.add(11) = regs.rdx;
-        *base.add(12) = regs.rcx;
-        *base.add(13) = regs.rbx;
-        *base.add(14) = regs.rax;
+        *base.add(3)  = regs.r12;
+        *base.add(4)  = regs.r11;
+        *base.add(5)  = regs.r10;
+        *base.add(6)  = regs.r9;
+        *base.add(7)  = regs.r8;
+        *base.add(8)  = regs.rdi;
+        *base.add(9)  = regs.rsi;
+        *base.add(10) = regs.rdx;
+        *base.add(11) = regs.rcx;
+        *base.add(12) = regs.rbx;
+        *base.add(13) = regs.rax;
+        *base.add(14) = regs.rbp;
         *base.add(15) = regs.rip;
         *base.add(16) = regs.cs;
         *base.add(17) = regs.rflags;
@@ -1018,8 +1110,17 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
 // ── Test / Demo ──────────────────────────────────────────────────
 
 extern "C" fn task_spin() -> ! {
+    let mut count = 0u64;
     loop {
-        unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+        if count < 3 {
+            crate::serial::write_str("TASK: spin ");
+            crate::serial::write_dec(count);
+            crate::serial::write_str(" (tid=");
+            crate::serial::write_dec(current_task_id());
+            crate::serial::write_str(")\n");
+            count += 1;
+        }
+        sys_yield();
     }
 }
 
@@ -1028,14 +1129,57 @@ pub fn test() {
 
     serial::write_str("TASK: testing kernel task creation...\n");
 
-    let tid1 = create_kernel_task_prio(task_spin as u64, -10);
-    let tid2 = create_kernel_task_prio(task_spin as u64, 5);
+    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, -10);
+    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 5);
 
     serial::write_str("TASK: task IDs: ");
     serial::write_dec(tid1.unwrap());
     serial::write_str(", ");
     serial::write_dec(tid2.unwrap());
     serial::write_str("\n");
+
+    // Load user ELF from multiboot2 module
+    let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
+    if info_addr != 0 {
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 4];
+        let n = crate::multiboot2::find_modules(info_addr, &mut modules);
+        if n > 0 {
+            let mod_data = unsafe {
+                core::slice::from_raw_parts(
+                    modules[0].start as *const u8,
+                    (modules[0].end - modules[0].start) as usize,
+                )
+            };
+            serial::write_str("TASK: loading user ELF from module (");
+            serial::write_dec(mod_data.len() as u64);
+            serial::write_str(" bytes @ 0x");
+            serial::write_hex(modules[0].start);
+            serial::write_str(")\n");
+            // Debug: print first 16 bytes
+            let first_bytes = &mod_data[..16.min(mod_data.len())];
+            for &b in first_bytes {
+                serial::write_hex(b as u64);
+                serial::write_char(' ');
+            }
+            serial::write_str("\n");
+            match crate::elf::load_elf(mod_data) {
+                Ok(elf_info) => {
+                    if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
+                        serial::write_str("TASK: created user task ");
+                        serial::write_dec(tid);
+                        serial::write_str(" entry=0x");
+                        serial::write_hex(elf_info.entry);
+                        serial::write_str("\n");
+                    }
+                }
+                Err(e) => {
+                    serial::write_str("TASK: ELF load failed: ");
+                    serial::write_str(e);
+                    serial::write_str("\n");
+                }
+            }
+        }
+    }
 
     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
@@ -1054,7 +1198,10 @@ pub fn test() {
 
     serial::write_str("TASK: switching to task 1...\n");
 
-    unsafe { core::arch::asm!("cli"); }
+    // Dequeue task 1 so it's not in the runqueue twice
+    remove_from_runqueue(1);
+
+    unsafe { core::arch::asm!("sti"); }
 
     let new_task = unsafe { &mut TASKS[task_idx(1)] };
     new_task.state = TaskState::Running;
@@ -1063,6 +1210,19 @@ pub fn test() {
     unsafe {
         let old_ptr = &mut TASKS[0].regs as *mut Registers;
         let new_ptr = &new_task.regs as *const Registers;
+        serial::write_str("  dbg_init: oldp=0x");
+        serial::write_hex(old_ptr as u64);
+        serial::write_str(" newp=0x");
+        serial::write_hex(new_ptr as u64);
+        serial::write_str(" cs=0x");
+        serial::write_hex((*new_ptr).cs);
+        serial::write_str(" ss=0x");
+        serial::write_hex((*new_ptr).ss);
+        serial::write_str(" rsp=0x");
+        serial::write_hex((*new_ptr).rsp);
+        serial::write_str(" rip=0x");
+        serial::write_hex((*new_ptr).rip);
+        serial::write_str("\n");
         core::arch::asm!(
             "mov rdi, {old}",
             "mov rsi, {new}",

@@ -24,6 +24,7 @@ mod elf;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 extern "C" {
     fn syscall_entry();
@@ -31,8 +32,12 @@ extern "C" {
 
 core::arch::global_asm!(include_str!("context_switch.asm"));
 
+pub static MULTIBOOT_INFO: AtomicU64 = AtomicU64::new(0);
+
 #[no_mangle]
 pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
+    MULTIBOOT_INFO.store(_info as u64, Ordering::SeqCst);
+
     serial::init();
     serial::write_str("Niobix v0.1.0\n");
     vga::clear();
@@ -88,7 +93,12 @@ memory::init(_info);
         );
         // Setup syscall MSRs
         // STAR: [63:48] = user CS, [47:32] = kernel CS
-        let star: u64 = (task::USER_CODE_SELECTOR as u64) << 48 | (task::KERNEL_CODE_SELECTOR as u64) << 32;
+        // STAR[47:32] = SYSCALL CS (kernel code)
+        // STAR[63:48] = base for SYSRET: CS = base+16, SS = base+8
+        // We need  CS = USER_CODE_SELECTOR|3  (=0x23)  → base+16 = 0x20 → base = 0x10
+        //          SS = USER_DATA_SELECTOR|3  (=0x1B)  → base+8  = 0x18 → base = 0x10
+        let star: u64 = (task::KERNEL_DATA_SELECTOR as u64) << 48
+                      | (task::KERNEL_CODE_SELECTOR as u64) << 32;
         core::arch::asm!(
             "mov ecx, 0xC0000081",
             "wrmsr",

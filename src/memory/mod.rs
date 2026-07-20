@@ -56,6 +56,21 @@ pub fn init(info_addr: u32) {
     let ks = buddy::page_align_down(kstart);
     let ke = buddy::page_align_up(kend);
 
+    // Find modules first so we can exclude their pages from free regions
+    let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
+    let nmodules = crate::multiboot2::find_modules(info_addr, &mut modules);
+    for i in 0..nmodules {
+        crate::serial::write_str("MEM: module ");
+        crate::serial::write_dec(i as u64);
+        crate::serial::write_str(" 0x");
+        crate::serial::write_hex(modules[i].start);
+        crate::serial::write_str(" - 0x");
+        crate::serial::write_hex(modules[i].end);
+        crate::serial::write_str("\n");
+    }
+
+    let info_page = buddy::page_align_down(info_addr as u64);
+
     unsafe {
         if ks >= base && ks < base + pages * buddy::PAGE_SIZE {
             let adj_start = ks;
@@ -64,31 +79,56 @@ pub fn init(info_addr: u32) {
             } else {
                 ke
             };
-            ALLOC.add_region(base, adj_start - base);
+            // lower region: base -> adj_start, skipping module + info pages
+            add_free_region_skipping(base, adj_start, &modules, nmodules, info_page);
             ALLOC.mark_allocated(adj_start, adj_end - adj_start);
+            // upper region: adj_end -> end
             if adj_end < base + pages * buddy::PAGE_SIZE {
-                ALLOC.add_region(adj_end, base + pages * buddy::PAGE_SIZE - adj_end);
+                add_free_region_skipping(adj_end, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
             }
         } else {
-            ALLOC.add_region(base, pages * buddy::PAGE_SIZE);
-        }
-    }
-
-    let ia = buddy::page_align_down(info_addr as u64);
-    if ia >= ks && ia < ke {
-    } else if ia >= base && ia < base + pages * buddy::PAGE_SIZE {
-        unsafe {
-            ALLOC.mark_allocated(ia, buddy::PAGE_SIZE);
-        }
-    }
-
-    if 0 == base {
-        unsafe {
-            ALLOC.mark_allocated(0, buddy::PAGE_SIZE);
+            add_free_region_skipping(base, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
         }
     }
 
     TOTAL_PAGES.store(pages, Ordering::SeqCst);
+}
+
+unsafe fn add_free_region_skipping(start: u64, end: u64,
+    modules: &[crate::multiboot2::ModuleInfo], nmodules: usize, info_page: u64)
+{
+    let mut cur = start;
+    while cur < end {
+        // Find the next reserved page that intersects [cur, end)
+        let mut next_reserved = end;
+        if info_page >= cur && info_page < end {
+            next_reserved = info_page;
+        }
+        for i in 0..nmodules {
+            let ms = buddy::page_align_down(modules[i].start);
+            let me = buddy::page_align_up(modules[i].end);
+            if ms >= cur && ms < end && ms < next_reserved {
+                next_reserved = ms;
+            }
+        }
+        if next_reserved > cur {
+            ALLOC.add_region(cur, next_reserved - cur);
+        }
+        // skip the reserved block
+        let reserved_end = end;
+        let mut skip_to = next_reserved + buddy::PAGE_SIZE;
+        if info_page >= next_reserved && info_page < reserved_end {
+            skip_to = skip_to.max(info_page + buddy::PAGE_SIZE);
+        }
+        for i in 0..nmodules {
+            let ms = buddy::page_align_down(modules[i].start);
+            let me = buddy::page_align_up(modules[i].end);
+            if ms >= next_reserved && ms < reserved_end && me > skip_to {
+                skip_to = me;
+            }
+        }
+        cur = skip_to;
+    }
 }
 
 

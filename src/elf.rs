@@ -105,7 +105,10 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
         return Err("PHdr out of bounds");
     }
 
-    // Clone kernel page tables for the new process
+    // Clone kernel page tables for the new process.
+    // Copy all 512 entries so the kernel can access its code/data when CR3 = user PML4.
+    // Deep-copy PDPT[0] (the identity-map PDPT) so we can modify PD entries without
+    // affecting the kernel's shared page tables.
     let pml4 = match alloc_page() {
         Some(p) => p,
         None => return Err("OOM for PML4"),
@@ -113,7 +116,44 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
     let new_pt = unsafe { &mut *(pml4 as *mut crate::paging::PageTable) };
     let kernel_pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::SeqCst);
     let old_pt = unsafe { &*(kernel_pml4 as *const crate::paging::PageTable) };
-    new_pt.0 = old_pt.0;
+    new_pt.0 = old_pt.0; // shallow copy all entries
+
+    // Deep-copy the identity-map PDPT (PML4[0] → PDPT → PD → PT).
+    // This gives us private copies of the PD and PDPT so map_into can modify them.
+    if new_pt.0[0] & crate::paging::PTE_PRESENT != 0 {
+        let old_pdpt = (new_pt.0[0] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
+        let new_pdpt = alloc_page().ok_or("OOM: PDPT clone")?;
+        unsafe {
+            core::ptr::copy(old_pdpt as *const u8, new_pdpt as *mut u8, 4096);
+            // Deep-copy each present PD in this PDPT
+            let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
+            for i in 0..512 {
+                if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
+                    let old_pd = (pdpt.0[i] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
+                    let new_pd = alloc_page().ok_or("OOM: PD clone")?;
+                    unsafe { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
+                    pdpt.0[i] = new_pd | (pdpt.0[i] & !crate::paging::PTE_ADDR_MASK);
+                }
+            }
+        }
+        // Set PTE_USER on PML4[0] and all PDPT/PD entries so user mode can walk them
+        new_pt.0[0] = (new_pdpt | (new_pt.0[0] & !crate::paging::PTE_ADDR_MASK)) | crate::paging::PTE_USER;
+        unsafe {
+            let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
+            for i in 0..512 {
+                if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
+                    pdpt.0[i] |= crate::paging::PTE_USER;
+                    let pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
+                    let pd = &mut *(pd_addr as *mut crate::paging::PageTable);
+                    for j in 0..512 {
+                        if pd.0[j] & crate::paging::PTE_PRESENT != 0 {
+                            pd.0[j] |= crate::paging::PTE_USER;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Highest mapped address (for stack placement)
     let mut max_end = 0u64;
@@ -245,6 +285,39 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
     serial::write_hex(entry);
     serial::write_str(" stack RSP=0x");
     serial::write_hex(USER_STACK_TOP - 16);
+    serial::write_str(" pml4=0x");
+    serial::write_hex(pml4);
+    serial::write_str("\n");
+
+    // Debug: read first 16 bytes of ELF/loaded code
+    let first_page_phys = {
+        let vpn3 = (entry >> 12) & 0x1FF;
+        let vpn2 = (entry >> 21) & 0x1FF;
+        let vpn1 = (entry >> 30) & 0x1FF;
+        let vpn0 = (entry >> 39) & 0x1FF;
+        let pml4_base = pml4 as *const crate::paging::PageTable;
+        let pml4e = unsafe { (*pml4_base).0[vpn0 as usize] };
+        let pdpt = (pml4e & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+        let pdpte = unsafe { (*pdpt).0[vpn1 as usize] };
+        let pd = (pdpte & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+        let pde = unsafe { (*pd).0[vpn2 as usize] };
+        serial::write_str("  PDE=0x");
+        serial::write_hex(pde);
+        serial::write_str("\n");
+        let pt = (pde & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+        let pte = unsafe { (*pt).0[vpn3 as usize] };
+        serial::write_str("  PTE=0x");
+        serial::write_hex(pte);
+        serial::write_str("\n");
+        pte & PTE_ADDR_MASK
+    };
+    // Print first instruction
+    serial::write_str("  code bytes: ");
+    for i in 0..8 {
+        let byte = unsafe { *((first_page_phys + i) as *const u8) };
+        serial::write_hex(byte as u64);
+        serial::write_char(' ');
+    }
     serial::write_str("\n");
 
     Ok(ElfLoadInfo {
