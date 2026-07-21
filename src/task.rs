@@ -506,12 +506,20 @@ pub fn exit_task(code: i32) {
 
     unsafe {
         let idx = task_idx(id);
-        TASKS[idx].state = TaskState::Exited;
+        TASKS[idx].state = TaskState::Zombie;
         TASKS[idx].exit_code = code;
 
-        free_stack(TASKS[idx].kernel_stack, KERNEL_STACK_PAGES);
-        if TASKS[idx].user_stack != 0 {
-            free_stack(TASKS[idx].user_stack, USER_STACK_PAGES);
+        // Parent (or any task waiting on this PID) will free stacks via waitpid
+        // Wake parent if it's blocked waiting for this child
+        if let Some(parent_id) = TASKS[idx].parent {
+            let pidx = task_idx(parent_id);
+            if TASKS[pidx].state == TaskState::Blocked
+                && (TASKS[pidx].blocked_on == id || TASKS[pidx].blocked_on == u64::MAX)
+            {
+                TASKS[pidx].state = TaskState::Ready;
+                TASKS[pidx].blocked_on = 0;
+                enqueue_task(parent_id, TASKS[pidx].prio);
+            }
         }
     }
 
@@ -827,12 +835,18 @@ pub const SYS_shm_notify: u64 = 6;
 pub const SYS_shm_wait: u64 = 7;
 pub const SYS_shm_teardown: u64 = 8;
 pub const SYS_spawn: u64 = 9;
+pub const SYS_waitpid: u64 = 10;
+pub const SYS_read: u64 = 11;
+pub const SYS_open: u64 = 12;
+pub const SYS_mmap: u64 = 13;
+
+pub const WNOHANG: u32 = 1;
 
 #[no_mangle]
 pub extern "C" fn syscall_handler(
     syscall_num: u64,
     arg1: u64, arg2: u64, arg3: u64,
-    arg4: u64, arg5: u64, _arg6: u64
+    arg4: u64, arg5: u64, arg6: u64
 ) -> i64 {
     match syscall_num {
         SYS_exit => sys_exit(arg1 as i32),
@@ -846,6 +860,10 @@ pub extern "C" fn syscall_handler(
         SYS_shm_wait => crate::ipc::shm_wait(arg1),
         SYS_shm_teardown => crate::ipc::shm_teardown(arg1),
         SYS_spawn => sys_spawn(arg1 as *const u8, arg2 as usize),
+        SYS_waitpid => sys_waitpid(arg1 as i64, arg2 as *mut i32, arg3 as u32),
+        SYS_read => sys_read(arg1 as u32, arg2 as *mut u8, arg3 as usize),
+        SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
+        SYS_mmap => sys_mmap(arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as i32, arg5 as i32, arg6 as u64), // offset unused
         _ => -ENOSYS,
     }
 }
@@ -1137,6 +1155,72 @@ pub const ERANGE: i64 = -34;
 pub const ENOSYS: i64 = -38;
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
+    let current = current_task_id();
+    if current == 0 { return -ECHILD; }
+
+    unsafe {
+        loop {
+            let mut found_child = false;
+            for i in 0..MAX_TASKS {
+                let child = &TASKS[i];
+                if child.id == 0 { continue; }
+                if child.parent != Some(current) { continue; }
+
+                // Filter by pid
+                if pid > 0 && child.id as i64 != pid { continue; }
+                if pid == 0 { continue; }
+                found_child = true;
+
+                if child.state == TaskState::Zombie {
+                    let exit_code = child.exit_code;
+                    let child_id = child.id;
+                    let child_ks = child.kernel_stack;
+                    let child_us = child.user_stack;
+
+                    if !status_ptr.is_null() {
+                        core::ptr::write_volatile(status_ptr, (exit_code & 0xFF) << 8);
+                    }
+                    free_stack(child_ks, KERNEL_STACK_PAGES);
+                    if child_us != 0 {
+                        free_stack(child_us, USER_STACK_PAGES);
+                    }
+                    TASKS[i] = Task::empty();
+                    return child_id as i64;
+                }
+            }
+
+            if !found_child {
+                return -ECHILD;
+            }
+
+            if flags & WNOHANG != 0 {
+                return 0;
+            }
+
+            // No zombie yet — yield and retry
+            yield_now();
+        }
+    }
+}
+
+fn sys_read(fd: u32, _buf: *mut u8, _count: usize) -> i64 {
+    if fd == 0 {
+        // stdin — no console input device yet
+        -EAGAIN
+    } else {
+        -EBADF
+    }
+}
+
+fn sys_open(_pathname: *const u8, _flags: i32) -> i64 {
+    -ENOSYS
+}
+
+fn sys_mmap(_addr: *mut u8, _length: usize, _prot: i32, _flags: i32, _fd: i32, _offset: u64) -> i64 {
+    -ENOSYS
+}
 
 pub fn pt_mgr() -> &'static mut PageTableManager {
     crate::paging::pt_mgr()
