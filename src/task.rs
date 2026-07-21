@@ -612,6 +612,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "test rax, rax",
         "jz 3f",
         "mov rsp, rax",
+        "and rsp, ~1",
         "3:",
         "pop r15",
         "pop r14",
@@ -628,7 +629,11 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbx",
         "pop rax",
         "pop rbp",
+        "test rax, 1",
+        "jnz 4f",
         "iretq",
+        "4:",
+        "ret",
 
         save_context = sym save_interrupt_context,
         timer_schedule = sym timer_schedule,
@@ -757,33 +762,56 @@ pub extern "C" fn timer_schedule() -> u64 {
     }
 }
 
+/// Build a stack frame for timer interrupt return.
+/// Returns RSP with bit 0 set for kernel targets (use ret), clear for user (use iretq).
 fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
-        let base = (kernel_stack as *mut u64).sub(20);
-        // Must match pop order in timer_interrupt_handler:
-        // pop r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rbx, rax, rbp
-        *base.add(0)  = regs.r15;
-        *base.add(1)  = regs.r14;
-        *base.add(2)  = regs.r13;
-        *base.add(3)  = regs.r12;
-        *base.add(4)  = regs.r11;
-        *base.add(5)  = regs.r10;
-        *base.add(6)  = regs.r9;
-        *base.add(7)  = regs.r8;
-        *base.add(8)  = regs.rdi;
-        *base.add(9)  = regs.rsi;
-        *base.add(10) = regs.rdx;
-        *base.add(11) = regs.rcx;
-        *base.add(12) = regs.rbx;
-        *base.add(13) = regs.rax;
-        *base.add(14) = regs.rbp;
-        *base.add(15) = regs.rip;
-        *base.add(16) = regs.cs;
-        *base.add(17) = regs.rflags;
-        *base.add(18) = regs.rsp;
-        *base.add(19) = regs.ss;
-        base as u64
+        if (regs.cs & 3) == 0 {
+            // Kernel→kernel: push 15 GP regs + RIP = 16 items, return via ret
+            let base = (kernel_stack as *mut u64).sub(16);
+            *base.add(0)  = regs.r15;
+            *base.add(1)  = regs.r14;
+            *base.add(2)  = regs.r13;
+            *base.add(3)  = regs.r12;
+            *base.add(4)  = regs.r11;
+            *base.add(5)  = regs.r10;
+            *base.add(6)  = regs.r9;
+            *base.add(7)  = regs.r8;
+            *base.add(8)  = regs.rdi;
+            *base.add(9)  = regs.rsi;
+            *base.add(10) = regs.rdx;
+            *base.add(11) = regs.rcx;
+            *base.add(12) = regs.rbx;
+            *base.add(13) = regs.rax;
+            *base.add(14) = regs.rbp;
+            *base.add(15) = regs.rip;
+            (base as u64) | 1
+        } else {
+            // Kernel→user: push 15 GP regs + full iretq frame (RIP, CS, RFLAGS, RSP, SS) = 20 items
+            let base = (kernel_stack as *mut u64).sub(20);
+            *base.add(0)  = regs.r15;
+            *base.add(1)  = regs.r14;
+            *base.add(2)  = regs.r13;
+            *base.add(3)  = regs.r12;
+            *base.add(4)  = regs.r11;
+            *base.add(5)  = regs.r10;
+            *base.add(6)  = regs.r9;
+            *base.add(7)  = regs.r8;
+            *base.add(8)  = regs.rdi;
+            *base.add(9)  = regs.rsi;
+            *base.add(10) = regs.rdx;
+            *base.add(11) = regs.rcx;
+            *base.add(12) = regs.rbx;
+            *base.add(13) = regs.rax;
+            *base.add(14) = regs.rbp;
+            *base.add(15) = regs.rip;
+            *base.add(16) = regs.cs;
+            *base.add(17) = regs.rflags;
+            *base.add(18) = regs.rsp;
+            *base.add(19) = regs.ss;
+            base as u64
+        }
     }
 }
 
