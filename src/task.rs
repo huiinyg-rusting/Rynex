@@ -540,6 +540,7 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov [rdi + 0x68], r13",
         "mov [rdi + 0x70], r14",
         "mov [rdi + 0x78], r15",
+        "mov [rdi + 0x38], rsp",
         "pushfq",
         "pop rax",
         "or rax, 0x200",
@@ -562,17 +563,16 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov r13, [rsi + 0x68]",
         "mov r14, [rsi + 0x70]",
         "mov r15, [rsi + 0x78]",
-        // Check if switching to a user task (CS != 0x08) or kernel task
-        "cmp qword ptr [rsi + 0x90], 8",
-        "jne 2f",
-        // Kernel → kernel: use ret (no 16-byte iretq mismatch)
-        "mov rax, [rsi + 0x80]",
+        // Check if target is user or kernel mode by examining CS.RPL
+        "mov rbx, [rsi + 0x90]",
+        "test bl, 3",
+        "jnz 1f",
+        // Kernel→kernel: push RIP and ret (1 pop = correct RSP alignment)
+        "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
-        "push rax",
         "ret",
-        "2:",
-        // Kernel → user: use iretq
-        "push qword ptr [rsi + 0x98]",
+        // Kernel→user: push full iretq frame (5 pops)
+        "1: push qword ptr [rsi + 0x98]",
         "push qword ptr [rsi + 0x38]",
         "push qword ptr [rsi + 0x88]",
         "push qword ptr [rsi + 0x90]",
@@ -664,8 +664,15 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         regs.rip    = *frame.add(0);
         regs.cs     = *frame.add(1);
         regs.rflags = *frame.add(2);
-        regs.rsp    = *frame.add(3);
-        regs.ss     = KERNEL_DATA_SELECTOR;
+        if (*frame.add(1) & 3) == 3 {
+            // User → kernel: CPU pushed SS and RSP onto kernel stack
+            regs.rsp = *frame.add(3);
+            regs.ss  = *frame.add(4);
+        } else {
+            // Kernel → kernel: only RIP, CS, RFLAGS pushed
+            regs.rsp = frame as u64 + 24;
+            regs.ss  = KERNEL_DATA_SELECTOR;
+        }
     }
 }
 
