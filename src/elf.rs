@@ -84,6 +84,7 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
     let hdr = unsafe { &*(data.as_ptr() as *const Elf64Header) };
 
     // Validate ELF magic
+
     if hdr.ident[0..4] != ELF_MAGIC {
         return Err("bad ELF magic");
     }

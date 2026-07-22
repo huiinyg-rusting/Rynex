@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::buddy::PAGE_SIZE;
 use crate::paging::PageTableManager;
+use crate::paging::PAGE_SIZE_4K;
 use crate::serial;
 
 pub const MAX_TASKS: usize = 64;
@@ -82,6 +83,15 @@ impl Registers {
 }
 
 #[derive(Copy, Clone)]
+pub struct Vma {
+    pub start: u64,
+    pub end: u64,
+    pub flags: u64,
+}
+
+pub const MAX_VMAS: usize = 16;
+
+#[derive(Copy, Clone)]
 pub struct Task {
     pub id: u64,
     pub tgid: u64,
@@ -112,6 +122,16 @@ pub struct Task {
     pub ipc_vaddr: u64,
 
     pub exit_code: i32,
+
+    // brk / heap
+    pub brk_start: u64,
+    pub brk_end: u64,
+
+    // VMAs for mmap/demand paging
+    pub vmas: [Vma; MAX_VMAS],
+
+    // For sleep syscall
+    pub wakeup_tick: u64,
 }
 
 impl Task {
@@ -144,6 +164,10 @@ impl Task {
             ipc_phys: 0,
             ipc_vaddr: 0,
             exit_code: 0,
+            brk_start: 0,
+            brk_end: 0,
+            vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
+            wakeup_tick: 0,
         }
     }
 }
@@ -377,51 +401,44 @@ pub fn schedule() {
 
     let current = CURRENT_TASK.load(Ordering::SeqCst);
 
-    if current != 0 {
-        unsafe {
-            let idx = task_idx(current);
-            if TASKS[idx].state == TaskState::Running {
-                TASKS[idx].state = TaskState::Ready;
-                enqueue_task(current, TASKS[idx].prio);
-            }
-        }
-    }
-
+    // Pick a different task. If the highest-priority task IS current,
+    // remove it from the queue and look for another one.
     let next_id = 'pick: {
-        let picked = dequeue_task();
-        match picked {
-            Some(id) if id == current => {
-                unsafe { enqueue_task(current, TASKS[task_idx(current)].prio); }
-                let prio = unsafe { TASKS[task_idx(current)].prio as usize };
-                unsafe { RUNQUEUE.bitmap &= !(1u64 << prio); }
-                let next = dequeue_task();
-                unsafe { RUNQUEUE.bitmap |= 1u64 << prio; }
-                match next {
-                    Some(id2) => { break 'pick id2; }
-                    None => {
-                        crate::serial::write_str(" schedule: only current task\n");
-                        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
-                        return;
-                    }
+        let first = dequeue_task();
+        match first {
+            Some(id) if id != current => break 'pick id,
+            Some(_) => {
+                let second = dequeue_task();
+                match second {
+                    Some(other) if other != current => break 'pick other,
+                    Some(other) => unsafe { enqueue_task(other, TASKS[task_idx(other)].prio); },
+                    None => {}
                 }
+                unsafe {
+                    enqueue_task(current, TASKS[task_idx(current)].prio);
+                    TASKS[task_idx(current)].state = TaskState::Running;
+                }
+                unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
+                return;
             }
-            Some(id) => { break 'pick id; }
             None => {
-                crate::serial::write_str(" schedule: no tasks\n");
                 unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
                 return;
             }
         }
     };
 
+    // Enqueue current task (if still active) before switching
+    if current != 0 {
+        let cur_idx = task_idx(current);
+        let state = unsafe { TASKS[cur_idx].state };
+        if state == TaskState::Ready {
+            let prio = unsafe { TASKS[cur_idx].prio };
+            unsafe { enqueue_task(current, prio); }
+        }
+    }
+
     let new_idx = task_idx(next_id);
-    crate::serial::write_str(" sched ");
-    crate::serial::write_dec(current);
-    crate::serial::write_str("->");
-    crate::serial::write_dec(next_id);
-    crate::serial::write_str(" pml4=0x");
-    crate::serial::write_hex(unsafe { TASKS[new_idx].pml4 });
-    crate::serial::write_str("\n");
 
     unsafe { crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack); }
 
@@ -430,47 +447,10 @@ pub fn schedule() {
     unsafe {
         TASKS[new_idx].state = TaskState::Running;
         pt_mgr().switch_to(TASKS[new_idx].pml4);
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3);
-        crate::serial::write_str(" cr3=0x");
-        crate::serial::write_hex(cr3);
-        crate::serial::write_str(" ok ks=0x");
-        crate::serial::write_hex(TASKS[new_idx].kernel_stack);
-        crate::serial::write_str("\n");
 
         let old_idx = task_idx(old);
         let old_ptr = &mut TASKS[old_idx].regs as *mut Registers;
         let new_ptr = &TASKS[new_idx].regs as *const Registers;
-
-        // Debug: test write to user stack before context switch
-        let user_rsp = (*new_ptr).rsp;
-        crate::serial::write_str("  debug: new.rsp=0x");
-        crate::serial::write_hex(user_rsp);
-        crate::serial::write_str("\n");
-        let test_addr = user_rsp - 40;
-        unsafe {
-            core::ptr::write_volatile(test_addr as *mut u64, 0x42);
-            let val = core::ptr::read_volatile(test_addr as *const u64);
-            crate::serial::write_str("  debug: user stack RW test at 0x");
-            crate::serial::write_hex(test_addr);
-            crate::serial::write_str(" val=0x");
-            crate::serial::write_hex(val);
-            crate::serial::write_str("\n");
-        }
-
-        crate::serial::write_str("  dbg: oldp=0x");
-        crate::serial::write_hex(old_ptr as u64);
-        crate::serial::write_str(" newp=0x");
-        crate::serial::write_hex(new_ptr as u64);
-        crate::serial::write_str(" cs=0x");
-        crate::serial::write_hex((*new_ptr).cs);
-        crate::serial::write_str(" rip=0x");
-        crate::serial::write_hex((*new_ptr).rip);
-        crate::serial::write_str(" rsp=0x");
-        crate::serial::write_hex((*new_ptr).rsp);
-        crate::serial::write_str(" ss=0x");
-        crate::serial::write_hex((*new_ptr).ss);
-        crate::serial::write_str("\n");
 
         core::arch::asm!(
             "mov rdi, {old}",
@@ -493,7 +473,6 @@ pub fn yield_now() {
         if TASKS[idx].state == TaskState::Running {
             TASKS[idx].state = TaskState::Ready;
             TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
-            enqueue_task(id, TASKS[idx].prio);
         }
     }
 
@@ -637,11 +616,18 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbx",
         "pop rax",
         "pop rbp",
-        "test rax, 1",
+        // RSP now points to RIP in the frame.
+        // Check FRAME_IS_KERNEL (set by build_frame): 1 = kernel ret, 0 = user iretq.
+        "movzx ecx, byte ptr [{frame_kernel}]",
+        "test ecx, 1",
         "jnz 4f",
+        // Kernel→user: iretq pops RIP, CS, RFLAGS, RSP, SS
         "iretq",
+        // Kernel→kernel: ret pops RIP
         "4:",
         "ret",
+
+        frame_kernel = sym FRAME_IS_KERNEL,
 
         save_context = sym save_interrupt_context,
         timer_schedule = sym timer_schedule,
@@ -698,13 +684,28 @@ pub extern "C" fn inc_ticks() {
 static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub extern "C" fn timer_schedule() -> u64 {
-    let c = SCHED_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if c < 3 {
-        crate::serial::write_str("SCHED: call ");
-        crate::serial::write_dec(c);
-        crate::serial::write_str("\n");
-    }
     crate::pic::send_eoi(0);
+
+    // Poll UART for serial input and feed into keyboard buffer
+    while let Some(c) = crate::serial::read_byte_nonblocking() {
+        crate::keyboard::push_char(c);
+    }
+
+    // Wake up sleeping tasks whose wakeup tick has arrived
+    let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].state == TaskState::Blocked
+                && TASKS[i].wakeup_tick > 0
+                && TASKS[i].wakeup_tick <= now
+                && TASKS[i].id != 0
+            {
+                TASKS[i].state = TaskState::Ready;
+                TASKS[i].wakeup_tick = 0;
+                enqueue_task(TASKS[i].id, TASKS[i].prio);
+            }
+        }
+    }
 
     let current = CURRENT_TASK.load(Ordering::SeqCst);
     if current == 0 {
@@ -729,39 +730,28 @@ pub extern "C" fn timer_schedule() -> u64 {
             return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
-        // Time slice expired — requeue and pick next
-        crate::serial::write_str("SCHED: expire ");
-        crate::serial::write_dec(current);
-        crate::serial::write_str("\n");
-        TASKS[idx].state = TaskState::Ready;
+        // Time slice expired — give a fresh time slice
         TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
-        enqueue_task(current, TASKS[idx].prio);
 
+        // Try to find a different task; if only current task is waiting, just keep running
         let next_id = match dequeue_task() {
             Some(id) => id,
             None => {
-                crate::serial::write_str("SCHED: no task\n");
                 TASKS[idx].state = TaskState::Running;
                 return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
             }
         };
 
         if next_id == current {
-            crate::serial::write_str("SCHED: same ");
-            crate::serial::write_dec(next_id);
-            crate::serial::write_str("\n");
             TASKS[idx].state = TaskState::Running;
             return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
+        // Switch to a different task — requeue current first
+        TASKS[idx].state = TaskState::Ready;
+        enqueue_task(current, TASKS[idx].prio);
+
         let new_idx = task_idx(next_id);
-        crate::serial::write_str("SCHED: ");
-        crate::serial::write_dec(current);
-        crate::serial::write_str(" -> ");
-        crate::serial::write_dec(next_id);
-        crate::serial::write_str(" (pml4=0x");
-        crate::serial::write_hex(TASKS[new_idx].pml4);
-        crate::serial::write_str(")\n");
         TASKS[new_idx].state = TaskState::Running;
         CURRENT_TASK.store(next_id, Ordering::SeqCst);
         pt_mgr().switch_to(TASKS[new_idx].pml4);
@@ -770,12 +760,16 @@ pub extern "C" fn timer_schedule() -> u64 {
     }
 }
 
+/// Set by build_frame: 0 = user frame (iretq), 1 = kernel frame (ret).
+#[no_mangle]
+static mut FRAME_IS_KERNEL: u8 = 0;
+
 /// Build a stack frame for timer interrupt return.
-/// Returns RSP with bit 0 set for kernel targets (use ret), clear for user (use iretq).
 fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
         if (regs.cs & 3) == 0 {
+            FRAME_IS_KERNEL = 1;
             // Kernel→kernel: push 15 GP regs + RIP = 16 items, return via ret
             let base = (kernel_stack as *mut u64).sub(16);
             *base.add(0)  = regs.r15;
@@ -794,8 +788,9 @@ fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
             *base.add(13) = regs.rax;
             *base.add(14) = regs.rbp;
             *base.add(15) = regs.rip;
-            (base as u64) | 1
+            base as u64
         } else {
+            FRAME_IS_KERNEL = 0;
             // Kernel→user: push 15 GP regs + full iretq frame (RIP, CS, RFLAGS, RSP, SS) = 20 items
             let base = (kernel_stack as *mut u64).sub(20);
             *base.add(0)  = regs.r15;
@@ -839,6 +834,12 @@ pub const SYS_waitpid: u64 = 10;
 pub const SYS_read: u64 = 11;
 pub const SYS_open: u64 = 12;
 pub const SYS_mmap: u64 = 13;
+pub const SYS_fork: u64 = 14;
+pub const SYS_execve: u64 = 15;
+pub const SYS_getpid: u64 = 16;
+pub const SYS_getppid: u64 = 17;
+pub const SYS_sleep: u64 = 18;
+pub const SYS_brk: u64 = 19;
 
 pub const WNOHANG: u32 = 1;
 
@@ -863,7 +864,13 @@ pub extern "C" fn syscall_handler(
         SYS_waitpid => sys_waitpid(arg1 as i64, arg2 as *mut i32, arg3 as u32),
         SYS_read => sys_read(arg1 as u32, arg2 as *mut u8, arg3 as usize),
         SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
-        SYS_mmap => sys_mmap(arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as i32, arg5 as i32, arg6 as u64), // offset unused
+        SYS_mmap => sys_mmap(arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as i32, arg5 as i32, arg6 as u64),
+        SYS_fork => sys_fork(),
+        SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
+        SYS_getpid => sys_getpid(),
+        SYS_getppid => sys_getppid(),
+        SYS_sleep => sys_sleep(arg1 as u64),
+        SYS_brk => sys_brk(arg1 as u64),
         _ => -ENOSYS,
     }
 }
@@ -877,17 +884,29 @@ fn sys_exit(status: i32) -> i64 {
 }
 
 fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
-    if fd == 1 && !buf.is_null() && count > 0 {
-        let mut total = 0;
-        while total < count {
-            let c = unsafe { *buf.add(total) };
+    if fd == 1 {
+        // stdout — write to serial
+        if buf.is_null() || count == 0 { return 0; }
+        let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+        for &c in slice {
             if c == 0 { break; }
             serial::write_char(c as char);
-            total += 1;
         }
-        total as i64
+        count as i64
     } else {
-        -EBADF
+        // Try writing to a VFS file descriptor
+        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+            Some(f) => f,
+            None => return -EBADF,
+        };
+        let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+        match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
+            Some(n) => {
+                inode_fd.pos += n;
+                n as i64
+            }
+            None => -EIO,
+        }
     }
 }
 
@@ -1152,6 +1171,7 @@ pub const EMLINK: i64 = -31;
 pub const EPIPE: i64 = -32;
 pub const EDOM: i64 = -33;
 pub const ERANGE: i64 = -34;
+pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -1205,21 +1225,597 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
     }
 }
 
-fn sys_read(fd: u32, _buf: *mut u8, _count: usize) -> i64 {
+fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if fd == 0 {
-        // stdin — no console input device yet
-        -EAGAIN
+        if buf.is_null() || count == 0 { return 0; }
+        let addr = &raw const crate::keyboard::RING_BUF as u64;
+        loop {
+            if crate::keyboard::KEY_COUNT.load(Ordering::SeqCst) > 0 {
+                let mut written = 0usize;
+                while written < count {
+                    match crate::keyboard::pop_char() {
+                        Some(c) => {
+                            unsafe { *buf.add(written) = c; }
+                            written += 1;
+                            if c == b'\n' || c == b'\r' { break; }
+                        }
+                        None => break,
+                    }
+                }
+                return written as i64;
+            }
+            unsafe {
+                let idx = task_idx(current_task_id());
+                TASKS[idx].blocked_on = addr;
+                TASKS[idx].state = TaskState::Blocked;
+            }
+            schedule();
+        }
     } else {
-        -EBADF
+        // Read from VFS file descriptor
+        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+            Some(f) => f,
+            None => return -EBADF,
+        };
+        let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+        match crate::vfs::inode_read(inode_fd.inode_idx, inode_fd.pos, slice) {
+            Some(n) => {
+                inode_fd.pos += n;
+                n as i64
+            }
+            None => -EIO,
+        }
     }
 }
 
-fn sys_open(_pathname: *const u8, _flags: i32) -> i64 {
-    -ENOSYS
+fn sys_open(pathname: *const u8, flags: i32) -> i64 {
+    if pathname.is_null() {
+        return -EFAULT;
+    }
+    // Read path string from user space
+    let mut name_buf = [0u8; 256];
+    let mut len = 0;
+    loop {
+        let c = unsafe { *pathname.add(len) };
+        if c == 0 { break; }
+        if len >= 255 { return -ENAMETOOLONG; }
+        name_buf[len] = c;
+        len += 1;
+    }
+    let name = &name_buf[..len];
+
+    match crate::vfs::find_inode(name) {
+        Some(inode_idx) => {
+            match crate::vfs::alloc_fd(inode_idx, flags) {
+                Some(fd) => fd as i64,
+                None => -EMFILE,
+            }
+        }
+        None => -ENOENT,
+    }
 }
 
-fn sys_mmap(_addr: *mut u8, _length: usize, _prot: i32, _flags: i32, _fd: i32, _offset: u64) -> i64 {
-    -ENOSYS
+// ── Mmap ──────────────────────────────────────────────────────────
+
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const PROT_EXEC: i32 = 4;
+const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_ANONYMOUS: i32 = 32;
+
+fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offset: u64) -> i64 {
+    if fd != -1 && (flags & MAP_ANONYMOUS) == 0 {
+        return -ENOSYS; // File-backed mmap not yet supported
+    }
+    if (flags & MAP_SHARED) != 0 {
+        return -ENOSYS; // Shared mmap not yet supported
+    }
+
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    let page_addr = if addr.is_null() {
+        0 // We'll pick an address
+    } else {
+        (addr as u64) & !0xFFF
+    };
+
+    let size = ((length + 0xFFF) & !0xFFF) as u64;
+
+    // Build PTE flags from prot
+    let mut pte_flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER;
+    if (prot & PROT_WRITE) != 0 {
+        pte_flags |= crate::paging::PTE_WRITABLE;
+    }
+    if (prot & PROT_EXEC) == 0 {
+        pte_flags |= crate::paging::PTE_NO_EXECUTE;
+    }
+
+    unsafe {
+        let idx = task_idx(id);
+        let pml4 = TASKS[idx].pml4;
+
+        // Find a free address if none specified
+        let final_addr = if page_addr == 0 {
+            // Scan for a free hole: start at 0x7000000000 (high enough to avoid ELF/stack)
+            let mut candidate = 0x7000_0000u64;
+            let mut found = false;
+            'search: while candidate + size <= 0x0000_7FFF_FFFF_F000 {
+                // Check if candidate overlaps with any VMA
+                let mut overlap = false;
+                for vma in &TASKS[idx].vmas {
+                    if vma.start == 0 && vma.end == 0 { continue; }
+                    if candidate < vma.end && candidate + size > vma.start {
+                        overlap = true;
+                        candidate = vma.end;
+                        continue 'search;
+                    }
+                }
+                if !overlap {
+                    found = true;
+                    break 'search;
+                }
+                candidate += PAGE_SIZE_4K;
+            }
+            if !found {
+                return -ENOMEM;
+            }
+            candidate
+        } else {
+            page_addr
+        };
+
+        // Register VMA for demand paging
+        let mut vma_added = false;
+        for vma in TASKS[idx].vmas.iter_mut() {
+            if vma.start == 0 && vma.end == 0 {
+                vma.start = final_addr;
+                vma.end = final_addr + size;
+                vma.flags = pte_flags;
+                vma_added = true;
+                break;
+            }
+        }
+        if !vma_added {
+            return -ENOMEM; // Too many VMAs
+        }
+
+        serial::write_str("SYS_MMAP: addr=0x");
+        serial::write_hex(final_addr);
+        serial::write_str(" size=0x");
+        serial::write_hex(size);
+        serial::write_str(" prot=");
+        serial::write_dec(prot as u64);
+        serial::write_str("\n");
+
+        final_addr as i64
+    }
+}
+
+// ── Fork ──────────────────────────────────────────────────────────
+
+fn sys_fork() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    unsafe {
+        let child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
+        let child_idx = task_idx(child_tid);
+
+        // Ensure slot is free
+        if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
+            return -ENOMEM;
+        }
+
+        let parent_idx = task_idx(id);
+        let parent = &TASKS[parent_idx];
+        let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
+            Some(s) => s,
+            None => return -ENOMEM,
+        };
+
+        // Clone PML4 with COW
+        let child_pml4 = match crate::paging::cow_fork_pml4(parent.pml4) {
+            Some(p) => p,
+            None => {
+                free_stack(kernel_stack, KERNEL_STACK_PAGES);
+                return -ENOMEM;
+            }
+        };
+
+        // Set up child task: copy register state but set rax=0 (return value)
+        let mut child_regs = parent.regs;
+        child_regs.rax = 0; // Child gets 0 from fork
+
+        let child = &mut TASKS[child_idx];
+        *child = Task {
+            id: child_tid,
+            tgid: child_tid,
+            state: TaskState::Ready,
+            regs: child_regs,
+            kernel_stack,
+            user_stack: parent.user_stack,
+            pml4: child_pml4,
+            static_prio: parent.static_prio,
+            normal_prio: parent.normal_prio,
+            prio: parent.prio,
+            time_slice: initial_time_slice(parent.prio),
+            parent: Some(id),
+            children_head: None,
+            sibling_next: None,
+            blocked_on: 0,
+            pi_boosted: false,
+            runqueue_next: None,
+            ipc_partner: 0,
+            ipc_phys: 0,
+            ipc_vaddr: 0,
+            exit_code: 0,
+            brk_start: parent.brk_start,
+            brk_end: parent.brk_end,
+            vmas: parent.vmas,
+            wakeup_tick: 0,
+        };
+
+        enqueue_task(child_tid, child.prio);
+
+        serial::write_str("SYS_FORK: child ");
+        serial::write_dec(child_tid);
+        serial::write_str(" (parent ");
+        serial::write_dec(id);
+        serial::write_str(")\n");
+
+        child_tid as i64
+    }
+}
+
+// ── Execve ────────────────────────────────────────────────────────
+
+fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    if pathname.is_null() {
+        return -EFAULT;
+    }
+
+    // Read path string from user space
+    let mut path_buf = [0u8; 256];
+    let mut len = 0;
+    loop {
+        let c = unsafe { *pathname.add(len) };
+        if c == 0 { break; }
+        if len >= 255 { return -ENAMETOOLONG; }
+        path_buf[len] = c;
+        len += 1;
+    }
+    let path = &path_buf[..len];
+
+    serial::write_str("SYS_EXECVE: '");
+    for &c in path { serial::write_char(c as char); }
+    serial::write_str("'\n");
+
+    // Look up the file in VFS
+    let inode_idx = match crate::vfs::find_inode(path) {
+        Some(idx) => idx,
+        None => {
+            serial::write_str("SYS_EXECVE: file not found\n");
+            return -ENOENT;
+        }
+    };
+
+    // Read ELF data from the inode
+    let elf_size = match crate::vfs::inode_size(inode_idx) {
+        Some(sz) => sz,
+        None => return -EIO,
+    };
+    if elf_size < 64 || elf_size > 1024 * 1024 * 16 {
+        return -EINVAL;
+    }
+
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let pages_needed = (elf_size + 0xFFF) / 0x1000;
+    let mut elford = 0;
+    while (4096usize << elford) < pages_needed * 4096 && elford < 10 {
+        elford += 1;
+    }
+    let buffer_phys = match alloc.alloc(elford) {
+        Some(p) => p,
+        None => return -ENOMEM,
+    };
+    let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_phys as *mut u8, elf_size) };
+    match crate::vfs::inode_read(inode_idx, 0, buffer) {
+        Some(n) if n == elf_size => {}
+        _ => {
+            alloc.free(buffer_phys, elford);
+            return -EIO;
+        }
+    }
+
+    // Load the ELF
+    match crate::elf::load_elf(buffer) {
+        Ok(info) => {
+            unsafe {
+                let idx = task_idx(id);
+                let old_pml4 = TASKS[idx].pml4;
+                let old_us = TASKS[idx].user_stack;
+
+                // Set up argv on the new user stack
+                let mut sp = info.stack_top;
+
+                // Simple argv setup: copy strings from user space to the new stack
+                if argv != 0 {
+                    // Count argv
+                    let mut argc: usize = 0;
+                    loop {
+                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(argc)) };
+                        if ptr == 0 { break; }
+                        argc += 1;
+                    }
+
+                    // Layout on new stack (downward):
+                    // [8-byte alignment padding]
+                    // [string data]
+                    // [argv pointers (8 bytes each)]
+                    // [argc (8 bytes)]
+                    // [return address placeholder]
+
+                    // First pass: calculate total string length
+                    let mut total_str_len = 0usize;
+                    let mut arg_ptrs = [0u64; 64];
+                    let mut arg_lens = [0usize; 64];
+                    for i in 0..argc {
+                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(i)) };
+                        if ptr == 0 { break; }
+                        // Copy string from user space
+                        let mut s = 0;
+                        loop {
+                            let c = unsafe { *(ptr as *const u8).add(s) };
+                            if c == 0 { break; }
+                            s += 1;
+                        }
+                        arg_lens[i] = s;
+                        total_str_len += s + 1; // +1 for null terminator
+                    }
+
+                    // Align to 8 bytes
+                    let aligned_str_len = (total_str_len + 7) & !7;
+                    let argv_area = aligned_str_len; // area for argv ptrs (below strings)
+
+                    // sp is the top of stack (highest address)
+                    // We layout from sp downward:
+                    // sp - total = strings (growing down from sp)
+                    // Below strings: argv pointers
+                    // Below argv: argc
+                    // Then return address
+
+                    let strings_start = sp - aligned_str_len as u64;
+                    let mut string_pos = sp - total_str_len as u64; // start writing from here (unaligned)
+
+                    for i in 0..argc {
+                        // Record argv pointer (within the stack area)
+                        arg_ptrs[i] = string_pos;
+                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(i)) };
+                        // Copy string byte by byte
+                        let mut j = 0;
+                        loop {
+                            let c = unsafe { *(ptr as *const u8).add(j) };
+                            if c == 0 { break; }
+                            unsafe { *(string_pos as *mut u8) = c; }
+                            string_pos += 1;
+                            j += 1;
+                        }
+                        unsafe { *(string_pos as *mut u8) = 0; }
+                        string_pos += 1;
+                    }
+                    // Pad to alignment
+                    string_pos = strings_start + aligned_str_len as u64;
+
+                    // Now place argv pointers (growing downward from aligned_str_len area)
+                    let argv_ptr_area = strings_start - ((argc + 1) * 8) as u64;
+                    for i in 0..argc {
+                        unsafe { core::ptr::write_volatile((argv_ptr_area + i as u64 * 8) as *mut u64, arg_ptrs[i]); }
+                    }
+                    unsafe { core::ptr::write_volatile((argv_ptr_area + argc as u64 * 8) as *mut u64, 0u64); } // NULL terminator
+
+                    // Place argc
+                    let argc_pos = argv_ptr_area - 8;
+                    unsafe { core::ptr::write_volatile(argc_pos as *mut u64, argc as u64); }
+
+                    // Set up registers for ELF entry with argc/argv on stack
+                    // RSP should point to argc on the stack (Linux-style: argc at (%rsp))
+                    sp = argc_pos;
+
+                    TASKS[idx].regs = Registers::new_user(info.entry, sp);
+                } else {
+                    TASKS[idx].regs = Registers::new_user(info.entry, info.stack_top);
+                }
+
+                TASKS[idx].pml4 = info.pml4;
+                TASKS[idx].user_stack = info.stack_top;
+                TASKS[idx].brk_start = 0;
+                TASKS[idx].brk_end = 0;
+                TASKS[idx].vmas = [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS];
+
+                // Free old PML4 page (physical address)
+                alloc.free(old_pml4, 0);
+                // Old user stack pages are not freed here — they'll be reclaimed
+                // when the parent reaps this task via waitpid
+
+                serial::write_str("SYS_EXECVE: task ");
+                serial::write_dec(id);
+                serial::write_str(" entry=0x");
+                serial::write_hex(info.entry);
+                serial::write_str(" rsp=0x");
+                serial::write_hex(sp);
+                serial::write_str("\n");
+
+                serial::write_str("EXECVE: pm4=");
+                serial::write_hex(TASKS[idx].pml4);
+                serial::write_str(" sw\n");
+                pt_mgr().switch_to(TASKS[idx].pml4);
+                crate::gdt::set_tss_rsp0(TASKS[idx].kernel_stack);
+
+                // Use context_switch with a temp save location so the
+                // new ELF's regs (already in TASKS[idx].regs) take effect.
+                static mut EXECVE_TMP: Registers = Registers {
+                    rax: 0, rbx: 0, rcx: 0, rdx: 0,
+                    rsi: 0, rdi: 0, rbp: 0, rsp: 0,
+                    r8: 0, r9: 0, r10: 0, r11: 0,
+                    r12: 0, r13: 0, r14: 0, r15: 0,
+                    rip: 0, rflags: 0, cs: 0, ss: 0,
+                };
+                context_switch(&mut EXECVE_TMP, &TASKS[idx].regs);
+            } // unsafe
+        }
+        Err(e) => {
+            alloc.free(buffer_phys, elford);
+            serial::write_str("SYS_EXECVE: ELF load failed: ");
+            let mut i = 0;
+            while i < 40 {
+                let c = e.as_bytes().get(i).copied().unwrap_or(0);
+                if c == 0 { break; }
+                serial::write_char(c as char);
+                i += 1;
+            }
+            serial::write_str("\n");
+            -ENOEXEC
+        }
+    }
+}
+
+// ── Get PID / PPID ───────────────────────────────────────────────
+
+fn sys_getpid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    id as i64
+}
+
+fn sys_getppid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe {
+        match TASKS[task_idx(id)].parent {
+            Some(pid) => pid as i64,
+            None => 0,
+        }
+    }
+}
+
+// ── Sleep ─────────────────────────────────────────────────────────
+
+fn sys_sleep(ticks: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    let now = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+
+    unsafe {
+        let idx = task_idx(id);
+        TASKS[idx].wakeup_tick = now + ticks;
+        TASKS[idx].state = TaskState::Blocked;
+    }
+
+    schedule();
+    0
+}
+
+// ── Brk ───────────────────────────────────────────────────────────
+
+fn sys_brk(addr: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    unsafe {
+        let idx = task_idx(id);
+
+        // If addr is 0, return current brk_end (SYS_brk(0) query)
+        if addr == 0 {
+            return TASKS[idx].brk_end as i64;
+        }
+
+        let vma = &mut TASKS[idx].vmas;
+        let brk_start = if TASKS[idx].brk_start == 0 {
+            // First brk call: use addr as start
+            TASKS[idx].brk_start = addr;
+            TASKS[idx].brk_end = addr;
+
+            // Register VMA for heap
+            for v in vma.iter_mut() {
+                if v.start == 0 && v.end == 0 {
+                    v.start = addr;
+                    v.end = addr;
+                    v.flags = crate::paging::PTE_PRESENT
+                        | crate::paging::PTE_WRITABLE
+                        | crate::paging::PTE_USER
+                        | crate::paging::PTE_NO_EXECUTE;
+                    break;
+                }
+            }
+            addr
+        } else {
+            TASKS[idx].brk_start
+        };
+
+        if addr < brk_start {
+            // Can't shrink below start
+            return TASKS[idx].brk_end as i64;
+        }
+
+        let old_end = TASKS[idx].brk_end;
+        TASKS[idx].brk_end = addr;
+
+        // Update VMA end
+        for v in vma.iter_mut() {
+            if v.start == brk_start {
+                v.end = addr;
+                break;
+            }
+        }
+
+        serial::write_str("SYS_BRK: brk=0x");
+        serial::write_hex(addr);
+        serial::write_str("\n");
+
+        addr as i64
+    }
+}
+
+pub fn current_task_pml4() -> u64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].pml4 }
+}
+
+/// Handle demand paging for mmap'd (or brk) regions.
+/// Returns true if the page was allocated and mapped.
+pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return false; }
+    unsafe {
+        let idx = task_idx(id);
+        for vma in &TASKS[idx].vmas {
+            if vma.start == 0 && vma.end == 0 { continue; }
+            if cr2 >= vma.start && cr2 < vma.end {
+                let alloc = &mut *crate::memory::allocator();
+                let phys = match alloc.alloc(0) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let page_addr = cr2 & !0xFFF;
+                if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
+                    return false;
+                }
+                crate::serial::write_str("  DMD: allocated page for 0x");
+                crate::serial::write_hex(page_addr);
+                crate::serial::write_str(" phys=0x");
+                crate::serial::write_hex(phys);
+                crate::serial::write_str("\n");
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn pt_mgr() -> &'static mut PageTableManager {
@@ -1248,8 +1844,9 @@ pub fn test() {
 
     serial::write_str("TASK: testing kernel task creation...\n");
 
-    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, -10);
-    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 5);
+    // Kernel test tasks get low priority (high nice) so user tasks always run first
+    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, 19);
+    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 19);
 
     serial::write_str("TASK: task IDs: ");
     serial::write_dec(tid1.unwrap());
@@ -1257,44 +1854,57 @@ pub fn test() {
     serial::write_dec(tid2.unwrap());
     serial::write_str("\n");
 
-    // Load user ELF from multiboot2 module
+    // Load user ELF modules from multiboot2
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 4];
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
-        if n > 0 {
+        // Register ALL modules in VFS, then load the first one as init
+        for i in 0..n {
             let mod_data = unsafe {
                 core::slice::from_raw_parts(
-                    modules[0].start as *const u8,
-                    (modules[0].end - modules[0].start) as usize,
+                    modules[i].start as *const u8,
+                    (modules[i].end - modules[i].start) as usize,
                 )
             };
-            serial::write_str("TASK: loading user ELF from module (");
+            serial::write_str("TASK: module ");
+            serial::write_dec(i as u64);
+            serial::write_str(": ");
             serial::write_dec(mod_data.len() as u64);
-            serial::write_str(" bytes @ 0x");
-            serial::write_hex(modules[0].start);
-            serial::write_str(")\n");
-            // Debug: print first 16 bytes
-            let first_bytes = &mod_data[..16.min(mod_data.len())];
-            for &b in first_bytes {
-                serial::write_hex(b as u64);
-                serial::write_char(' ');
-            }
-            serial::write_str("\n");
-            match crate::elf::load_elf(mod_data) {
-                Ok(elf_info) => {
-                    if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
-                        serial::write_str("TASK: created user task ");
-                        serial::write_dec(tid);
-                        serial::write_str(" entry=0x");
-                        serial::write_hex(elf_info.entry);
-                        serial::write_str("\n");
+            serial::write_str(" bytes\n");
+
+            // Check ELF magic
+            if mod_data.len() >= 4 && mod_data[0] == 0x7f && mod_data[1] == b'E'
+                && mod_data[2] == b'L' && mod_data[3] == b'F'
+            {
+                // Register each module with the right name
+                match i {
+                    0 => {
+                        crate::vfs::create_file(b"/bin/init", mod_data);
+                        match crate::elf::load_elf(mod_data) {
+                            Ok(elf_info) => {
+                                if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
+                                    serial::write_str("TASK: created user init task ");
+                                    serial::write_dec(tid);
+                                    serial::write_str(" entry=0x");
+                                    serial::write_hex(elf_info.entry);
+                                    serial::write_str("\n");
+                                }
+                            }
+                            Err(e) => {
+                                serial::write_str("TASK: ELF load failed: ");
+                                serial::write_str(e);
+                                serial::write_str("\n");
+                            }
+                        }
                     }
-                }
-                Err(e) => {
-                    serial::write_str("TASK: ELF load failed: ");
-                    serial::write_str(e);
-                    serial::write_str("\n");
+                    1 => {
+                        crate::vfs::create_file(b"/bin/hello", mod_data);
+                    }
+                    2 => {
+                        crate::vfs::create_file(b"/bin/shell", mod_data);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1329,19 +1939,6 @@ pub fn test() {
     unsafe {
         let old_ptr = &mut TASKS[0].regs as *mut Registers;
         let new_ptr = &new_task.regs as *const Registers;
-        serial::write_str("  dbg_init: oldp=0x");
-        serial::write_hex(old_ptr as u64);
-        serial::write_str(" newp=0x");
-        serial::write_hex(new_ptr as u64);
-        serial::write_str(" cs=0x");
-        serial::write_hex((*new_ptr).cs);
-        serial::write_str(" ss=0x");
-        serial::write_hex((*new_ptr).ss);
-        serial::write_str(" rsp=0x");
-        serial::write_hex((*new_ptr).rsp);
-        serial::write_str(" rip=0x");
-        serial::write_hex((*new_ptr).rip);
-        serial::write_str("\n");
         core::arch::asm!(
             "mov rdi, {old}",
             "mov rsi, {new}",
