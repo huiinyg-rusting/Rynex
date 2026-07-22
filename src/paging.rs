@@ -400,7 +400,7 @@ pub fn init() {
     crate::serial::write_str("PAGING: init done\n");
 }
 
-pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
+pub fn get_pte_in(pml4: u64, virt: u64) -> Option<&'static mut u64> {
     let vpn = [
         ((virt >> 39) & 0x1FF) as usize,
         ((virt >> 30) & 0x1FF) as usize,
@@ -408,8 +408,7 @@ pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
         ((virt >> 12) & 0x1FF) as usize,
     ];
 
-    let pml4 = pt_mgr().kernel_pml4() as *const PageTable;
-    let pml4e = unsafe { (*pml4).0[vpn[0]] };
+    let pml4e = unsafe { (*(pml4 as *const PageTable)).0[vpn[0]] };
     if pml4e & PTE_PRESENT == 0 { return None; }
 
     let pdpt = (pml4e & PTE_ADDR_MASK) as *const PageTable;
@@ -422,19 +421,128 @@ pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
     if pde & PTE_HUGE != 0 { return None; }
 
     let pt = (pde & PTE_ADDR_MASK) as *const PageTable;
-    let pte = unsafe { &(*pt).0[vpn[3]] };
-    if *pte & PTE_PRESENT == 0 { return None; }
+    let pte = unsafe { (*pt).0[vpn[3]] };
+    if pte & PTE_PRESENT == 0 { return None; }
 
     let pt_mut = (pde & PTE_ADDR_MASK) as *mut PageTable;
     Some(unsafe { &mut (*pt_mut).0[vpn[3]] })
+}
+
+pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
+    let kernel_pml4 = KERNEL_PML4.load(Ordering::SeqCst);
+    get_pte_in(kernel_pml4, virt)
 }
 
 pub fn is_user_addr(addr: u64) -> bool {
     addr < 0x0000_8000_0000_0000
 }
 
-pub fn cow_remap(virt: u64) -> bool {
-    let pte = match get_pte(virt) {
+// Clone the current process's PML4 for fork.
+// Creates a new PML4 with private (deep-copied) user page tables.
+// User 4K pages are shared with COW (read-only in child, read-only in parent too).
+// 2M/1G huge pages (kernel identity map) stay shared writable.
+pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let new_pml4 = alloc.alloc(0)?;
+    unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
+
+    let old_table = unsafe { &*(old_pml4 as *const PageTable) };
+    let new_table = unsafe { &mut *(new_pml4 as *mut PageTable) };
+
+    // Copy kernel PML4 entries (indices 256-511)
+    let kernel_pml4_val = KERNEL_PML4.load(Ordering::Relaxed);
+    let kernel_pt = unsafe { &*(kernel_pml4_val as *const PageTable) };
+    for i in 256..512 {
+        new_table.0[i] = kernel_pt.0[i];
+    }
+
+    // Walk old PML4 user entries (0..256) to deep-copy page tables.
+    // PML4[255] may hold user stack (0x7FFFFFFFBxxx), so we must clone all user entries.
+    for pml4_idx in 0..256 {
+        let pml4e = old_table.0[pml4_idx];
+        if pml4e & PTE_PRESENT == 0 { continue; }
+
+        let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
+        let old_pdpt = unsafe { &*(old_pdpt_phys as *const PageTable) };
+
+        // Deep-copy the PDPT
+        let new_pdpt_phys = alloc.alloc(0)?;
+        unsafe { core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, 4096); }
+        let new_pdpt = unsafe { &mut *(new_pdpt_phys as *mut PageTable) };
+
+        for pdpt_idx in 0..512 {
+            let pdpte = old_pdpt.0[pdpt_idx];
+            if pdpte & PTE_PRESENT == 0 { continue; }
+
+            if pdpte & PTE_HUGE != 0 {
+                // 1G page (kernel identity) — keep writable, shallow copy
+                new_pdpt.0[pdpt_idx] = pdpte;
+                continue;
+            }
+
+            let old_pd_phys = pdpte & PTE_ADDR_MASK;
+            let old_pd = unsafe { &*(old_pd_phys as *const PageTable) };
+
+            // Deep-copy the PD
+            let new_pd_phys = alloc.alloc(0)?;
+            unsafe { core::ptr::write_bytes(new_pd_phys as *mut u8, 0, 4096); }
+            let new_pd = unsafe { &mut *(new_pd_phys as *mut PageTable) };
+
+            for pd_idx in 0..512 {
+                let pde = old_pd.0[pd_idx];
+                if pde & PTE_PRESENT == 0 { continue; }
+
+                if pde & PTE_HUGE != 0 {
+                    // 2M page (kernel identity) — keep writable, shallow copy
+                    new_pd.0[pd_idx] = pde;
+                    continue;
+                }
+
+                // 4K page — deep-copy PT
+                let old_pt_phys = pde & PTE_ADDR_MASK;
+                let old_pt = unsafe { &*(old_pt_phys as *const PageTable) };
+
+                let new_pt_phys = alloc.alloc(0)?;
+                unsafe { core::ptr::write_bytes(new_pt_phys as *mut u8, 0, 4096); }
+                let new_pt = unsafe { &mut *(new_pt_phys as *mut PageTable) };
+
+                for pt_idx in 0..512 {
+                    let pte = old_pt.0[pt_idx];
+                    if pte & PTE_PRESENT == 0 { continue; }
+
+                    // COW: share physical page, child gets read-only
+                    let cow_flags = pte & !(PTE_ADDR_MASK | PTE_WRITABLE);
+                    new_pt.0[pt_idx] = (pte & PTE_ADDR_MASK) | cow_flags;
+
+                    // Parent: also remove writable for COW
+                    let src_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
+                    src_pt.0[pt_idx] = pte & !PTE_WRITABLE;
+                }
+
+                let pde_flags = pde & !PTE_ADDR_MASK;
+                new_pd.0[pd_idx] = new_pt_phys | pde_flags;
+            }
+
+            let pdpt_flags = pdpte & !PTE_ADDR_MASK;
+            new_pdpt.0[pdpt_idx] = new_pd_phys | pdpt_flags;
+        }
+
+        let pml4e_flags = pml4e & !PTE_ADDR_MASK;
+        new_table.0[pml4_idx] = new_pdpt_phys | pml4e_flags;
+    }
+
+    // Flush TLB for old PML4 since we modified its PTEs
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+    }
+
+    Some(new_pml4)
+}
+
+pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
+    let pte = match get_pte_in(pml4, virt) {
         Some(p) => p,
         None => return false,
     };
@@ -466,13 +574,24 @@ pub fn cow_remap(virt: u64) -> bool {
     true
 }
 
+pub fn cow_remap(virt: u64) -> bool {
+    cow_remap_in(KERNEL_PML4.load(Ordering::SeqCst), virt)
+}
+
 pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
     let is_write = code_bits & 2 != 0;
-    let is_viol = code_bits & 1 != 0;
+    let is_present = code_bits & 1 != 0;
 
-    // Write to a read-only user page → COW
-    if cpl == 3 && is_write && is_viol {
-        if cow_remap(cr2) {
+    // Get the faulting task's PML4
+    let task_pml4 = crate::task::current_task_pml4();
+    if task_pml4 == 0 {
+        return false;
+    }
+
+    // Write to a read-only page → COW (handle both user and kernel mode,
+    // since CR0.WP=1 prevents kernel writes to read-only pages too)
+    if is_write && is_present {
+        if cow_remap_in(task_pml4, cr2) {
             crate::serial::write_str("  COW: copied page for 0x");
             crate::serial::write_hex(cr2);
             crate::serial::write_str("\n");
@@ -480,8 +599,12 @@ pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
         }
     }
 
-    // User page not present → TODO: demand paging
-    if cpl == 3 && !is_viol {
+    // Page not present → demand paging (mmap'd/brk pages)
+    if cpl == 3 && !is_present {
+        // Check if this address is in an mmap'd region
+        if crate::task::handle_demand_page(task_pml4, cr2) {
+            return true;
+        }
         return false;
     }
 

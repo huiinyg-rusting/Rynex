@@ -32,7 +32,7 @@ SECTIONS
         *(.bss .bss.*)
         . = ALIGN(4K);
         stack_bottom = .;
-        . += 16K;
+        . += 32K;
         stack_top = .;
     }
 

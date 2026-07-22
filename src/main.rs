@@ -21,6 +21,8 @@ mod pic;
 mod pit;
 mod ipc;
 mod elf;
+mod vfs;
+mod keyboard;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -56,12 +58,19 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
     pic::mask_all();
     pic::unmask(0);
+    pic::unmask(1);
     vga::write_str("PIC: OK\n");
     serial::write_str("PIC: OK\n");
 
     pit::init(100);
     vga::write_str("PIT: OK\n");
     serial::write_str("PIT: OK\n");
+
+    keyboard::init();
+    let kbd_vec = pic::IRQ_BASE + 1;
+    idt::register_irq(kbd_vec, keyboard::keyboard_interrupt_handler as u64);
+    vga::write_str("KBD: OK\n");
+    serial::write_str("KBD: OK\n");
 
 memory::init(_info);
     // Enable NX (No-Execute) in EFER MSR and setup syscall MSRs

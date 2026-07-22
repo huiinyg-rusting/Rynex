@@ -18,6 +18,8 @@ pub fn init() {
     outb(COM1 + 3, 0x03);
     outb(COM1 + 2, 0xC7);
     outb(COM1 + 4, 0x0B);
+    // Drain any stale input
+    while inb(COM1 + 5) & 1 != 0 { inb(COM1); }
 }
 
 pub fn write_byte(byte: u8) {
@@ -64,5 +66,24 @@ pub fn write_hex(val: u64) {
     for i in (0..16).rev() {
         let nibble = ((val >> (i * 4)) & 0xF) as usize;
         write_byte(hex[nibble]);
+    }
+}
+
+pub fn receive_ready() -> bool {
+    inb(COM1 + 5) & 1 != 0
+}
+
+pub fn read_byte() -> u8 {
+    while !receive_ready() {
+        unsafe { core::arch::asm!("pause", options(nostack, nomem)); }
+    }
+    inb(COM1)
+}
+
+pub fn read_byte_nonblocking() -> Option<u8> {
+    if receive_ready() {
+        Some(inb(COM1))
+    } else {
+        None
     }
 }

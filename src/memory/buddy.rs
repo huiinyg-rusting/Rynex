@@ -60,6 +60,7 @@ impl BuddyAllocator {
     }
 
     fn free_one(&mut self, addr: u64, order: u8) {
+        if !self.is_managed(addr) { return; }
         let mut cur = addr;
         let mut o = order;
 
