@@ -641,7 +641,8 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         if current == 0 {
             return;
         }
-        let regs = &mut TASKS[task_idx(current)].regs;
+        let idx = task_idx(current);
+        let regs = &mut TASKS[idx].regs;
 
         let gp = frame.sub(15);
         regs.r15 = *gp.add(0);
@@ -660,23 +661,33 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         regs.rax = *gp.add(13);
         regs.rbp = *gp.add(14);
 
-        // Detect user→kernel vs kernel→kernel by checking frame+0:
-        //   user→kernel: frame+0 = SS (ring-3 data selector, &3 == 3)
-        //   kernel→kernel: frame+0 = RFLAGS (bit 1 is always set, &3 == 2)
-        if (*frame.add(0) & 3) == 3 {
-            // User → kernel: CPU pushed SS, RSP(user), RFLAGS, CS, RIP
+        // Detect user→kernel vs kernel→kernel by checking CS.RPL at frame+1:
+        //   frame[0] = RIP   (lowest address, always present)
+        //   frame[1] = CS    (CS.RPL = 3 for user, 0 for kernel)
+        //   frame[2] = RFLAGS
+        //   frame[3] = RSP_user   (only for CPL change)
+        //   frame[4] = SS         (only for CPL change)
+        if (*frame.add(1) & 3) == 3 {
+            // User → kernel: CPU pushed SS, RSP, RFLAGS, CS, RIP
+            FRAME_IS_KERNEL = 0;
+            regs.rip    = *frame.add(0);
+            regs.cs     = *frame.add(1);
             regs.rflags = *frame.add(2);
-            regs.cs     = *frame.add(3);
-            regs.rip    = *frame.add(4);
-            regs.rsp    = frame as u64 + 24;
-            regs.ss     = *frame.add(0);
+            regs.rsp    = *frame.add(3);
+            regs.ss     = *frame.add(4);
         } else {
             // Kernel → kernel: CPU pushed RFLAGS, CS, RIP
-            regs.rflags = *frame.add(0);
+            FRAME_IS_KERNEL = 1;
+            regs.rip    = *frame.add(0);
             regs.cs     = *frame.add(1);
-            regs.rip    = *frame.add(2);
-            regs.rsp    = frame as u64 + 24;
-            regs.ss     = KERNEL_DATA_SELECTOR;
+            regs.rflags = *frame.add(2);
+            if TASKS[idx].user_stack != 0 {
+                // User task interrupted during syscall — use per-task kernel stack
+                regs.rsp = TASKS[idx].kernel_stack;
+            } else {
+                regs.rsp = frame as u64 + 24;
+            }
+            regs.ss = KERNEL_DATA_SELECTOR;
         }
     }
 }
@@ -720,6 +731,13 @@ pub extern "C" fn timer_schedule() -> u64 {
 
     unsafe {
         let idx = task_idx(current);
+
+        // If a user task is interrupted in kernel mode (during a syscall), do NOT
+        // switch stacks. The syscall handler runs on the global syscall_stack;
+        // switching RSP to the per-task kernel_stack would break its call chain.
+        if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
+            return 0;
+        }
 
         // Decrement time slice
         if TASKS[idx].time_slice > 0 {
