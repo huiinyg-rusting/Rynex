@@ -23,8 +23,10 @@ pub fn init() {
             .set_stack_index(1); // IST 1 (TSS.ist[0]) for Double Fault
 
         idt[task::TIMER_IRQ_VECTOR]
-            .set_handler_addr(x86_64::VirtAddr::new(task::timer_interrupt_handler as u64))
-            .set_stack_index(2); // IST 2 (TSS.ist[1]) for Timer
+            .set_handler_addr(x86_64::VirtAddr::new(task::timer_interrupt_handler as u64));
+            // No IST: the timer runs on the current task's kernel stack.
+            // Without IST the CPU preserves RSP for same-CPL interrupts,
+            // so the zero path correctly restores the original RSP.
 
         idt.page_fault
             .set_handler_fn(interrupts::page_fault)
