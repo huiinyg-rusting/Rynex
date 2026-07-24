@@ -660,17 +660,23 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         regs.rax = *gp.add(13);
         regs.rbp = *gp.add(14);
 
-        regs.rip    = *frame.add(0);
-        regs.cs     = *frame.add(1);
-        regs.rflags = *frame.add(2);
-        if (*frame.add(1) & 3) == 3 {
-            // User → kernel: CPU pushed SS and RSP onto kernel stack
-            regs.rsp = *frame.add(3);
-            regs.ss  = *frame.add(4);
+        // Detect user→kernel vs kernel→kernel by checking frame+0:
+        //   user→kernel: frame+0 = SS (ring-3 data selector, &3 == 3)
+        //   kernel→kernel: frame+0 = RFLAGS (bit 1 is always set, &3 == 2)
+        if (*frame.add(0) & 3) == 3 {
+            // User → kernel: CPU pushed SS, RSP(user), RFLAGS, CS, RIP
+            regs.rflags = *frame.add(2);
+            regs.cs     = *frame.add(3);
+            regs.rip    = *frame.add(4);
+            regs.rsp    = frame as u64 + 24;
+            regs.ss     = *frame.add(0);
         } else {
-            // Kernel → kernel: only RIP, CS, RFLAGS pushed
-            regs.rsp = frame as u64 + 24;
-            regs.ss  = KERNEL_DATA_SELECTOR;
+            // Kernel → kernel: CPU pushed RFLAGS, CS, RIP
+            regs.rflags = *frame.add(0);
+            regs.cs     = *frame.add(1);
+            regs.rip    = *frame.add(2);
+            regs.rsp    = frame as u64 + 24;
+            regs.ss     = KERNEL_DATA_SELECTOR;
         }
     }
 }
