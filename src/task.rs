@@ -554,9 +554,13 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov rbx, [rsi + 0x90]",
         "test bl, 3",
         "jnz 1f",
-        // Kernel→kernel: push RIP and ret (1 pop = correct RSP alignment)
+        // Kernel→kernel: push RIP and sti; ret
+        // STI enables interrupts after RET (Intel guarantee: STI takes effect
+        // at the next instruction boundary). This allows kernel tasks to
+        // receive timer interrupts for polling and rescheduling.
         "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
+        "sti",
         "ret",
         // Kernel→user: push full iretq frame (5 pops)
         "1: push qword ptr [rsi + 0x98]",
@@ -596,11 +600,10 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "add rdi, 8",
         "call {save_context}",
         "call {timer_schedule}",
-        "test rax, rax",
-        "jz 3f",
+        // Always switch RSP to build_frame base, pop 15 GP, iretq.
+        // Even when no task switch is needed, timer_schedule returns a self-frame
+        // built from the current task's already-saved registers.
         "mov rsp, rax",
-        "and rsp, ~1",
-        "3:",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -616,18 +619,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbx",
         "pop rax",
         "pop rbp",
-        // RSP now points to RIP in the frame.
-        // Check FRAME_IS_KERNEL (set by build_frame): 1 = kernel ret, 0 = user iretq.
-        "movzx ecx, byte ptr [{frame_kernel}]",
-        "test ecx, 1",
-        "jnz 4f",
-        // Kernel→user: iretq pops RIP, CS, RFLAGS, RSP, SS
         "iretq",
-        // Kernel→kernel: ret pops RIP
-        "4:",
-        "ret",
-
-        frame_kernel = sym FRAME_IS_KERNEL,
 
         save_context = sym save_interrupt_context,
         timer_schedule = sym timer_schedule,
@@ -665,11 +657,10 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         //   frame[0] = RIP   (lowest address, always present)
         //   frame[1] = CS    (CS.RPL = 3 for user, 0 for kernel)
         //   frame[2] = RFLAGS
-        //   frame[3] = RSP_user   (only for CPL change)
-        //   frame[4] = SS         (only for CPL change)
+        //   frame[3] = RSP_user   (only for CPL change or IST)
+        //   frame[4] = SS         (only for CPL change or IST)
         if (*frame.add(1) & 3) == 3 {
             // User → kernel: CPU pushed SS, RSP, RFLAGS, CS, RIP
-            FRAME_IS_KERNEL = 0;
             regs.rip    = *frame.add(0);
             regs.cs     = *frame.add(1);
             regs.rflags = *frame.add(2);
@@ -677,7 +668,6 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.ss     = *frame.add(4);
         } else {
             // Kernel → kernel: CPU pushed RFLAGS, CS, RIP
-            FRAME_IS_KERNEL = 1;
             regs.rip    = *frame.add(0);
             regs.cs     = *frame.add(1);
             regs.rflags = *frame.add(2);
@@ -732,11 +722,18 @@ pub extern "C" fn timer_schedule() -> u64 {
     unsafe {
         let idx = task_idx(current);
 
-        // If a user task is interrupted in kernel mode (during a syscall), do NOT
-        // switch stacks. The syscall handler runs on the global syscall_stack;
-        // switching RSP to the per-task kernel_stack would break its call chain.
+        // Kernel tasks: no preemption via timer, but still build a self-frame
+        // so the interrupt handler always has a valid frame to pop-and-iretq.
+        if TASKS[idx].user_stack == 0 {
+            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+        }
+
+        // User task interrupted in kernel mode (during a syscall): build a
+        // self-frame on the per-task kernel_stack. After iretq, RSP is restored
+        // to regs.rsp (the syscall_stack address saved by save_interrupt_context),
+        // so the interrupted call chain is preserved.
         if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
-            return 0;
+            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         // Decrement time slice
@@ -784,63 +781,36 @@ pub extern "C" fn timer_schedule() -> u64 {
     }
 }
 
-/// Set by build_frame: 0 = user frame (iretq), 1 = kernel frame (ret).
-#[no_mangle]
-static mut FRAME_IS_KERNEL: u8 = 0;
-
-/// Build a stack frame for timer interrupt return.
+/// Build a full 20-item stack frame for timer interrupt return via iretq.
 fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
-        if (regs.cs & 3) == 0 {
-            FRAME_IS_KERNEL = 1;
-            // Kernel→kernel: push 15 GP regs + RIP = 16 items, return via ret
-            let base = (kernel_stack as *mut u64).sub(16);
-            *base.add(0)  = regs.r15;
-            *base.add(1)  = regs.r14;
-            *base.add(2)  = regs.r13;
-            *base.add(3)  = regs.r12;
-            *base.add(4)  = regs.r11;
-            *base.add(5)  = regs.r10;
-            *base.add(6)  = regs.r9;
-            *base.add(7)  = regs.r8;
-            *base.add(8)  = regs.rdi;
-            *base.add(9)  = regs.rsi;
-            *base.add(10) = regs.rdx;
-            *base.add(11) = regs.rcx;
-            *base.add(12) = regs.rbx;
-            *base.add(13) = regs.rax;
-            *base.add(14) = regs.rbp;
-            *base.add(15) = regs.rip;
-            base as u64
-        } else {
-            FRAME_IS_KERNEL = 0;
-            // Kernel→user: push 15 GP regs + full iretq frame (RIP, CS, RFLAGS, RSP, SS) = 20 items
-            let base = (kernel_stack as *mut u64).sub(20);
-            *base.add(0)  = regs.r15;
-            *base.add(1)  = regs.r14;
-            *base.add(2)  = regs.r13;
-            *base.add(3)  = regs.r12;
-            *base.add(4)  = regs.r11;
-            *base.add(5)  = regs.r10;
-            *base.add(6)  = regs.r9;
-            *base.add(7)  = regs.r8;
-            *base.add(8)  = regs.rdi;
-            *base.add(9)  = regs.rsi;
-            *base.add(10) = regs.rdx;
-            *base.add(11) = regs.rcx;
-            *base.add(12) = regs.rbx;
-            *base.add(13) = regs.rax;
-            *base.add(14) = regs.rbp;
-            *base.add(15) = regs.rip;
-            *base.add(16) = regs.cs;
-            *base.add(17) = regs.rflags;
-            *base.add(18) = regs.rsp;
-            *base.add(19) = regs.ss;
-            base as u64
-        }
+        let base = (kernel_stack as *mut u64).sub(20);
+        *base.add(0)  = regs.r15;
+        *base.add(1)  = regs.r14;
+        *base.add(2)  = regs.r13;
+        *base.add(3)  = regs.r12;
+        *base.add(4)  = regs.r11;
+        *base.add(5)  = regs.r10;
+        *base.add(6)  = regs.r9;
+        *base.add(7)  = regs.r8;
+        *base.add(8)  = regs.rdi;
+        *base.add(9)  = regs.rsi;
+        *base.add(10) = regs.rdx;
+        *base.add(11) = regs.rcx;
+        *base.add(12) = regs.rbx;
+        *base.add(13) = regs.rax;
+        *base.add(14) = regs.rbp;
+        *base.add(15) = regs.rip;
+        *base.add(16) = regs.cs;
+        *base.add(17) = regs.rflags;
+        *base.add(18) = regs.rsp;
+        *base.add(19) = regs.ss;
+        base as u64
     }
 }
+
+
 
 // ── Syscalls ─────────────────────────────────────────────────────
 
@@ -1253,20 +1223,21 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if fd == 0 {
         if buf.is_null() || count == 0 { return 0; }
         let addr = &raw const crate::keyboard::RING_BUF as u64;
+        let mut written = 0usize;
         loop {
             if crate::keyboard::KEY_COUNT.load(Ordering::SeqCst) > 0 {
-                let mut written = 0usize;
                 while written < count {
                     match crate::keyboard::pop_char() {
                         Some(c) => {
+                            crate::serial::write_char(c as char);
                             unsafe { *buf.add(written) = c; }
                             written += 1;
-                            if c == b'\n' || c == b'\r' { break; }
+                            if c == b'\n' || c == b'\r' { return written as i64; }
                         }
                         None => break,
                     }
                 }
-                return written as i64;
+                if written >= count { return written as i64; }
             }
             unsafe {
                 let idx = task_idx(current_task_id());
@@ -1883,7 +1854,6 @@ pub fn test() {
     if info_addr != 0 {
         let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
-        // Register ALL modules in VFS, then load the first one as init
         for i in 0..n {
             let mod_data = unsafe {
                 core::slice::from_raw_parts(
@@ -1897,11 +1867,9 @@ pub fn test() {
             serial::write_dec(mod_data.len() as u64);
             serial::write_str(" bytes\n");
 
-            // Check ELF magic
             if mod_data.len() >= 4 && mod_data[0] == 0x7f && mod_data[1] == b'E'
                 && mod_data[2] == b'L' && mod_data[3] == b'F'
             {
-                // Register each module with the right name
                 match i {
                     0 => {
                         crate::vfs::create_file(b"/bin/init", mod_data);
@@ -1954,7 +1922,8 @@ pub fn test() {
     // Dequeue task 1 so it's not in the runqueue twice
     remove_from_runqueue(1);
 
-    unsafe { core::arch::asm!("sti"); }
+    // Interrupts still disabled (cli on line 1852). The context_switch will
+    // enable them via `sti; ret` when it enters the new kernel task.
 
     let new_task = unsafe { &mut TASKS[task_idx(1)] };
     new_task.state = TaskState::Running;

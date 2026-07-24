@@ -124,7 +124,13 @@ pub extern "x86-interrupt" fn bound_range(frame: InterruptStackFrame) {
 
 pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     exit_user_task(&frame, "Invalid Opcode", &[]);
-    crate::serial::write_str("EXC: Invalid Opcode\n");
+    crate::serial::write_str("EXC: Invalid Opcode rip=0x");
+    crate::serial::write_hex(frame.instruction_pointer.as_u64());
+    crate::serial::write_str(" cs=0x");
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    crate::serial::write_hex(cs as u64);
+    crate::serial::write_str("\n");
     halt();
 }
 
