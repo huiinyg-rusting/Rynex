@@ -47,7 +47,7 @@ pub const MAX_FDS_PER_TASK: usize = 16;
 
 // ── RamFS ─────────────────────────────────────────────────────────
 
-static mut INODES: [Inode; MAX_INODES] = [Inode::empty(); MAX_INODES];
+pub static mut INODES: [Inode; MAX_INODES] = [Inode::empty(); MAX_INODES];
 
 pub fn init() {
     serial::write_str("VFS: init\n");

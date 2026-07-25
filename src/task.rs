@@ -902,28 +902,66 @@ fn write_frame(base: *mut u64, regs: &Registers) {
 
 
 
-// ── Syscalls ─────────────────────────────────────────────────────
+// ── Syscalls (Linux x86_64 compatible) ───────────────────────────
 
-pub const SYS_exit: u64 = 0;
+// Linux x86_64 syscall numbers
+pub const SYS_read: u64 = 0;
 pub const SYS_write: u64 = 1;
-pub const SYS_get_ticks: u64 = 2;
-pub const SYS_yield: u64 = 3;
-pub const SYS_futex: u64 = 4;
-pub const SYS_shm_setup: u64 = 5;
-pub const SYS_shm_notify: u64 = 6;
-pub const SYS_shm_wait: u64 = 7;
-pub const SYS_shm_teardown: u64 = 8;
-pub const SYS_spawn: u64 = 9;
-pub const SYS_waitpid: u64 = 10;
-pub const SYS_read: u64 = 11;
-pub const SYS_open: u64 = 12;
-pub const SYS_mmap: u64 = 13;
-pub const SYS_fork: u64 = 14;
-pub const SYS_execve: u64 = 15;
-pub const SYS_getpid: u64 = 16;
-pub const SYS_getppid: u64 = 17;
-pub const SYS_sleep: u64 = 18;
-pub const SYS_brk: u64 = 19;
+pub const SYS_open: u64 = 2;
+pub const SYS_close: u64 = 3;
+pub const SYS_stat: u64 = 4;
+pub const SYS_fstat: u64 = 5;
+pub const SYS_lstat: u64 = 6;
+pub const SYS_mmap: u64 = 9;
+pub const SYS_mprotect: u64 = 10;
+pub const SYS_munmap: u64 = 11;
+pub const SYS_brk: u64 = 12;
+pub const SYS_rt_sigaction: u64 = 13;
+pub const SYS_rt_sigprocmask: u64 = 14;
+pub const SYS_rt_sigreturn: u64 = 15;
+pub const SYS_ioctl: u64 = 16;
+pub const SYS_access: u64 = 21;
+pub const SYS_pipe: u64 = 22;
+pub const SYS_sched_yield: u64 = 24;
+pub const SYS_dup: u64 = 32;
+pub const SYS_dup2: u64 = 33;
+pub const SYS_nanosleep: u64 = 35;
+pub const SYS_getpid: u64 = 39;
+pub const SYS_clone: u64 = 56;
+pub const SYS_fork: u64 = 57;
+pub const SYS_vfork: u64 = 58;
+pub const SYS_execve: u64 = 59;
+pub const SYS_exit: u64 = 60;
+pub const SYS_wait4: u64 = 61;
+pub const SYS_kill: u64 = 62;
+pub const SYS_uname: u64 = 63;
+pub const SYS_fcntl: u64 = 72;
+pub const SYS_getcwd: u64 = 79;
+pub const SYS_chdir: u64 = 80;
+pub const SYS_fchdir: u64 = 81;
+pub const SYS_rename: u64 = 82;
+pub const SYS_mkdir: u64 = 83;
+pub const SYS_rmdir: u64 = 84;
+pub const SYS_unlink: u64 = 87;
+pub const SYS_readlink: u64 = 89;
+pub const SYS_gettimeofday: u64 = 96;
+pub const SYS_getuid: u64 = 102;
+pub const SYS_getgid: u64 = 104;
+pub const SYS_geteuid: u64 = 107;
+pub const SYS_getegid: u64 = 108;
+pub const SYS_getdents64: u64 = 217;
+
+// Niobix-specific (high numbers, no Linux conflict)
+pub const SYS_niobix_get_ticks: u64 = 2000;
+pub const SYS_niobix_futex: u64 = 2001;
+pub const SYS_niobix_shm_setup: u64 = 2002;
+pub const SYS_niobix_shm_notify: u64 = 2003;
+pub const SYS_niobix_shm_wait: u64 = 2004;
+pub const SYS_niobix_shm_teardown: u64 = 2005;
+pub const SYS_niobix_spawn: u64 = 2006;
+pub const SYS_niobix_getppid: u64 = 2007;
+pub const SYS_niobix_sleep: u64 = 2008;
+pub const SYS_niobix_yield: u64 = 2009;
 
 pub const WNOHANG: u32 = 1;
 
@@ -934,28 +972,50 @@ pub extern "C" fn syscall_handler(
     arg4: u64, arg5: u64, arg6: u64
 ) -> i64 {
     match syscall_num {
-        SYS_exit => sys_exit(arg1 as i32),
-        SYS_write => sys_write(arg1 as u32, arg2 as *const u8, arg3 as usize),
-        SYS_get_ticks => sys_get_ticks(),
-        SYS_yield => sys_yield(),
-        SYS_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
-                                arg4 as *const u32, arg5 as u32),
-        SYS_shm_setup => crate::ipc::shm_setup(arg1, arg2),
-        SYS_shm_notify => crate::ipc::shm_notify(arg1),
-        SYS_shm_wait => crate::ipc::shm_wait(arg1),
-        SYS_shm_teardown => crate::ipc::shm_teardown(arg1),
-        SYS_spawn => sys_spawn(arg1 as *const u8, arg2 as usize),
-        SYS_waitpid => sys_waitpid(arg1 as i64, arg2 as *mut i32, arg3 as u32),
         SYS_read => sys_read(arg1 as u32, arg2 as *mut u8, arg3 as usize),
+        SYS_write => sys_write(arg1 as u32, arg2 as *const u8, arg3 as usize),
         SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
+        SYS_close => sys_close(arg1 as u32),
+        SYS_stat => sys_stat(arg1 as *const u8, arg2 as *mut u8),
+        SYS_fstat => sys_fstat(arg1 as u32, arg2 as *mut u8),
+        SYS_lstat => sys_stat(arg1 as *const u8, arg2 as *mut u8), // lstat = stat in flat fs
         SYS_mmap => sys_mmap(arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as i32, arg5 as i32, arg6 as u64),
+        SYS_brk => sys_brk(arg1 as u64),
+        SYS_ioctl => sys_ioctl(arg1 as u32, arg2 as u64, arg3 as u64),
+        SYS_access => sys_access(arg1 as *const u8, arg2 as i32),
+        SYS_pipe => sys_pipe(arg1 as *mut u32),
+        SYS_dup2 => sys_dup2(arg1 as u32, arg2 as u32),
+        SYS_nanosleep => sys_nanosleep(arg1 as *const u64, arg2 as *mut u64),
+        SYS_getpid => sys_getpid(),
         SYS_fork => sys_fork(),
         SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
-        SYS_getpid => sys_getpid(),
-        SYS_getppid => sys_getppid(),
-        SYS_sleep => sys_sleep(arg1 as u64),
-        SYS_brk => sys_brk(arg1 as u64),
-        _ => -ENOSYS,
+        SYS_exit => sys_exit(arg1 as i32),
+        SYS_wait4 => sys_wait4(arg1 as i64, arg2 as *mut i32, arg3 as i32, arg4 as u64),
+        SYS_kill => sys_kill(arg1 as i64, arg2 as i32),
+        SYS_uname => sys_uname(arg1 as *mut u8),
+        SYS_fcntl => sys_fcntl(arg1 as u32, arg2 as i32, arg3 as u64),
+        SYS_getcwd => sys_getcwd(arg1 as *mut u8, arg2 as usize),
+        SYS_chdir => sys_chdir(arg1 as *const u8),
+        SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
+        SYS_getuid => 0,
+        SYS_getgid => 0,
+        SYS_geteuid => 0,
+        SYS_getegid => 0,
+        SYS_getdents64 => sys_getdents64(arg1 as u32, arg2 as *mut u8, arg3 as usize),
+        SYS_sched_yield => sys_niobix_yield(),
+        // Niobix-specific
+        SYS_niobix_get_ticks => sys_get_ticks(),
+        SYS_niobix_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
+                                        arg4 as *const u32, arg5 as u32),
+        SYS_niobix_shm_setup => crate::ipc::shm_setup(arg1, arg2),
+        SYS_niobix_shm_notify => crate::ipc::shm_notify(arg1),
+        SYS_niobix_shm_wait => crate::ipc::shm_wait(arg1),
+        SYS_niobix_shm_teardown => crate::ipc::shm_teardown(arg1),
+        SYS_niobix_spawn => sys_spawn(arg1 as *const u8, arg2 as usize),
+        SYS_niobix_getppid => sys_getppid(),
+        SYS_niobix_sleep => sys_sleep(arg1 as u64),
+        SYS_niobix_yield => sys_niobix_yield(),
+        _ => { -ENOSYS }
     }
 }
 
@@ -978,18 +1038,32 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
         }
         count as i64
     } else {
-        // Try writing to a VFS file descriptor
         let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
             Some(f) => f,
             None => return -EBADF,
         };
-        let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-        match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
-            Some(n) => {
-                inode_fd.pos += n;
-                n as i64
+        // Pipe write end?
+        if inode_fd.inode_idx == crate::vfs::MAX_INODES - 2 {
+            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+            unsafe {
+                for &c in slice {
+                    if c == 0 { break; }
+                    if PIPE_WPOS < 4096 {
+                        PIPE_BUF[PIPE_WPOS] = c;
+                        PIPE_WPOS += 1;
+                    }
+                }
             }
-            None => -EIO,
+            slice.len() as i64
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+            match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
+                Some(n) => {
+                    inode_fd.pos += n;
+                    n as i64
+                }
+                None => -EIO,
+            }
         }
     }
 }
@@ -998,7 +1072,7 @@ fn sys_get_ticks() -> i64 {
     unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64 }
 }
 
-fn sys_yield() -> i64 {
+fn sys_niobix_yield() -> i64 {
     yield_now();
     0
 }
@@ -1337,18 +1411,43 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
             schedule();
         }
     } else {
-        // Read from VFS file descriptor
         let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
             Some(f) => f,
             None => return -EBADF,
         };
-        let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-        match crate::vfs::inode_read(inode_fd.inode_idx, inode_fd.pos, slice) {
-            Some(n) => {
-                inode_fd.pos += n;
-                n as i64
+        // Pipe read end?
+        if inode_fd.inode_idx == crate::vfs::MAX_INODES - 1 {
+            unsafe {
+                let mut written = 0usize;
+                loop {
+                    if PIPE_RPOS < PIPE_WPOS {
+                        let avail = PIPE_WPOS - PIPE_RPOS;
+                        let to_read = core::cmp::min(count - written, avail);
+                        core::ptr::copy_nonoverlapping(PIPE_BUF.as_ptr().add(PIPE_RPOS), buf.add(written), to_read);
+                        PIPE_RPOS += to_read;
+                        written += to_read;
+                        if written > 0 {
+                            if PIPE_RPOS == PIPE_WPOS { PIPE_RPOS = 0; PIPE_WPOS = 0; }
+                            return written as i64;
+                        }
+                    }
+                    // No data - block
+                    let addr = &raw mut PIPE_BUF as u64;
+                    let idx = task_idx(current_task_id());
+                    TASKS[idx].blocked_on = addr;
+                    TASKS[idx].state = TaskState::Blocked;
+                    schedule();
+                }
             }
-            None => -EIO,
+        } else {
+            let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+            match crate::vfs::inode_read(inode_fd.inode_idx, inode_fd.pos, slice) {
+                Some(n) => {
+                    inode_fd.pos += n;
+                    n as i64
+                }
+                None => -EIO,
+            }
         }
     }
 }
@@ -1866,6 +1965,343 @@ fn sys_brk(addr: u64) -> i64 {
     }
 }
 
+// ── Close ──────────────────────────────────────────────────────────
+
+fn sys_close(fd: u32) -> i64 {
+    if crate::vfs::close_fd(fd as usize) { 0 } else { -EBADF }
+}
+
+// ── Pipe ───────────────────────────────────────────────────────────
+
+static mut PIPE_BUF: [u8; 4096] = [0; 4096];
+static mut PIPE_RPOS: usize = 0;
+static mut PIPE_WPOS: usize = 0;
+static mut PIPE_OPEN: bool = false;
+
+fn sys_pipe(pipefd: *mut u32) -> i64 {
+    if pipefd.is_null() { return -EFAULT; }
+    unsafe {
+        if PIPE_OPEN { return -EMFILE; }
+        PIPE_RPOS = 0;
+        PIPE_WPOS = 0;
+        PIPE_OPEN = true;
+        // Create pseudo-inodes for pipe read/write ends
+        // We use inode index crate::vfs::MAX_INODES-1 and crate::vfs::MAX_INODES-2 as pipe markers
+        let r_fd = crate::vfs::alloc_fd(crate::vfs::MAX_INODES - 1, 0); // read end
+        let w_fd = crate::vfs::alloc_fd(crate::vfs::MAX_INODES - 2, 0); // write end
+        match (r_fd, w_fd) {
+            (Some(r), Some(w)) => {
+                core::ptr::write_volatile(pipefd, r as u32);
+                core::ptr::write_volatile(pipefd.add(1), w as u32);
+                0
+            }
+            _ => -EMFILE,
+        }
+    }
+}
+
+// Override pipe read/write in the syscall handlers
+// We handle pipes in sys_read/sys_write instead
+// ── Dup2 ───────────────────────────────────────────────────────────
+
+fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
+    let table = match crate::vfs::get_fd_table() {
+        Some(t) => t,
+        None => return -EBADF,
+    };
+    unsafe {
+        if (oldfd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[oldfd as usize].used {
+            return -EBADF;
+        }
+        if oldfd == newfd { return newfd as i64; }
+        if (newfd as usize) < crate::vfs::MAX_FDS_PER_TASK {
+            table[newfd as usize] = table[oldfd as usize];
+            table[newfd as usize].pos = 0;
+        }
+        newfd as i64
+    }
+}
+
+// ── Access ─────────────────────────────────────────────────────────
+
+fn sys_access(pathname: *const u8, _mode: i32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    if crate::vfs::find_inode(name).is_some() { 0 } else { -ENOENT }
+}
+
+// ── Nanosleep ──────────────────────────────────────────────────────
+
+fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
+    if req.is_null() { return -EFAULT; }
+    let ns = unsafe { core::ptr::read_volatile(req) };
+    // PIT ticks are ~20ms each (50Hz)
+    let ticks = (ns + 19_999_999) / 20_000_000; // ceiling division
+    if ticks > 0 {
+        sys_sleep(ticks);
+    }
+    0
+}
+
+// ── Wait4 ──────────────────────────────────────────────────────────
+
+fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64 {
+    // Reuse existing waitpid logic; WNOHANG in options corresponds to flags
+    let wnohang = if _options & 1 != 0 { WNOHANG } else { 0 };
+    sys_waitpid(pid, status_ptr, wnohang)
+}
+
+// ── Kill ───────────────────────────────────────────────────────────
+
+fn sys_kill(_pid: i64, _sig: i32) -> i64 {
+    // Stub: no actual signal support yet
+    -ENOSYS
+}
+
+// ── Uname ──────────────────────────────────────────────────────────
+
+fn sys_uname(buf: *mut u8) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    let utsname = [
+        b'N', b'i', b'o', b'b', b'i', b'x', 0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, // 65th byte
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(utsname.as_ptr(), buf, 65);
+    }
+    0
+}
+
+// ── Ioctl ──────────────────────────────────────────────────────────
+
+fn sys_ioctl(fd: u32, request: u64, _arg3: u64) -> i64 {
+    // Only handle TCGETS (0x5401) on stdin — report it's a TTY
+    if fd == 0 && request == 0x5401 {
+        // Return 0 to indicate it IS a tty
+        return 0;
+    }
+    // Other ioctls fail
+    -ENOTTY
+}
+
+// ── Fcntl ──────────────────────────────────────────────────────────
+
+fn sys_fcntl(fd: u32, cmd: i32, _arg: u64) -> i64 {
+    match cmd {
+        0 => { // F_DUPFD
+            sys_dup2(fd, fd) // dup to lowest available — simplified
+        }
+        _ => -EINVAL,
+    }
+}
+
+// ── Getcwd ─────────────────────────────────────────────────────────
+
+static mut CWD_BUF: [u8; 256] = [0; 256];
+static mut CWD_LEN: usize = 0;
+static CWD_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn get_cwd_bytes() -> &'static [u8] {
+    unsafe {
+        if !CWD_INIT.load(core::sync::atomic::Ordering::Relaxed) {
+            CWD_BUF[0] = b'/';
+            CWD_LEN = 1;
+            CWD_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        &CWD_BUF[..CWD_LEN]
+    }
+}
+
+fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    let cwd = get_cwd_bytes();
+    if size < cwd.len() + 1 { return -ERANGE; }
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
+        core::ptr::write_volatile(buf.add(cwd.len()), 0);
+    }
+    cwd.len() as i64
+}
+
+// ── Chdir ──────────────────────────────────────────────────────────
+
+fn sys_chdir(path: *const u8) -> i64 {
+    if path.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(path) };
+    if name.is_empty() { return -ENOENT; }
+    // For now, only support "/" (root)
+    if name == b"/" || name == b"/bin" {
+        unsafe {
+            CWD_BUF[0] = b'/';
+            CWD_LEN = 1;
+        }
+        return 0;
+    }
+    // Check if path exists
+    if crate::vfs::find_inode(name).is_some() {
+        // "chdir" to a file - in this flat fs, just accept it
+        unsafe {
+            let l = core::cmp::min(name.len(), 255);
+            CWD_BUF[..l].copy_from_slice(&name[..l]);
+            CWD_LEN = l;
+        }
+        return 0;
+    }
+    -ENOENT
+}
+
+// ── Getdents64 ─────────────────────────────────────────────────────
+
+#[repr(packed)]
+struct LinuxDirent64 {
+    d_ino: u64,
+    d_off: u64,
+    d_reclen: u16,
+    d_type: u8,
+    d_name: [u8; 0], // flexible, we manage manually
+}
+
+fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    let table = match crate::vfs::get_fd_table() {
+        Some(t) => t,
+        None => return -EBADF,
+    };
+    unsafe {
+        if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
+            return -EBADF;
+        }
+        let ino = table[fd as usize].inode_idx;
+        if ino >= crate::vfs::MAX_INODES - 2 {
+            return -ENOTDIR;
+        }
+    }
+
+    let mut written = 0usize;
+    unsafe {
+        for i in 0..crate::vfs::MAX_INODES {
+            if !crate::vfs::INODES[i].used { continue; }
+            if i >= crate::vfs::MAX_INODES - 2 { continue; }
+
+            let mut nlen = 0usize;
+            while nlen < 32 && crate::vfs::INODES[i].name[nlen] != 0 { nlen += 1; }
+            if nlen == 0 { continue; }
+
+            let reclen: usize = (19 + nlen + 7) & !7;
+            if written + reclen > count { break; }
+
+            let ent = buf.add(written) as *mut LinuxDirent64;
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_ino), i as u64);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_off), reclen as u64);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_reclen), reclen as u16);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_type), 0);
+            let name_ptr = buf.add(written + 19) as *mut u8;
+            core::ptr::copy_nonoverlapping(crate::vfs::INODES[i].name.as_ptr(), name_ptr, nlen);
+            core::ptr::write_volatile(name_ptr.add(nlen), 0);
+
+            written += reclen as usize;
+        }
+    }
+    written as i64
+}
+
+// ── Gettimeofday ───────────────────────────────────────────────────
+
+fn sys_gettimeofday(tv: *mut u64, _tz: *mut u64) -> i64 {
+    if tv.is_null() { return -EFAULT; }
+    let ticks = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+    // Each tick is ~20ms (50Hz PIT)
+    let secs = (ticks * 20_000_000) / 1_000_000_000_000; // not precise, placeholder
+    let usecs = ((ticks * 20_000_000) / 1000) % 1_000_000;
+    unsafe {
+        core::ptr::write_volatile(tv, secs);
+        core::ptr::write_volatile(tv.add(1), usecs);
+    }
+    0
+}
+
+// ── Stat/Fstat/Lstat ───────────────────────────────────────────────
+
+#[repr(C)]
+struct LinuxStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    _pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+}
+
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IRWXU: u32 = 0o700;
+const S_IRUSR: u32 = 0o400;
+
+fn fill_stat(ino_idx: usize, statbuf: *mut u8) -> i64 {
+    unsafe {
+        let st = statbuf as *mut LinuxStat;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_dev), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_ino), ino_idx as u64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_nlink), 1);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_mode), S_IFREG | S_IRUSR);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_uid), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_gid), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_rdev), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_size), crate::vfs::INODES[ino_idx].size as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_blksize), 4096);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_blocks), ((crate::vfs::INODES[ino_idx].size + 511) / 512) as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_atime), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_mtime), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_ctime), 0);
+    }
+    0
+}
+
+fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
+    if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::find_inode(name) {
+        Some(idx) => fill_stat(idx, statbuf),
+        None => -ENOENT,
+    }
+}
+
+fn sys_fstat(fd: u32, statbuf: *mut u8) -> i64 {
+    if statbuf.is_null() { return -EFAULT; }
+    let fdesc = match crate::vfs::fd_to_inode(fd as usize) {
+        Some(f) => f,
+        None => return -EBADF,
+    };
+    fill_stat(fdesc.inode_idx, statbuf)
+}
+
+// ── Helper ─────────────────────────────────────────────────────────
+
+fn cstr_from_ptr(ptr: *const u8) -> &'static [u8] {
+    unsafe {
+        let mut len = 0usize;
+        while core::ptr::read_volatile(ptr.add(len)) != 0 && len < 4096 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    }
+}
+
 pub fn current_task_pml4() -> u64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return 0; }
@@ -1927,14 +2363,14 @@ extern "C" fn task_spin() -> ! {
                 unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
             }
         }
-        sys_yield();
+        sys_niobix_yield();
     }
 }
 
 extern "C" fn task_spin_minimal() -> ! {
     crate::serial::write_str("TASK: minimal spin started\n");
     loop {
-        sys_yield();
+        sys_niobix_yield();
     }
 }
 
