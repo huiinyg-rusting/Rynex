@@ -1943,15 +1943,67 @@ pub fn test() {
 
     serial::write_str("TASK: testing kernel task creation...\n");
 
-    // Kernel test tasks get low priority (high nice)
-    let tid1 = create_kernel_task_prio(task_spin_minimal as *const () as u64, 19);
-    // let tid2 = create_kernel_task_prio(task_spin_minimal as *const () as u64, 19);
+    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, 19);
+    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 19);
 
     serial::write_str("TASK: task IDs: ");
     serial::write_dec(tid1.unwrap());
-    // serial::write_str(", ");
-    // serial::write_dec(tid2.unwrap());
+    serial::write_str(", ");
+    serial::write_dec(tid2.unwrap());
     serial::write_str("\n");
+
+    // Load user ELF modules from multiboot2
+    let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
+    if info_addr != 0 {
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
+        let n = crate::multiboot2::find_modules(info_addr, &mut modules);
+        for i in 0..n {
+            let mod_data = unsafe {
+                core::slice::from_raw_parts(
+                    modules[i].start as *const u8,
+                    (modules[i].end - modules[i].start) as usize,
+                )
+            };
+            serial::write_str("TASK: module ");
+            serial::write_dec(i as u64);
+            serial::write_str(": ");
+            serial::write_dec(mod_data.len() as u64);
+            serial::write_str(" bytes\n");
+
+            if mod_data.len() >= 4 && mod_data[0] == 0x7f && mod_data[1] == b'E'
+                && mod_data[2] == b'L' && mod_data[3] == b'F'
+            {
+                match i {
+                    0 => {
+                        crate::vfs::create_file(b"/bin/init", mod_data);
+                        match crate::elf::load_elf(mod_data) {
+                            Ok(elf_info) => {
+                                if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
+                                    serial::write_str("TASK: created user init task ");
+                                    serial::write_dec(tid);
+                                    serial::write_str(" entry=0x");
+                                    serial::write_hex(elf_info.entry);
+                                    serial::write_str("\n");
+                                }
+                            }
+                            Err(e) => {
+                                serial::write_str("TASK: ELF load failed: ");
+                                serial::write_str(e);
+                                serial::write_str("\n");
+                            }
+                        }
+                    }
+                    1 => {
+                        crate::vfs::create_file(b"/bin/hello", mod_data);
+                    }
+                    2 => {
+                        crate::vfs::create_file(b"/bin/shell", mod_data);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
