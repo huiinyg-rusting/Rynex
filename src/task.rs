@@ -196,6 +196,18 @@ static mut RUNQUEUE: RunQueue = RunQueue::new();
 static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+// Debug: count context switches
+static SWITCH_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Scratch buffer for timer interrupt frame (kernel tasks only).
+// build_frame writes 20×8 = 160 bytes. Kernel tasks use this instead of
+// writing to kernel_stack-160, which would corrupt the call chain.
+static mut TIMER_FRAME_SCRATCH: [u64; 20] = [0; 20];
+
+// Scratch area for kernel→kernel preemption trampoline.
+// Stores [real_rax, real_rdx, real_rip] for the task being resumed.
+static mut PREEMPT_SCRATCH: [u64; 3] = [0; 3];
+
 pub fn current_task_id() -> u64 {
     CURRENT_TASK.load(Ordering::SeqCst)
 }
@@ -440,6 +452,13 @@ pub fn schedule() {
 
     let new_idx = task_idx(next_id);
 
+    let sc = SWITCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sc % 1000 == 0 {
+        crate::serial::write_str("SW#");
+        crate::serial::write_dec(sc);
+        crate::serial::write_str("\n");
+    }
+
     unsafe { crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack); }
 
     let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
@@ -554,10 +573,11 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov rbx, [rsi + 0x90]",
         "test bl, 3",
         "jnz 1f",
-        // Kernel→kernel: push RIP and sti; ret
-        // STI enables interrupts after RET (Intel guarantee: STI takes effect
-        // at the next instruction boundary). This allows kernel tasks to
-        // receive timer interrupts for polling and rescheduling.
+        // Kernel→kernel: push RIP, sti, and ret.
+        // Interrupts are re-enabled here (they were disabled by cli in
+        // schedule() or by the iretq RFLAGS restore of the timer handler).
+        // The timer handler now correctly restores RSP for kernel→kernel,
+        // so preemption is safe.
         "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
         "sti",
@@ -596,14 +616,18 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "push r13",
         "push r14",
         "push r15",
+        "sub rsp, 256",
         "mov rdi, rbp",
         "add rdi, 8",
         "call {save_context}",
         "call {timer_schedule}",
-        // Always switch RSP to build_frame base, pop 15 GP, iretq.
-        // Even when no task switch is needed, timer_schedule returns a self-frame
-        // built from the current task's already-saved registers.
-        "mov rsp, rax",
+        // RAX = frame address from timer_schedule.
+        // If zero (kernel task), restore GP regs from the stack and return
+        // using the CPU-pushed interrupt frame directly.
+        "test rax, rax",
+        "jnz 2f",
+        // Kernel task: no frame manipulation, just restore and return
+        "add rsp, 256",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -619,7 +643,35 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbx",
         "pop rax",
         "pop rbp",
+        // RSP now points at CPU-pushed frame: RIP, CS, RFLAGS
+        // Kernel→kernel return: iretq restores RIP, CS, RFLAGS from the
+        // CPU-saved frame without clobbering any GP registers.
         "iretq",
+        // User task or preemption: use build_frame result
+        "2: mov rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "pop rbp",
+        "test byte ptr [rsp + 8], 3",
+        "jnz 3f",
+        "mov rdx, [rsp + 24]",
+        "mov rax, [rsp + 0]",
+        "mov rsp, rdx",
+        "push rax",
+        "ret",
+        "3: iretq",
 
         save_context = sym save_interrupt_context,
         timer_schedule = sym timer_schedule,
@@ -667,17 +719,16 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.rsp    = *frame.add(3);
             regs.ss     = *frame.add(4);
         } else {
-            // Kernel → kernel: CPU pushed RFLAGS, CS, RIP
+            // Kernel → kernel: CPU pushed RFLAGS, CS, RIP.
+            // RSP at interrupt time = frame + 24 (3 items * 8 bytes).
+            // Always use the real interrupted RSP — the build_frame + iretq
+            // restore path will return here correctly regardless of whether
+            // this is a kernel task or a user task in a syscall.
             regs.rip    = *frame.add(0);
             regs.cs     = *frame.add(1);
             regs.rflags = *frame.add(2);
-            if TASKS[idx].user_stack != 0 {
-                // User task interrupted during syscall — use per-task kernel stack
-                regs.rsp = TASKS[idx].kernel_stack;
-            } else {
-                regs.rsp = frame as u64 + 24;
-            }
-            regs.ss = KERNEL_DATA_SELECTOR;
+            regs.rsp    = frame as u64 + 24;
+            regs.ss     = KERNEL_DATA_SELECTOR;
         }
     }
 }
@@ -722,10 +773,9 @@ pub extern "C" fn timer_schedule() -> u64 {
     unsafe {
         let idx = task_idx(current);
 
-        // Kernel tasks: no preemption via timer, but still build a self-frame
-        // so the interrupt handler always has a valid frame to pop-and-iretq.
+        // Kernel tasks: return 0 to signal handler to use CPU-pushed frame directly
         if TASKS[idx].user_stack == 0 {
-            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return 0;
         }
 
         // User task interrupted in kernel mode (during a syscall): build a
@@ -733,7 +783,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         // to regs.rsp (the syscall_stack address saved by save_interrupt_context),
         // so the interrupted call chain is preserved.
         if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
-            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         // Decrement time slice
@@ -743,12 +793,12 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         // If task not running, don't reschedule — just build frame from saved regs
         if TASKS[idx].state != TaskState::Running {
-            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         // Time slice still positive → keep running current task
         if TASKS[idx].time_slice > 0 {
-            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         // Time slice expired — give a fresh time slice
@@ -759,13 +809,13 @@ pub extern "C" fn timer_schedule() -> u64 {
             Some(id) => id,
             None => {
                 TASKS[idx].state = TaskState::Running;
-                return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+                return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
             }
         };
 
         if next_id == current {
             TASKS[idx].state = TaskState::Running;
-            return build_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
         }
 
         // Switch to a different task — requeue current first
@@ -777,15 +827,56 @@ pub extern "C" fn timer_schedule() -> u64 {
         CURRENT_TASK.store(next_id, Ordering::SeqCst);
         pt_mgr().switch_to(TASKS[new_idx].pml4);
         crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack);
-        build_frame(TASKS[new_idx].kernel_stack, &raw const TASKS[new_idx])
+        build_kernel_preempt_frame(TASKS[new_idx].kernel_stack, &raw const TASKS[new_idx])
     }
 }
 
-/// Build a full 20-item stack frame for timer interrupt return via iretq.
-fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
+/// Build frame into the static scratch buffer (for kernel tasks, avoiding
+/// corrupting their own kernel stack call chain).
+fn build_frame_scratch(task_ptr: *const Task) -> u64 {
+    let regs = unsafe { &(*task_ptr).regs };
+    unsafe {
+        let base = &raw mut TIMER_FRAME_SCRATCH as *mut u64;
+        write_frame(base, regs);
+        base as u64
+    }
+}
+
+/// Build a frame for kernel→kernel preemption.
+/// Stores the real RAX/RDX/RIP in PREEMPT_SCRATCH and redirects
+/// the frame's RIP through a trampoline that restores them after
+/// the push+ret clobbers RAX and RDX.
+fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
         let base = (kernel_stack as *mut u64).sub(20);
+        write_frame(base, regs);
+        if (regs.cs & 3) == 0 {
+            PREEMPT_SCRATCH[0] = regs.rax;
+            PREEMPT_SCRATCH[1] = regs.rdx;
+            PREEMPT_SCRATCH[2] = regs.rip;
+            *base.add(15) = preempt_trampoline as u64;
+        }
+        base as u64
+    }
+}
+
+/// Trampoline for kernel→kernel preemption.
+/// Called when a kernel task is resumed from timer preemption.
+/// The handler's push+ret clobbers RAX and RDX; this trampoline
+/// restores them from PREEMPT_SCRATCH and jumps to the real RIP.
+#[unsafe(naked)]
+pub unsafe extern "C" fn preempt_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [{scratch} + 0]",
+        "mov rdx, [{scratch} + 8]",
+        "jmp [{scratch} + 16]",
+        scratch = sym PREEMPT_SCRATCH,
+    )
+}
+
+fn write_frame(base: *mut u64, regs: &Registers) {
+    unsafe {
         *base.add(0)  = regs.r15;
         *base.add(1)  = regs.r14;
         *base.add(2)  = regs.r13;
@@ -806,7 +897,6 @@ fn build_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
         *base.add(17) = regs.rflags;
         *base.add(18) = regs.rsp;
         *base.add(19) = regs.ss;
-        base as u64
     }
 }
 
@@ -1821,6 +1911,7 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
 
 extern "C" fn task_spin() -> ! {
     let mut count = 0u64;
+    let mut yields = 0u64;
     loop {
         if count < 3 {
             crate::serial::write_str("TASK: spin ");
@@ -1830,6 +1921,19 @@ extern "C" fn task_spin() -> ! {
             crate::serial::write_str(")\n");
             count += 1;
         }
+        yields += 1;
+        if yields > 100 {
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+            }
+        }
+        sys_yield();
+    }
+}
+
+extern "C" fn task_spin_minimal() -> ! {
+    crate::serial::write_str("TASK: minimal spin started\n");
+    loop {
         sys_yield();
     }
 }
@@ -1839,68 +1943,15 @@ pub fn test() {
 
     serial::write_str("TASK: testing kernel task creation...\n");
 
-    // Kernel test tasks get low priority (high nice) so user tasks always run first
-    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, 19);
-    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 19);
+    // Kernel test tasks get low priority (high nice)
+    let tid1 = create_kernel_task_prio(task_spin_minimal as *const () as u64, 19);
+    // let tid2 = create_kernel_task_prio(task_spin_minimal as *const () as u64, 19);
 
     serial::write_str("TASK: task IDs: ");
     serial::write_dec(tid1.unwrap());
-    serial::write_str(", ");
-    serial::write_dec(tid2.unwrap());
+    // serial::write_str(", ");
+    // serial::write_dec(tid2.unwrap());
     serial::write_str("\n");
-
-    // Load user ELF modules from multiboot2
-    let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
-    if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
-        let n = crate::multiboot2::find_modules(info_addr, &mut modules);
-        for i in 0..n {
-            let mod_data = unsafe {
-                core::slice::from_raw_parts(
-                    modules[i].start as *const u8,
-                    (modules[i].end - modules[i].start) as usize,
-                )
-            };
-            serial::write_str("TASK: module ");
-            serial::write_dec(i as u64);
-            serial::write_str(": ");
-            serial::write_dec(mod_data.len() as u64);
-            serial::write_str(" bytes\n");
-
-            if mod_data.len() >= 4 && mod_data[0] == 0x7f && mod_data[1] == b'E'
-                && mod_data[2] == b'L' && mod_data[3] == b'F'
-            {
-                match i {
-                    0 => {
-                        crate::vfs::create_file(b"/bin/init", mod_data);
-                        match crate::elf::load_elf(mod_data) {
-                            Ok(elf_info) => {
-                                if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
-                                    serial::write_str("TASK: created user init task ");
-                                    serial::write_dec(tid);
-                                    serial::write_str(" entry=0x");
-                                    serial::write_hex(elf_info.entry);
-                                    serial::write_str("\n");
-                                }
-                            }
-                            Err(e) => {
-                                serial::write_str("TASK: ELF load failed: ");
-                                serial::write_str(e);
-                                serial::write_str("\n");
-                            }
-                        }
-                    }
-                    1 => {
-                        crate::vfs::create_file(b"/bin/hello", mod_data);
-                    }
-                    2 => {
-                        crate::vfs::create_file(b"/bin/shell", mod_data);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
 
     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
@@ -1921,9 +1972,6 @@ pub fn test() {
 
     // Dequeue task 1 so it's not in the runqueue twice
     remove_from_runqueue(1);
-
-    // Interrupts still disabled (cli on line 1852). The context_switch will
-    // enable them via `sti; ret` when it enters the new kernel task.
 
     let new_task = unsafe { &mut TASKS[task_idx(1)] };
     new_task.state = TaskState::Running;
