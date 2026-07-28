@@ -56,6 +56,10 @@ pub fn set_tss_rsp0(rsp0: u64) {
     unsafe { TSS.rsp[0] = rsp0; }
 }
 
+pub fn get_tss_rsp0() -> u64 {
+    unsafe { TSS.rsp[0] }
+}
+
 pub fn init() {
     unsafe {
         let df_top = DF_STACK.as_ptr() as u64 + DF_STACK.len() as u64;
@@ -67,6 +71,16 @@ pub fn init() {
         TSS.ist[1] = timer_top;     // IST 2: Timer
         TSS.ist[2] = syscall_top;   // IST 3: Syscall
         TSS.ist[3] = pf_top;        // IST 4: Page Fault
+
+        crate::serial::write_str("GDT: DF_STACK top=0x");
+        crate::serial::write_hex(df_top);
+        crate::serial::write_str(" PF_STACK top=0x");
+        crate::serial::write_hex(pf_top);
+        crate::serial::write_str(" TSS.ist[0]=0x");
+        crate::serial::write_hex(TSS.ist[0]);
+        crate::serial::write_str(" TSS.ist[3]=0x");
+        crate::serial::write_hex(TSS.ist[3]);
+        crate::serial::write_str("\n");
 
         let tss_addr = &TSS as *const _ as u64;
         let (tsk_low, tss_high) = make_tss_descriptor(tss_addr, size_of::<TaskStateSegment>() as u32 - 1);

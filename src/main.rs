@@ -73,6 +73,13 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     serial::write_str("KBD: OK\n");
 
 memory::init(_info);
+    // Enable SSE (required by libc/musl which uses SSE instructions)
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+        cr4 |= 0x600; // OSFXSR (bit 9) + OSXMMEXCPT (bit 10)
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, nomem));
+    }
     // Enable NX (No-Execute) in EFER MSR and setup syscall MSRs
     unsafe {
         // Read current EFER
@@ -102,10 +109,21 @@ memory::init(_info);
         );
         // Setup syscall MSRs
         // STAR: [63:48] = user CS, [47:32] = kernel CS
-        // STAR[47:32] = SYSCALL CS (kernel code)
-        // STAR[63:48] = base for SYSRET: CS = base+16, SS = base+8
-        // We need  CS = USER_CODE_SELECTOR|3  (=0x23)  → base+16 = 0x20 → base = 0x10
-        //          SS = USER_DATA_SELECTOR|3  (=0x1B)  → base+8  = 0x18 → base = 0x10
+        // SYSCALL (user→kernel): CS = STAR[47:32], SS = STAR[47:32] + 8
+        // SYSRETQ (kernel→user): CS = (STAR[63:48] + 16) | 3, SS = (STAR[63:48] + 8) | 3
+        //
+        // iretq and SYSRETQ must produce the same CS/SS so the GDT descriptors
+        // are re-checked correctly on interrupt→iretq transitions.
+        //
+        // GDT layout:
+        //   0x08: ring0 code  (DPL=0)  ← SYSCALL CS
+        //   0x10: ring0 data  (DPL=0)  ← SYSCALL SS
+        //   0x18: ring3 data  (DPL=3)  ← SYSRETQ SS  (STAR[63:48]=0x10 → 0x10+8=0x18, |3→0x1B)
+        //   0x20: ring3 code  (DPL=3)  ← SYSRETQ CS  (STAR[63:48]=0x10 → 0x10+16=0x20, |3→0x23)
+        //   TSS low/high at 0x28/0x30
+        //
+        // STAR[47:32] = KERNEL_CODE_SELECTOR (0x08) for SYSCALL
+        // STAR[63:48] = KERNEL_DATA_SELECTOR (0x10) for SYSRETQ
         let star: u64 = (task::KERNEL_DATA_SELECTOR as u64) << 48
                       | (task::KERNEL_CODE_SELECTOR as u64) << 32;
         core::arch::asm!(

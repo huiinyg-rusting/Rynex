@@ -37,6 +37,8 @@ struct Elf64ProgramHeader {
 
 const PT_NULL: u32 = 0;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -46,6 +48,12 @@ pub struct ElfLoadInfo {
     pub entry: u64,
     pub pml4: u64,
     pub stack_top: u64,
+    pub is_dynamic: bool,
+    pub interp_path: [u8; 64],
+    pub interp_path_len: usize,
+    pub phdr_user: u64,
+    pub phnum: u16,
+    pub phentsize: u16,
 }
 
 fn page_align_up(addr: u64) -> u64 {
@@ -62,10 +70,7 @@ fn alloc_page() -> Option<u64> {
 }
 
 fn pt_flags(elf_flags: u32) -> u64 {
-    let mut f = PTE_PRESENT | PTE_USER;
-    if elf_flags & PF_W != 0 {
-        f |= PTE_WRITABLE;
-    }
+    let mut f = PTE_PRESENT | PTE_USER | PTE_WRITABLE;
     if elf_flags & PF_X == 0 {
         f |= PTE_NO_EXECUTE;
     }
@@ -77,6 +82,17 @@ fn map_page_into(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), &'st
 }
 
 pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
+    // Check if it's a PIE (ET_DYN); if so, use a non-zero base to avoid identity map
+    if data.len() >= 16 {
+        let e_type = u16::from_le_bytes([data[16], data[17]]);
+        if e_type == 3 {
+            return load_elf_at(data, 0x400000, None);
+        }
+    }
+    load_elf_at(data, 0, None)
+}
+
+pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> Result<ElfLoadInfo, &'static str> {
     if data.len() < 64 {
         return Err("ELF too small");
     }
@@ -106,58 +122,89 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
         return Err("PHdr out of bounds");
     }
 
-    // Clone kernel page tables for the new process.
-    // Copy all 512 entries so the kernel can access its code/data when CR3 = user PML4.
-    // Deep-copy PDPT[0] (the identity-map PDPT) so we can modify PD entries without
-    // affecting the kernel's shared page tables.
-    let pml4 = match alloc_page() {
-        Some(p) => p,
-        None => return Err("OOM for PML4"),
-    };
-    let new_pt = unsafe { &mut *(pml4 as *mut crate::paging::PageTable) };
-    let kernel_pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::SeqCst);
-    let old_pt = unsafe { &*(kernel_pml4 as *const crate::paging::PageTable) };
-    new_pt.0 = old_pt.0; // shallow copy all entries
+    // Clone kernel page tables for the new process, or use an existing PML4
+    let pml4 = if let Some(existing) = existing_pml4 {
+        existing
+    } else {
+        let p = match alloc_page() {
+            Some(p) => p,
+            None => return Err("OOM for PML4"),
+        };
+        let new_pt = unsafe { &mut *(p as *mut crate::paging::PageTable) };
+        let kernel_pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::SeqCst);
+        let old_pt = unsafe { &*(kernel_pml4 as *const crate::paging::PageTable) };
+        new_pt.0 = old_pt.0; // shallow copy all entries
 
-    // Deep-copy the identity-map PDPT (PML4[0] → PDPT → PD → PT).
-    // This gives us private copies of the PD and PDPT so map_into can modify them.
-    if new_pt.0[0] & crate::paging::PTE_PRESENT != 0 {
-        let old_pdpt = (new_pt.0[0] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let new_pdpt = alloc_page().ok_or("OOM: PDPT clone")?;
-        unsafe {
-            core::ptr::copy(old_pdpt as *const u8, new_pdpt as *mut u8, 4096);
-            // Deep-copy each present PD in this PDPT
-            let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
-            for i in 0..512 {
-                if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
-                    let old_pd = (pdpt.0[i] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
-                    let new_pd = alloc_page().ok_or("OOM: PD clone")?;
-                    unsafe { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
-                    pdpt.0[i] = new_pd | (pdpt.0[i] & !crate::paging::PTE_ADDR_MASK);
+        // Deep-copy the identity-map PDPT (PML4[0] → PDPT → PD → PT).
+        // This gives us private copies of the PD and PDPT so map_into can modify them.
+        if new_pt.0[0] & crate::paging::PTE_PRESENT != 0 {
+            let old_pdpt = (new_pt.0[0] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
+            let new_pdpt = alloc_page().ok_or("OOM: PDPT clone")?;
+            unsafe {
+                core::ptr::copy(old_pdpt as *const u8, new_pdpt as *mut u8, 4096);
+        let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
+        for i in 0..512 {
+            if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
+                if pdpt.0[i] & crate::paging::PTE_HUGE != 0 {
+                    // 1G huge page — keep as-is (don't deep-copy)
+                    continue;
                 }
+                let old_pd = (pdpt.0[i] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
+                let new_pd = alloc_page().ok_or("OOM: PD clone")?;
+                unsafe { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
+                pdpt.0[i] = new_pd | (pdpt.0[i] & !crate::paging::PTE_ADDR_MASK);
             }
         }
-        // Set PTE_USER on PML4[0] and all PDPT/PD entries so user mode can walk them
-        new_pt.0[0] = (new_pdpt | (new_pt.0[0] & !crate::paging::PTE_ADDR_MASK)) | crate::paging::PTE_USER;
-        unsafe {
-            let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
-            for i in 0..512 {
-                if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
-                    pdpt.0[i] |= crate::paging::PTE_USER;
-                    let pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
-                    let pd = &mut *(pd_addr as *mut crate::paging::PageTable);
-                    for j in 0..512 {
-                        if pd.0[j] & crate::paging::PTE_PRESENT != 0 {
-                            pd.0[j] |= crate::paging::PTE_USER;
+            }
+            // Set PTE_USER on PML4[0] and all PDPT/PD entries so user mode can walk them
+            new_pt.0[0] = (new_pdpt | (new_pt.0[0] & !crate::paging::PTE_ADDR_MASK)) | crate::paging::PTE_USER;
+            unsafe {
+                let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
+                for i in 0..512 {
+                    if pdpt.0[i] & crate::paging::PTE_PRESENT != 0 {
+                        pdpt.0[i] |= crate::paging::PTE_USER;
+                        if pdpt.0[i] & crate::paging::PTE_HUGE != 0 {
+                            // 1G huge page — no PD to walk
+                            continue;
+                        }
+                        let pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
+                        let pd = &mut *(pd_addr as *mut crate::paging::PageTable);
+                        for j in 0..512 {
+                            if pd.0[j] & crate::paging::PTE_PRESENT != 0 {
+                                pd.0[j] |= crate::paging::PTE_USER;
+                            }
                         }
                     }
                 }
             }
         }
-    }
+        p
+    };
 
     // Highest mapped address (for stack placement)
     let mut max_end = 0u64;
+    let mut interp_path = [0u8; 64];
+    let mut interp_path_len = 0usize;
+    let mut is_dynamic = false;
+
+    // First pass: detect PT_INTERP
+    for i in 0..phnum {
+        let phdr = unsafe {
+            let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
+            &*p
+        };
+        if phdr.type_ == PT_INTERP {
+            let off = phdr.offset as usize;
+            let sz = phdr.filesz as usize;
+            if off + sz <= data.len() && sz > 0 && sz < 64 {
+                let path = &data[off..off + sz - 1]; // exclude null terminator
+                let len = core::cmp::min(path.len(), 63);
+                interp_path[..len].copy_from_slice(&path[..len]);
+                interp_path_len = len;
+                is_dynamic = true;
+            }
+        }
+    }
 
     // Load each PT_LOAD segment
     for i in 0..phnum {
@@ -170,13 +217,10 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
             continue;
         }
 
-        if phdr.vaddr < 0x10000 {
-            return Err("segment too low");
-        }
-
-        let seg_start = page_align_down(phdr.vaddr);
-        let seg_end = page_align_up(phdr.vaddr + phdr.memsz);
-        let offset_in_page = phdr.vaddr - seg_start;
+        let vaddr_base = phdr.vaddr + load_addr;
+        let seg_start = page_align_down(vaddr_base);
+        let seg_end = page_align_up(vaddr_base + phdr.memsz);
+        let offset_in_page = vaddr_base - seg_start;
 
         let flags = pt_flags(phdr.flags);
 
@@ -201,20 +245,20 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
 
             // Copy file data or zero-fill
             let page_off = if addr == seg_start { offset_in_page } else { 0 };
-            let copy_start = phdr.vaddr + page_off;
+            let copy_start = addr + page_off;
             let copy_size = if copy_start + phdr.filesz > addr + 4096 {
                 addr + 4096 - copy_start
             } else {
-                phdr.filesz.saturating_sub(copy_start - phdr.vaddr)
+                phdr.filesz.saturating_sub(copy_start - vaddr_base)
             };
 
             if copy_size > 0 {
-                let file_off = (copy_start - phdr.vaddr) as usize;
+                let file_off = (copy_start - vaddr_base) as usize;
                 if (phdr.offset as usize + file_off + copy_size as usize) <= data.len() {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(phdr.offset as usize + file_off),
-                            phys as *mut u8,
+                            (phys + page_off) as *mut u8,
                             copy_size as usize,
                         );
                     }
@@ -224,62 +268,67 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
             addr += 4096;
         }
 
-        if phdr.vaddr + phdr.memsz > max_end {
-            max_end = phdr.vaddr + phdr.memsz;
+        if phdr.vaddr + load_addr + phdr.memsz > max_end {
+            max_end = phdr.vaddr + load_addr + phdr.memsz;
         }
     }
 
-    // Allocate user stack at USER_STACK_TOP
-    let stack_start = USER_STACK_TOP - (USER_STACK_PAGES as u64 * 4096);
-    let mut addr = stack_start;
-    while addr < USER_STACK_TOP {
-        let phys = match alloc_page() {
-            Some(p) => p,
-            None => return Err("OOM for stack"),
-        };
-        // Clear stack page
-        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
-        let flags = PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NO_EXECUTE;
-        map_page_into(pml4, addr, phys, flags)?;
-        addr += 4096;
-    }
-
-    let entry = hdr.entry;
-
-    // Set up initial stack (x86_64 SysV ABI):
-    //   RSP → argc (8 bytes) at USER_STACK_TOP - 16
-    //         argv[0] = NULL  at USER_STACK_TOP - 8
-    //   (16 bytes total, RSP is 16-byte aligned since USER_STACK_TOP % 16 == 0)
-
-    let last_stack_vaddr = USER_STACK_TOP - 8;
-    let last_stack_phys = {
-        let vpn3 = ((last_stack_vaddr) >> 12) & 0x1FF;
-        let vpn2 = ((last_stack_vaddr) >> 21) & 0x1FF;
-        let vpn1 = ((last_stack_vaddr) >> 30) & 0x1FF;
-        let vpn0 = ((last_stack_vaddr) >> 39) & 0x1FF;
-
-        let pml4 = pml4 as *const crate::paging::PageTable;
-        let pml4e = unsafe { (*pml4).0[vpn0 as usize] };
-        if pml4e & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
-        let pdpt = (pml4e & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pdpte = unsafe { (*pdpt).0[vpn1 as usize] };
-        if pdpte & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
-        let pd = (pdpte & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pde = unsafe { (*pd).0[vpn2 as usize] };
-        if pde & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
-        let pt = (pde & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pte = unsafe { (*pt).0[vpn3 as usize] };
-        if pte & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
-        pte & PTE_ADDR_MASK
+    // PHDR is within the first PT_LOAD segment — no separate page needed.
+    // The ld.so computes base as AT_PHDR - phdr_vaddr, so AT_PHDR must
+    // point to the actual PHDR location in the loaded image.
+    let phdr_user = if is_dynamic {
+        load_addr + hdr.phoff as u64
+    } else {
+        0
     };
 
-    // The last stack page's offset within the page
-    let page_off = last_stack_vaddr & 0xFFF;
-    unsafe {
-        let phys = last_stack_phys + page_off;
-        // phys maps to USER_STACK_TOP - 8; phys - 8 maps to USER_STACK_TOP - 16
-        core::ptr::write((phys - 8) as *mut u64, 0);  // argc = 0 at USER_STACK_TOP - 16
-        core::ptr::write(phys as *mut u64, 0);         // argv = NULL at USER_STACK_TOP - 8
+    // Allocate user stack at USER_STACK_TOP (only when creating new PML4)
+    if existing_pml4.is_none() {
+        serial::write_str("EXECVE_AT: alloc stack...\n");
+        let stack_start = USER_STACK_TOP - (USER_STACK_PAGES as u64 * 4096);
+        let mut addr = stack_start;
+        while addr < USER_STACK_TOP {
+            let phys = match alloc_page() {
+                Some(p) => p,
+                None => return Err("OOM for stack"),
+            };
+            unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+            let flags = PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_NO_EXECUTE;
+            map_page_into(pml4, addr, phys, flags)?;
+            addr += 4096;
+        }
+    }
+
+    let entry = hdr.entry + load_addr;
+
+    // Set up initial stack (only when creating new PML4)
+    if existing_pml4.is_none() {
+        let last_stack_vaddr = USER_STACK_TOP - 8;
+        let last_stack_phys = {
+            let vpn3 = ((last_stack_vaddr) >> 12) & 0x1FF;
+            let vpn2 = ((last_stack_vaddr) >> 21) & 0x1FF;
+            let vpn1 = ((last_stack_vaddr) >> 30) & 0x1FF;
+            let vpn0 = ((last_stack_vaddr) >> 39) & 0x1FF;
+            let pml4 = pml4 as *const crate::paging::PageTable;
+            let pml4e = unsafe { (*pml4).0[vpn0 as usize] };
+            if pml4e & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
+            let pdpt = (pml4e & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+            let pdpte = unsafe { (*pdpt).0[vpn1 as usize] };
+            if pdpte & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
+            let pd = (pdpte & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+            let pde = unsafe { (*pd).0[vpn2 as usize] };
+            if pde & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
+            let pt = (pde & PTE_ADDR_MASK) as *const crate::paging::PageTable;
+            let pte = unsafe { (*pt).0[vpn3 as usize] };
+            if pte & PTE_PRESENT == 0 { return Err("stack PTE not found"); }
+            pte & PTE_ADDR_MASK
+        };
+        let page_off = last_stack_vaddr & 0xFFF;
+        unsafe {
+            let phys = last_stack_phys + page_off;
+            core::ptr::write((phys - 8) as *mut u64, 0);
+            core::ptr::write(phys as *mut u64, 0);
+        }
     }
 
     serial::write_str("ELF: loaded entry=0x");
@@ -325,5 +374,11 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
         entry,
         pml4,
         stack_top: USER_STACK_TOP - 16,
+        is_dynamic,
+        interp_path,
+        interp_path_len,
+        phdr_user,
+        phnum: phnum as u16,
+        phentsize: phentsize as u16,
     })
 }

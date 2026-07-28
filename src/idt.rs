@@ -28,9 +28,10 @@ pub fn init() {
             // Without IST the CPU preserves RSP for same-CPL interrupts,
             // so the zero path correctly restores the original RSP.
 
+        // Test: use real PF handler with DF's IST stack (index 1)
         idt.page_fault
-            .set_handler_fn(interrupts::page_fault)
-            .set_stack_index(4); // IST 4 (TSS.ist[3]) for Page Fault
+            .set_handler_fn(interrupts::page_fault_real)
+            .set_stack_index(1); // DF's IST stack (temporarily)
     }
 
     idt.invalid_tss.set_handler_fn(interrupts::invalid_tss);

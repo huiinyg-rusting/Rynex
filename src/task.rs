@@ -11,6 +11,9 @@ pub const USER_STACK_PAGES: usize = 8;
 pub const IRQ_BASE: u8 = 0x30;
 pub const TIMER_IRQ_VECTOR: u8 = IRQ_BASE + 0;
 
+// Virtual address for the user TLS/TCB page (one page below user stack)
+pub const USER_TLS_VADDR: u64 = 0x0000_7FFF_FFFF_A000;
+
 pub const KERNEL_CODE_SELECTOR: u64 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u64 = 0x10;
 pub const USER_CODE_SELECTOR: u64 = 0x20;
@@ -36,6 +39,12 @@ fn initial_time_slice(prio: u8) -> u32 {
     if t < 2 { 2 } else { t }
 }
 
+#[no_mangle]
+pub extern "C" fn debug_print_hex(val: u64) {
+    serial::write_str(".");
+    serial::write_hex(val);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TaskState {
@@ -56,6 +65,7 @@ pub struct Registers {
     pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
     pub rip: u64, pub rflags: u64,
     pub cs: u64, pub ss: u64,
+    pub fs_base: u64,
 }
 
 impl Registers {
@@ -67,6 +77,7 @@ impl Registers {
             r12: 0, r13: 0, r14: 0, r15: 0,
             rip: entry, rflags: 0x202,
             cs: KERNEL_CODE_SELECTOR, ss: KERNEL_DATA_SELECTOR,
+            fs_base: 0,
         }
     }
 
@@ -78,6 +89,7 @@ impl Registers {
             r12: 0, r13: 0, r14: 0, r15: 0,
             rip: entry, rflags: 0x202,
             cs: USER_CODE_SELECTOR | 3, ss: USER_DATA_SELECTOR | 3,
+            fs_base: 0,
         }
     }
 }
@@ -146,6 +158,7 @@ impl Task {
                 r8: 0, r9: 0, r10: 0, r11: 0,
                 r12: 0, r13: 0, r14: 0, r15: 0,
                 rip: 0, rflags: 0, cs: 0, ss: 0,
+                fs_base: 0,
             },
             kernel_stack: 0,
             user_stack: 0,
@@ -373,11 +386,32 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
+    // Allocate a zero-filled TLS/TCB page so __get_tp() returns 0 (first-load path)
+    let tls_phys = unsafe { &mut *crate::memory::allocator() }.alloc(0)?;
+    unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+    let tls_flags = crate::paging::PTE_PRESENT
+        | crate::paging::PTE_WRITABLE
+        | crate::paging::PTE_USER
+        | crate::paging::PTE_NO_EXECUTE;
+    if PageTableManager::map_into(pml4, USER_TLS_VADDR, tls_phys, tls_flags).is_err() {
+        return None;
+    }
+
     let task = unsafe { &mut TASKS[task_idx(tid)] };
     task.id = tid;
     task.tgid = tid;
     task.state = TaskState::Ready;
     task.regs = Registers::new_user(entry, user_stack_top);
+    task.regs.fs_base = USER_TLS_VADDR;
+    serial::write_str("USER_TASK[");
+    serial::write_dec(tid);
+    serial::write_str("].cs=0x");
+    serial::write_hex(task.regs.cs);
+    serial::write_str(" ss=0x");
+    serial::write_hex(task.regs.ss);
+    serial::write_str(" entry=0x");
+    serial::write_hex(entry);
+    serial::write_str("\n");
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
@@ -463,13 +497,44 @@ pub fn schedule() {
 
     let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
 
+    serial::write_str("SCHED: old=");
+    serial::write_dec(old);
+    serial::write_str(" new=");
+    serial::write_dec(next_id);
+    serial::write_str(" new.cs=0x");
+    serial::write_hex(unsafe { TASKS[new_idx].regs.cs });
+    serial::write_str(" new.ss=0x");
+    serial::write_hex(unsafe { TASKS[new_idx].regs.ss });
+    serial::write_str("\n");
+
     unsafe {
         TASKS[new_idx].state = TaskState::Running;
         pt_mgr().switch_to(TASKS[new_idx].pml4);
 
+        // Sanity check: print if any saved RIP is non-canonical
+        let new_rip = TASKS[new_idx].regs.rip;
+        if (new_rip >> 47) != 0 && (new_rip >> 47) != 0x1FFFF {
+            crate::serial::write_str("SCHED: BAD RIP=0x");
+            crate::serial::write_hex(new_rip);
+            crate::serial::write_str(" cs=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.cs);
+            crate::serial::write_str("\n");
+        }
+
         let old_idx = task_idx(old);
         let old_ptr = &mut TASKS[old_idx].regs as *mut Registers;
         let new_ptr = &TASKS[new_idx].regs as *const Registers;
+
+        // Restore FS base for the new task
+        let fs_base = TASKS[new_idx].regs.fs_base;
+        core::arch::asm!(
+            "mov ecx, 0xC0000100",
+            "wrmsr",
+            in("eax") (fs_base as u32),
+            in("edx") ((fs_base >> 32) as u32),
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
 
         core::arch::asm!(
             "mov rdi, {old}",
@@ -554,6 +619,11 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov [rdi + 0x88], rax",
         "mov [rdi + 0x90], cs",
         "mov [rdi + 0x98], ss",
+        // Check if target is user or kernel mode by examining CS.RPL
+        "mov rbx, [rsi + 0x90]",
+        "test bl, 3",
+        "jnz 1f",
+        // Kernel→kernel: load new RSP, push RIP, sti, and ret.
         "mov rsp, [rsi + 0x38]",
         "mov rax, [rsi + 0x00]",
         "mov rbx, [rsi + 0x08]",
@@ -569,25 +639,30 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov r13, [rsi + 0x68]",
         "mov r14, [rsi + 0x70]",
         "mov r15, [rsi + 0x78]",
-        // Check if target is user or kernel mode by examining CS.RPL
-        "mov rbx, [rsi + 0x90]",
-        "test bl, 3",
-        "jnz 1f",
-        // Kernel→kernel: push RIP, sti, and ret.
-        // Interrupts are re-enabled here (they were disabled by cli in
-        // schedule() or by the iretq RFLAGS restore of the timer handler).
-        // The timer handler now correctly restores RSP for kernel→kernel,
-        // so preemption is safe.
         "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
         "sti",
         "ret",
-        // Kernel→user: push full iretq frame (5 pops)
-        "1: push qword ptr [rsi + 0x98]",
-        "push qword ptr [rsi + 0x38]",
-        "push qword ptr [rsi + 0x88]",
-        "push qword ptr [rsi + 0x90]",
-        "push qword ptr [rsi + 0x80]",
+        // Kernel→user: build iretq frame on kernel stack
+        "1: push qword ptr [rsi + 0x98]",     // SS
+        "push qword ptr [rsi + 0x38]",        // RSP (user stack)
+        "push qword ptr [rsi + 0x88]",        // RFLAGS
+        "push qword ptr [rsi + 0x90]",        // CS (0x23)
+        "push qword ptr [rsi + 0x80]",        // RIP
+        "mov rax, [rsi + 0x00]",
+        "mov rbx, [rsi + 0x08]",
+        "mov rcx, [rsi + 0x10]",
+        "mov rdx, [rsi + 0x18]",
+        "mov rdi, [rsi + 0x28]",
+        "mov rbp, [rsi + 0x30]",
+        "mov r8,  [rsi + 0x40]",
+        "mov r9,  [rsi + 0x48]",
+        "mov r10, [rsi + 0x50]",
+        "mov r11, [rsi + 0x58]",
+        "mov r12, [rsi + 0x60]",
+        "mov r13, [rsi + 0x68]",
+        "mov r14, [rsi + 0x70]",
+        "mov r15, [rsi + 0x78]",
         "mov rsi, [rsi + 0x20]",
         "iretq",
     )
@@ -620,6 +695,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "mov rdi, rbp",
         "add rdi, 8",
         "call {save_context}",
+        "call {inc_ticks}",
         "call {timer_schedule}",
         // RAX = frame address from timer_schedule.
         // If zero (kernel task), restore GP regs from the stack and return
@@ -674,6 +750,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "3: iretq",
 
         save_context = sym save_interrupt_context,
+        inc_ticks = sym inc_ticks,
         timer_schedule = sym timer_schedule,
     )
 }
@@ -704,6 +781,19 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
         regs.rbx = *gp.add(12);
         regs.rax = *gp.add(13);
         regs.rbp = *gp.add(14);
+
+        // Save FS base MSR
+        let fs_base_low: u32;
+        let fs_base_high: u32;
+        core::arch::asm!(
+            "mov ecx, 0xC0000100",
+            "rdmsr",
+            out("eax") fs_base_low,
+            out("edx") fs_base_high,
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
+        regs.fs_base = (fs_base_high as u64) << 32 | fs_base_low as u64;
 
         // Detect user→kernel vs kernel→kernel by checking CS.RPL at frame+1:
         //   frame[0] = RIP   (lowest address, always present)
@@ -743,7 +833,6 @@ static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 
 pub extern "C" fn timer_schedule() -> u64 {
     crate::pic::send_eoi(0);
-
     // Poll UART for serial input and feed into keyboard buffer
     while let Some(c) = crate::serial::read_byte_nonblocking() {
         crate::keyboard::push_char(c);
@@ -836,6 +925,15 @@ pub extern "C" fn timer_schedule() -> u64 {
 fn build_frame_scratch(task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
+        // Restore FS base for this task
+        core::arch::asm!(
+            "mov ecx, 0xC0000100",
+            "wrmsr",
+            in("eax") (regs.fs_base as u32),
+            in("edx") ((regs.fs_base >> 32) as u32),
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
         let base = &raw mut TIMER_FRAME_SCRATCH as *mut u64;
         write_frame(base, regs);
         base as u64
@@ -849,6 +947,15 @@ fn build_frame_scratch(task_ptr: *const Task) -> u64 {
 fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
+        // Restore FS base for this task
+        core::arch::asm!(
+            "mov ecx, 0xC0000100",
+            "wrmsr",
+            in("eax") (regs.fs_base as u32),
+            in("edx") ((regs.fs_base >> 32) as u32),
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
         let base = (kernel_stack as *mut u64).sub(20);
         write_frame(base, regs);
         if (regs.cs & 3) == 0 {
@@ -949,6 +1056,7 @@ pub const SYS_getuid: u64 = 102;
 pub const SYS_getgid: u64 = 104;
 pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
+pub const SYS_arch_prctl: u64 = 158;
 pub const SYS_getdents64: u64 = 217;
 
 // Niobix-specific (high numbers, no Linux conflict)
@@ -962,6 +1070,11 @@ pub const SYS_niobix_spawn: u64 = 2006;
 pub const SYS_niobix_getppid: u64 = 2007;
 pub const SYS_niobix_sleep: u64 = 2008;
 pub const SYS_niobix_yield: u64 = 2009;
+
+pub const ARCH_SET_FS: u64 = 0x1002;
+pub const ARCH_GET_FS: u64 = 0x1003;
+
+pub const INTERP_BASE: u64 = 0x100_0000_0000;
 
 pub const WNOHANG: u32 = 1;
 
@@ -980,12 +1093,15 @@ pub extern "C" fn syscall_handler(
         SYS_fstat => sys_fstat(arg1 as u32, arg2 as *mut u8),
         SYS_lstat => sys_stat(arg1 as *const u8, arg2 as *mut u8), // lstat = stat in flat fs
         SYS_mmap => sys_mmap(arg1 as *mut u8, arg2 as usize, arg3 as i32, arg4 as i32, arg5 as i32, arg6 as u64),
+        SYS_mprotect => sys_mprotect(arg1 as u64, arg2 as usize, arg3 as i32),
+        SYS_munmap => sys_munmap(arg1 as u64, arg2 as usize),
         SYS_brk => sys_brk(arg1 as u64),
         SYS_ioctl => sys_ioctl(arg1 as u32, arg2 as u64, arg3 as u64),
         SYS_access => sys_access(arg1 as *const u8, arg2 as i32),
         SYS_pipe => sys_pipe(arg1 as *mut u32),
         SYS_dup2 => sys_dup2(arg1 as u32, arg2 as u32),
         SYS_nanosleep => sys_nanosleep(arg1 as *const u64, arg2 as *mut u64),
+        SYS_arch_prctl => sys_arch_prctl(arg1 as u64, arg2 as u64),
         SYS_getpid => sys_getpid(),
         SYS_fork => sys_fork(),
         SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
@@ -1577,6 +1693,32 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
     }
 }
 
+fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(id);
+        let pml4 = TASKS[idx].pml4;
+        let start = addr & !0xFFF;
+        let end = ((addr + len as u64 + 0xFFF) & !0xFFF);
+        let mut pte_flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER;
+        if (prot & 2) != 0 { pte_flags |= crate::paging::PTE_WRITABLE; }
+        if (prot & 4) == 0 { pte_flags |= crate::paging::PTE_NO_EXECUTE; }
+        let mut page = start;
+        while page < end {
+            if let Some(phys) = crate::paging::PageTableManager::resolve_phys(pml4, page) {
+                let _ = crate::paging::PageTableManager::map_into(pml4, page, phys, pte_flags);
+            }
+            page += 4096;
+        }
+    }
+    0
+}
+
+fn sys_munmap(_addr: u64, _len: usize) -> i64 {
+    0
+}
+
 // ── Fork ──────────────────────────────────────────────────────────
 
 fn sys_fork() -> i64 {
@@ -1656,6 +1798,7 @@ fn sys_fork() -> i64 {
 // ── Execve ────────────────────────────────────────────────────────
 
 fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
+    serial::write_str("EXECVE: entered\n");
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
@@ -1717,139 +1860,366 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     }
 
     // Load the ELF
+    serial::write_str("EXECVE: loading ELF...\n");
     match crate::elf::load_elf(buffer) {
         Ok(info) => {
+            serial::write_str("EXECVE: ELF loaded OK\n");
             unsafe {
                 let idx = task_idx(id);
                 let old_pml4 = TASKS[idx].pml4;
-                let old_us = TASKS[idx].user_stack;
 
-                // Set up argv on the new user stack
-                let mut sp = info.stack_top;
+                // If dynamic: load interpreter
+                let mut interp_info = None;
+                if info.is_dynamic {
+                    serial::write_str("EXECVE: loading interpreter...\n");
+                    let interp_path = core::str::from_utf8_unchecked(
+                        core::slice::from_raw_parts(info.interp_path.as_ptr(), info.interp_path_len)
+                    );
+                    serial::write_str("SYS_EXECVE: interp='");
+                    serial::write_str(interp_path);
+                    serial::write_str("'\n");
 
-                // Simple argv setup: copy strings from user space to the new stack
-                if argv != 0 {
-                    // Count argv
-                    let mut argc: usize = 0;
-                    loop {
-                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(argc)) };
-                        if ptr == 0 { break; }
-                        argc += 1;
-                    }
-
-                    // Layout on new stack (downward):
-                    // [8-byte alignment padding]
-                    // [string data]
-                    // [argv pointers (8 bytes each)]
-                    // [argc (8 bytes)]
-                    // [return address placeholder]
-
-                    // First pass: calculate total string length
-                    let mut total_str_len = 0usize;
-                    let mut arg_ptrs = [0u64; 64];
-                    let mut arg_lens = [0usize; 64];
-                    for i in 0..argc {
-                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(i)) };
-                        if ptr == 0 { break; }
-                        // Copy string from user space
-                        let mut s = 0;
-                        loop {
-                            let c = unsafe { *(ptr as *const u8).add(s) };
-                            if c == 0 { break; }
-                            s += 1;
+                    // Look up interpreter in VFS
+                    let interp_name = interp_path.as_bytes();
+                    let interp_inode = match crate::vfs::find_inode(interp_name) {
+                        Some(ino) => ino,
+                        None => {
+                            serial::write_str("SYS_EXECVE: interp not found\n");
+                            alloc.free(buffer_phys, elford);
+                            return -ENOENT;
                         }
-                        arg_lens[i] = s;
-                        total_str_len += s + 1; // +1 for null terminator
+                    };
+                    let interp_size = match crate::vfs::inode_size(interp_inode) {
+                        Some(sz) => sz,
+                        None => { alloc.free(buffer_phys, elford); return -EIO; }
+                    };
+                    if interp_size > 1024 * 1024 * 16 {
+                        alloc.free(buffer_phys, elford);
+                        return -EINVAL;
                     }
-
-                    // Align to 8 bytes
-                    let aligned_str_len = (total_str_len + 7) & !7;
-                    let argv_area = aligned_str_len; // area for argv ptrs (below strings)
-
-                    // sp is the top of stack (highest address)
-                    // We layout from sp downward:
-                    // sp - total = strings (growing down from sp)
-                    // Below strings: argv pointers
-                    // Below argv: argc
-                    // Then return address
-
-                    let strings_start = sp - aligned_str_len as u64;
-                    let mut string_pos = sp - total_str_len as u64; // start writing from here (unaligned)
-
-                    for i in 0..argc {
-                        // Record argv pointer (within the stack area)
-                        arg_ptrs[i] = string_pos;
-                        let ptr: u64 = unsafe { core::ptr::read_volatile((argv as *const u64).add(i)) };
-                        // Copy string byte by byte
-                        let mut j = 0;
-                        loop {
-                            let c = unsafe { *(ptr as *const u8).add(j) };
-                            if c == 0 { break; }
-                            unsafe { *(string_pos as *mut u8) = c; }
-                            string_pos += 1;
-                            j += 1;
+                    let interp_pages = (interp_size + 0xFFF) / 0x1000;
+                    let mut interp_ord = 0;
+                    while (4096usize << interp_ord) < interp_pages * 4096 && interp_ord < 10 {
+                        interp_ord += 1;
+                    }
+                    let interp_phys = match alloc.alloc(interp_ord) {
+                        Some(p) => p,
+                        None => { alloc.free(buffer_phys, elford); return -ENOMEM; }
+                    };
+                    let interp_buf = unsafe {
+                        core::slice::from_raw_parts_mut(interp_phys as *mut u8, interp_size)
+                    };
+                    match crate::vfs::inode_read(interp_inode, 0, interp_buf) {
+                        Some(n) if n == interp_size => {}
+                        _ => {
+                            alloc.free(buffer_phys, elford);
+                            alloc.free(interp_phys, interp_ord);
+                            return -EIO;
                         }
-                        unsafe { *(string_pos as *mut u8) = 0; }
-                        string_pos += 1;
                     }
-                    // Pad to alignment
-                    string_pos = strings_start + aligned_str_len as u64;
 
-                    // Now place argv pointers (growing downward from aligned_str_len area)
-                    let argv_ptr_area = strings_start - ((argc + 1) * 8) as u64;
-                    for i in 0..argc {
-                        unsafe { core::ptr::write_volatile((argv_ptr_area + i as u64 * 8) as *mut u64, arg_ptrs[i]); }
+                    // Load interpreter at a PIC base into the same PML4
+                    match crate::elf::load_elf_at(interp_buf, INTERP_BASE, Some(info.pml4)) {
+                        Ok(ii) => interp_info = Some(ii),
+                        Err(e) => {
+                            alloc.free(buffer_phys, elford);
+                            alloc.free(interp_phys, interp_ord);
+                            serial::write_str("SYS_EXECVE: interp load failed: ");
+                            serial::write_str(e);
+                            serial::write_str("\n");
+                            return -ENOEXEC;
+                        }
                     }
-                    unsafe { core::ptr::write_volatile((argv_ptr_area + argc as u64 * 8) as *mut u64, 0u64); } // NULL terminator
-
-                    // Place argc
-                    let argc_pos = argv_ptr_area - 8;
-                    unsafe { core::ptr::write_volatile(argc_pos as *mut u64, argc as u64); }
-
-                    // Set up registers for ELF entry with argc/argv on stack
-                    // RSP should point to argc on the stack (Linux-style: argc at (%rsp))
-                    sp = argc_pos;
-
-                    TASKS[idx].regs = Registers::new_user(info.entry, sp);
-                } else {
-                    TASKS[idx].regs = Registers::new_user(info.entry, info.stack_top);
                 }
 
+                // Determine entry point and final stack layout
+                let final_entry = match &interp_info {
+                    Some(ii) => ii.entry,
+                    None => info.entry,
+                };
+
+                // ── Stack layout (high to low) ──
+                // [argv strings at top]
+                // [random 16 bytes]
+                // [AUX vectors (key+val pairs)]
+                // [envp NULL]
+                // [argv pointers + NULL]
+                // [argc]  ← SP
+                //
+                // This follows Linux ABI: SP→argc, SP+8→argv[0], etc.
+                let mut sp = info.stack_top;
+
+                // ── Read argv into kernel buffers ──
+                // argv is a user pointer in the calling task's address space
+                // (current PML4).  We read it into a kernel buffer now, before
+                // switching to the new PML4 below.
+                let mut argc: usize = 0;
+                let mut arg_ptrs = [0u64; 64];
+                let mut argv_buf = [0u8; 4096];
+                let mut argv_offsets = [0u64; 64];
+                let mut argv_buf_len = 0usize;
+                if argv != 0 {
+                    let mut pos = 0usize;
+                    loop {
+                        let ptr: u64 = core::ptr::read_volatile((argv as *const u64).add(argc));
+                        if ptr == 0 { break; }
+                        let mut s = 0usize;
+                        loop {
+                            if pos + s >= argv_buf.len() { break; }
+                            let c = *(ptr as *const u8).add(s);
+                            if c == 0 { break; }
+                            argv_buf[pos + s] = c;
+                            s += 1;
+                        }
+                        if pos + s < argv_buf.len() {
+                            argv_buf[pos + s] = 0;
+                        }
+                        argv_offsets[argc] = pos as u64;
+                        pos += s + 1;
+                        argc += 1;
+                        if argc >= 64 { break; }
+                    }
+                    argv_buf_len = pos;
+                }
+
+                // ── Switch to the new PML4 ──
+                // All subsequent stack writes use the new address space.
+                pt_mgr().switch_to(info.pml4);
+                crate::gdt::set_tss_rsp0(TASKS[idx].kernel_stack);
+
+                // ── Write argv strings from kernel buffer to user stack ──
+                if argv != 0 && argc > 0 {
+                    let total_aligned = (argv_buf_len + 7) & !7;
+                    sp -= total_aligned as u64;
+                    let mut string_pos = sp;
+                    for i in 0..argc {
+                        arg_ptrs[i] = string_pos;
+                        let off = argv_offsets[i] as usize;
+                        let mut s = 0usize;
+                        loop {
+                            let c = argv_buf[off + s];
+                            if c == 0 { break; }
+                            unsafe { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, c); }
+                            s += 1;
+                        }
+                        unsafe { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, 0u8); }
+                        string_pos += s as u64 + 1;
+                    }
+                }
+
+                if info.is_dynamic {
+                    // Build stack from bottom: random data, AUX, envp, argv, argc
+                    use core::ptr::write_volatile as wv;
+
+                    macro_rules! aux {
+                        ($key:expr, $val:expr) => {
+                            sp -= 16;
+                            wv(sp as *mut u64, $key);
+                            wv((sp + 8) as *mut u64, $val);
+                        }
+                    }
+
+                    // 1. Random data
+                    sp -= 16;
+                    let random_data = sp;
+                    wv(sp as *mut u64, 0xdeadbeefcafebabeu64);
+                    wv((sp + 8) as *mut u64, 0x123456789abcdef0u64);
+
+                    // 2. AUX vectors (go downward; first written is at the highest mem).
+                    // AT_NULL must be written FIRST so it ends up at the highest address
+                    // in the aux range; the remaining entries are written after (below) it.
+                    // This way, when _dlstart_c iterates forward from argv/envp, it sees
+                    // actual aux entries before hitting AT_NULL as the terminator.
+                    aux!(0, 0u64);             // AT_NULL
+                    aux!(16, 0x0u64);          // AT_HWCAP
+                    aux!(26, 16u64);           // AT_RANDOM length
+                    aux!(25, random_data);     // AT_RANDOM
+                    aux!(23, 0u64);            // AT_SECURE
+                    aux!(17, 100u64);          // AT_CLKTCK
+                    aux!(14, 0u64);            // AT_EGID
+                    aux!(13, 0u64);            // AT_GID
+                    aux!(12, 0u64);            // AT_EUID
+                    aux!(11, 0u64);            // AT_UID
+                    aux!(9, info.entry);       // AT_ENTRY
+                    aux!(8, 0u64);             // AT_FLAGS
+                    aux!(7, INTERP_BASE);      // AT_BASE
+                    aux!(6, 4096u64);          // AT_PAGESZ
+                    aux!(5, info.phnum as u64); // AT_PHNUM
+                    aux!(4, info.phentsize as u64); // AT_PHENT
+                    aux!(3, info.phdr_user);   // AT_PHDR
+
+                    // 3. envp NULL
+                    sp -= 8;
+                    wv(sp as *mut u64, 0u64);
+
+                    // 4. argv pointers + NULL
+                    sp -= ((argc + 1) * 8) as u64;
+                    for i in 0..argc {
+                        wv((sp + i as u64 * 8) as *mut u64, arg_ptrs[i]);
+                    }
+                    wv((sp + argc as u64 * 8) as *mut u64, 0u64);
+
+                    // 5. argc
+                    sp -= 8;
+                    wv(sp as *mut u64, argc as u64);
+                } else {
+                    // Static: simple stack
+                    // envp NULL
+                    sp -= 8;
+                    unsafe { core::ptr::write_volatile(sp as *mut u64, 0u64); }
+                    // argv pointers + NULL
+                    sp -= ((argc + 1) * 8) as u64;
+                    for i in 0..argc {
+                        unsafe { core::ptr::write_volatile((sp + i as u64 * 8) as *mut u64, arg_ptrs[i]); }
+                    }
+                    unsafe { core::ptr::write_volatile((sp + argc as u64 * 8) as *mut u64, 0u64); }
+                    // argc
+                    sp -= 8;
+                    unsafe { core::ptr::write_volatile(sp as *mut u64, argc as u64); }
+                }
+
+                TASKS[idx].regs = Registers::new_user(final_entry, sp);
+                // Allocate zero-filled TLS page so __get_tp() returns 0 (first-load path)
+                if info.is_dynamic {
+                    let tls_phys = match alloc.alloc(0) {
+                        Some(p) => p,
+                        None => { alloc.free(old_pml4, 0); alloc.free(buffer_phys, elford); return -ENOMEM; }
+                    };
+                    unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+                    let tls_flags = crate::paging::PTE_PRESENT
+                        | crate::paging::PTE_WRITABLE
+                        | crate::paging::PTE_USER
+                        | crate::paging::PTE_NO_EXECUTE;
+                    if PageTableManager::map_into(info.pml4, USER_TLS_VADDR, tls_phys, tls_flags).is_err() {
+                        alloc.free(old_pml4, 0);
+                        alloc.free(buffer_phys, elford);
+                        return -ENOMEM;
+                    }
+                    TASKS[idx].regs.fs_base = USER_TLS_VADDR;
+                }
                 TASKS[idx].pml4 = info.pml4;
+                // Switch to the new page table so the iretq finds the user mappings
+                pt_mgr().switch_to(info.pml4);
                 TASKS[idx].user_stack = info.stack_top;
                 TASKS[idx].brk_start = 0;
                 TASKS[idx].brk_end = 0;
                 TASKS[idx].vmas = [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS];
 
-                // Free old PML4 page (physical address)
                 alloc.free(old_pml4, 0);
-                // Old user stack pages are not freed here — they'll be reclaimed
-                // when the parent reaps this task via waitpid
 
-                serial::write_str("SYS_EXECVE: task ");
+                serial::write_str("EXECVE: task ");
                 serial::write_dec(id);
                 serial::write_str(" entry=0x");
-                serial::write_hex(info.entry);
-                serial::write_str(" rsp=0x");
+                serial::write_hex(final_entry);
+                serial::write_str(" sp=0x");
                 serial::write_hex(sp);
+                if info.is_dynamic {
+                    serial::write_str(" dyn");
+                }
                 serial::write_str("\n");
 
-                serial::write_str("EXECVE: pm4=");
-                serial::write_hex(TASKS[idx].pml4);
-                serial::write_str(" sw\n");
-                pt_mgr().switch_to(TASKS[idx].pml4);
-                crate::gdt::set_tss_rsp0(TASKS[idx].kernel_stack);
+                serial::write_str("EXECVE: launching entry=0x");
+                serial::write_hex(final_entry);
+                serial::write_str(" sp=0x");
+                serial::write_hex(sp);
+                serial::write_str(" cs=0x");
+                serial::write_hex(TASKS[idx].regs.cs);
+                serial::write_str(" ss=0x");
+                serial::write_hex(TASKS[idx].regs.ss);
+                serial::write_str(" rflags=0x");
+                serial::write_hex(TASKS[idx].regs.rflags);
+                serial::write_str("\n");
+                // Dump first 40 qwords of the user stack
+                for i in 0..40u64 {
+                    let val = unsafe { core::ptr::read_volatile((sp + i*8) as *const u64) };
+                    serial::write_str("  [");
+                    serial::write_hex(sp + i*8);
+                    serial::write_str("] = 0x");
+                    serial::write_hex(val);
+                    serial::write_str("\n");
+                }
 
-                // Use context_switch with a temp save location so the
-                // new ELF's regs (already in TASKS[idx].regs) take effect.
-                static mut EXECVE_TMP: Registers = Registers {
-                    rax: 0, rbx: 0, rcx: 0, rdx: 0,
-                    rsi: 0, rdi: 0, rbp: 0, rsp: 0,
-                    r8: 0, r9: 0, r10: 0, r11: 0,
-                    r12: 0, r13: 0, r14: 0, r15: 0,
-                    rip: 0, rflags: 0, cs: 0, ss: 0,
-                };
-                context_switch(&mut EXECVE_TMP, &TASKS[idx].regs);
+                // If dynamic, dump DYNAMIC section and RELA table
+                if info.is_dynamic {
+                    let dynv_addr = final_entry + 0xe8e18 - 0xa9091; // base + _DYNAMIC
+                    let base_addr = final_entry - 0xa9091;
+                    serial::write_str("EXECVE: base=0x");
+                    serial::write_hex(base_addr);
+                    serial::write_str(" _DYNAMIC=0x");
+                    serial::write_hex(dynv_addr);
+                    serial::write_str("\n");
+                    // Dump DYNAMIC section (first 32 qwords)
+                    serial::write_str("  DYNAMIC dump:\n");
+                    for i in 0..32u64 {
+                        let val = unsafe { core::ptr::read_volatile((dynv_addr + i*8) as *const u64) };
+                        serial::write_str("    [0x");
+                        serial::write_hex(dynv_addr + i*8);
+                        serial::write_str("] = 0x");
+                        serial::write_hex(val);
+                        serial::write_str("\n");
+                    }
+                    // Dump RELA table (first 16 entries)
+                    let rela_addr = base_addr + 0x134b8;
+                    serial::write_str("  RELA dump (base+0x134b8=0x");
+                    serial::write_hex(rela_addr);
+                    serial::write_str("):\n");
+                    for i in 0..16u64 {
+                        let off = unsafe { core::ptr::read_volatile((rela_addr + i*24) as *const u64) };
+                        let info = unsafe { core::ptr::read_volatile((rela_addr + i*24 + 8) as *const u64) };
+                        let addend = unsafe { core::ptr::read_volatile((rela_addr + i*24 + 16) as *const u64) };
+                        serial::write_str("    [");
+                        serial::write_dec(i);
+                        serial::write_str("] off=0x");
+                        serial::write_hex(off);
+                        serial::write_str(" info=0x");
+                        serial::write_hex(info);
+                        serial::write_str(" addend=0x");
+                        serial::write_hex(addend);
+                        serial::write_str("\n");
+                    }
+                }
+
+                // Naked trampoline: loads GP regs from Registers and iretqs
+                unsafe {
+                    let r_ptr = &TASKS[idx].regs as *const Registers;
+                    // Set FS base before jumping to user space
+                    let fs_base = TASKS[idx].regs.fs_base;
+                    core::arch::asm!(
+                        "mov ecx, 0xC0000100",
+                        "wrmsr",
+                        in("eax") (fs_base as u32),
+                        in("edx") ((fs_base >> 32) as u32),
+                        out("ecx") _,
+                        options(nostack, preserves_flags)
+                    );
+                    #[unsafe(naked)]
+                    unsafe extern "C" fn iretq_trampoline(_regs: *const Registers) -> ! {
+                        core::arch::naked_asm!(
+                            "push qword ptr [rdi + 0x98]",
+                            "push qword ptr [rdi + 0x38]",
+                            "push qword ptr [rdi + 0x88]",
+                            "push qword ptr [rdi + 0x90]",
+                            "push qword ptr [rdi + 0x80]",
+                            "mov rax, [rdi + 0x00]",
+                            "mov rbx, [rdi + 0x08]",
+                            "mov rcx, [rdi + 0x10]",
+                            "mov rdx, [rdi + 0x18]",
+                            "mov rsi, [rdi + 0x20]",
+                            "mov rbp, [rdi + 0x30]",
+                            "mov r8,  [rdi + 0x40]",
+                            "mov r9,  [rdi + 0x48]",
+                            "mov r10, [rdi + 0x50]",
+                            "mov r11, [rdi + 0x58]",
+                            "mov r12, [rdi + 0x60]",
+                            "mov r13, [rdi + 0x68]",
+                            "mov r14, [rdi + 0x70]",
+                            "mov r15, [rdi + 0x78]",
+                            "mov rdi, [rdi + 0x28]",
+                            "iretq",
+                        )
+                    }
+                    iretq_trampoline(r_ptr);
+                }
             } // unsafe
         }
         Err(e) => {
@@ -1883,6 +2253,43 @@ fn sys_getppid() -> i64 {
             Some(pid) => pid as i64,
             None => 0,
         }
+    }
+}
+
+fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
+    match code {
+        ARCH_SET_FS => {
+            let id = CURRENT_TASK.load(Ordering::SeqCst);
+            if id == 0 { return -EINVAL; }
+            unsafe {
+                let idx = task_idx(id);
+                TASKS[idx].regs.fs_base = addr;
+            }
+            unsafe {
+                core::arch::asm!(
+                    "mov ecx, 0xC0000100",
+                    "wrmsr",
+                    in("eax") (addr as u32),
+                    in("edx") ((addr >> 32) as u32),
+                    out("ecx") _,
+                    options(nostack, preserves_flags)
+                );
+            }
+            0
+        }
+        ARCH_GET_FS => {
+            let id = CURRENT_TASK.load(Ordering::SeqCst);
+            if id == 0 { return -EINVAL; }
+            unsafe {
+                let idx = task_idx(id);
+                let val = TASKS[idx].regs.fs_base;
+                if addr != 0 {
+                    core::ptr::write_volatile(addr as *mut u64, val);
+                }
+            }
+            0
+        }
+        _ => -EINVAL,
     }
 }
 
@@ -2361,6 +2768,7 @@ extern "C" fn task_spin() -> ! {
         if yields > 100 {
             loop {
                 unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+                sys_niobix_yield();
             }
         }
         sys_niobix_yield();
@@ -2434,6 +2842,14 @@ pub fn test() {
                     }
                     2 => {
                         crate::vfs::create_file(b"/bin/shell", mod_data);
+                    }
+                    3 => {
+                        crate::vfs::create_external_file(b"/lib/libc.so", modules[i].start as *mut u8, mod_data.len());
+                        crate::vfs::create_external_file(b"/lib/ld-musl-x86_64.so.1", modules[i].start as *mut u8, mod_data.len());
+                    }
+                    4 => {
+                        crate::vfs::create_file(b"/bin/hello_dynamic", mod_data);
+                        serial::write_str("TASK: registered /bin/hello_dynamic in VFS\n");
                     }
                     _ => {}
                 }

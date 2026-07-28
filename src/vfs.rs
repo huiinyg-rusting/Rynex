@@ -1,11 +1,24 @@
 use crate::serial;
 
-// ── Inode (file) ──────────────────────────────────────────────────
+const DATA_POOL_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+static mut DATA_POOL: [u8; DATA_POOL_SIZE] = [0; DATA_POOL_SIZE];
+static mut POOL_OFFSET: usize = 0;
+
+fn pool_alloc(size: usize) -> Option<*mut u8> {
+    unsafe {
+        let aligned = (POOL_OFFSET + 15) & !15;
+        if aligned + size > DATA_POOL_SIZE {
+            return None;
+        }
+        POOL_OFFSET = aligned + size;
+        Some(DATA_POOL.as_mut_ptr().add(aligned))
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Inode {
     pub name: [u8; 32],
-    pub data: [u8; 8192],
+    pub data_ptr: *mut u8,
     pub size: usize,
     pub used: bool,
 }
@@ -14,14 +27,12 @@ impl Inode {
     pub const fn empty() -> Self {
         Inode {
             name: [0; 32],
-            data: [0; 8192],
+            data_ptr: core::ptr::null_mut(),
             size: 0,
             used: false,
         }
     }
 }
-
-// ── File descriptor ───────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 pub struct FileDesc {
@@ -45,36 +56,29 @@ impl FileDesc {
 pub const MAX_INODES: usize = 32;
 pub const MAX_FDS_PER_TASK: usize = 16;
 
-// ── RamFS ─────────────────────────────────────────────────────────
-
 pub static mut INODES: [Inode; MAX_INODES] = [Inode::empty(); MAX_INODES];
 
 pub fn init() {
     serial::write_str("VFS: init\n");
 }
 
-/// Create a file in the ramfs. Returns the inode index.
 pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used {
-                // Clear the inode
                 INODES[i] = Inode::empty();
                 INODES[i].used = true;
 
-                // Copy name directly into the inode
                 let name_len = core::cmp::min(name.len(), 31);
                 for j in 0..name_len {
                     INODES[i].name[j] = name[j];
                 }
                 INODES[i].name[name_len] = 0;
 
-                // Copy data directly into the inode
-                let data_len = core::cmp::min(data.len(), 8192);
-                for j in 0..data_len {
-                    INODES[i].data[j] = data[j];
-                }
-                INODES[i].size = data_len;
+                let data_ptr = pool_alloc(data.len())?;
+                core::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+                INODES[i].data_ptr = data_ptr;
+                INODES[i].size = data.len();
 
                 serial::write_str("VFS: created file '");
                 let mut j = 0;
@@ -83,7 +87,7 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
                     j += 1;
                 }
                 serial::write_str("' (");
-                serial::write_dec(data_len as u64);
+                serial::write_dec(data.len() as u64);
                 serial::write_str(" bytes)\n");
                 return Some(i);
             }
@@ -92,17 +96,46 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
     }
 }
 
-/// Find an inode by name. Returns the index or None.
+pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_INODES {
+            if !INODES[i].used {
+                INODES[i] = Inode::empty();
+                INODES[i].used = true;
+
+                let name_len = core::cmp::min(name.len(), 31);
+                for j in 0..name_len {
+                    INODES[i].name[j] = name[j];
+                }
+                INODES[i].name[name_len] = 0;
+
+                INODES[i].data_ptr = data;
+                INODES[i].size = size;
+
+                serial::write_str("VFS: created external file '");
+                let mut j = 0;
+                while j < 31 && INODES[i].name[j] != 0 {
+                    serial::write_char(INODES[i].name[j] as char);
+                    j += 1;
+                }
+                serial::write_str("' (");
+                serial::write_dec(size as u64);
+                serial::write_str(" bytes)\n");
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
 pub fn find_inode(name: &[u8]) -> Option<usize> {
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used { continue; }
             let iname = core::str::from_utf8(&INODES[i].name).unwrap_or("");
             let iname_bytes = iname.as_bytes();
-            // Compare up to the shorter length
             let l = core::cmp::min(name.len(), iname_bytes.len());
             if &name[..l] == &iname_bytes[..l] {
-                // Check that remaining bytes in iname are null (end of string)
                 let remaining = &iname_bytes[l..];
                 if remaining.iter().all(|&c| c == 0) {
                     return Some(i);
@@ -128,11 +161,11 @@ pub fn inode_read(idx: usize, pos: usize, buf: &mut [u8]) -> Option<usize> {
             return None;
         }
         let inode = &INODES[idx];
-        if pos >= inode.size {
+        if pos >= inode.size || inode.data_ptr.is_null() {
             return Some(0);
         }
         let to_read = core::cmp::min(buf.len(), inode.size - pos);
-        buf[..to_read].copy_from_slice(&inode.data[pos..pos + to_read]);
+        core::ptr::copy_nonoverlapping(inode.data_ptr.add(pos), buf.as_mut_ptr(), to_read);
         Some(to_read)
     }
 }
@@ -143,21 +176,15 @@ pub fn inode_write(idx: usize, pos: usize, buf: &[u8]) -> Option<usize> {
             return None;
         }
         let inode = &mut INODES[idx];
-        if pos > 8192 {
+        if pos > inode.size || inode.data_ptr.is_null() {
             return None;
         }
-        let to_write = core::cmp::min(buf.len(), 8192 - pos);
-        inode.data[pos..pos + to_write].copy_from_slice(&buf[..to_write]);
-        if pos + to_write > inode.size {
-            inode.size = pos + to_write;
-        }
+        let to_write = core::cmp::min(buf.len(), inode.size - pos);
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), inode.data_ptr.add(pos), to_write);
         Some(to_write)
     }
 }
 
-// ── Per-task file descriptors ─────────────────────────────────────
-
-// Per-task FD tables stored in a global array indexed by task ID
 static mut FD_TABLES: [[FileDesc; MAX_FDS_PER_TASK]; super::task::MAX_TASKS] =
     [[FileDesc::empty(); MAX_FDS_PER_TASK]; super::task::MAX_TASKS];
 
@@ -168,8 +195,6 @@ pub fn get_fd_table() -> Option<&'static mut [FileDesc; MAX_FDS_PER_TASK]> {
     unsafe { Some(&mut FD_TABLES[idx]) }
 }
 
-/// Allocate a new FD for the current task pointing to the given inode.
-/// Returns the FD number (0-based index into the FD table).
 pub fn alloc_fd(inode_idx: usize, flags: i32) -> Option<usize> {
     let table = get_fd_table()?;
     for i in 0..MAX_FDS_PER_TASK {
