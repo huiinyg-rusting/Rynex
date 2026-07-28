@@ -111,40 +111,79 @@ impl PageTableManager {
         };
 
         let pdpte = unsafe { (*pdpt).0[vpn[1]] };
-        let pd: *mut PageTable = if pdpte & PTE_PRESENT != 0 {
+        let pd: *mut PageTable = if pdpte & PTE_PRESENT != 0 && pdpte & PTE_HUGE == 0 {
             (pdpte & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let new_pd = Self::alloc_page()?;
             unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
+            if pdpte & PTE_HUGE != 0 {
+                let gb_base = pdpte & (0xFFFFFFFFFF << 30);
+                let gb_flags = (pdpte & !PTE_ADDR_MASK) | PTE_HUGE;
+                let pd_arr = unsafe { &mut *(new_pd as *mut PageTable) };
+                for i in 0..512u64 {
+                    pd_arr.0[i as usize] = (gb_base + i * 0x200000) | gb_flags;
+                }
+            }
             unsafe { (*pdpt).0[vpn[1]] = new_pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
             new_pd as *mut PageTable
         };
 
         let pde = unsafe { (*pd).0[vpn[2]] };
-        let pt: *mut PageTable = if pde & PTE_PRESENT != 0 {
-            if pde & PTE_HUGE != 0 {
-                // Split 2M huge page into 512 regular 4K entries
-                let new_pt = Self::alloc_page()?;
-                unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-                let huge_base = pde & PTE_ADDR_MASK;
-                let pte_flags = PTE_PRESENT | PTE_WRITABLE | (pde & (PTE_NO_EXECUTE | PTE_USER));
-                for i in 0..512u64 {
-                    unsafe { (*(new_pt as *mut [u64; 512]))[i as usize] = (huge_base + i * 4096) | pte_flags; }
-                }
-                unsafe { (*pd).0[vpn[2]] = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
-                new_pt as *mut PageTable
-            } else {
-                (pde & PTE_ADDR_MASK) as *mut PageTable
-            }
+        let pt: *mut PageTable = if pde & PTE_PRESENT != 0 && pde & PTE_HUGE == 0 {
+            (pde & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let new_pt = Self::alloc_page()?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-            unsafe { (*pd).0[vpn[2]] = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER; }
+            // If we are splitting a 2MB huge page, preserve the existing mapping
+            // by filling the new PT with the huge page's physical addresses.
+            if pde & PTE_HUGE != 0 {
+                let huge_base = pde & (0xFFFFFFFFFF << 21);
+                let huge_flags = pde & 0x7F;
+                let pt_arr = unsafe { &mut *(new_pt as *mut PageTable) };
+                for i in 0..512u64 {
+                    pt_arr.0[i as usize] = (huge_base + i * 4096) | huge_flags;
+                }
+            }
+            let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            unsafe { (*pd).0[vpn[2]] = pde_val; }
+            crate::serial::write_str("map_into: vpn2=");
+            crate::serial::write_dec(vpn[2] as u64);
+            crate::serial::write_str(" pde set to 0x");
+            crate::serial::write_hex(pde_val);
+            crate::serial::write_str(" (new_pt=0x");
+            crate::serial::write_hex(new_pt);
+            crate::serial::write_str(")\n");
             new_pt as *mut PageTable
         };
 
         unsafe { (*pt).0[vpn[3]] = phys | flags | PTE_PRESENT; }
         Ok(())
+    }
+
+    pub fn resolve_phys(pml4: u64, virt: u64) -> Option<u64> {
+        let vpn = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+        unsafe {
+            let pml4e = (*(pml4 as *const PageTable)).0[vpn[0]];
+            if pml4e & PTE_PRESENT == 0 { return None; }
+            let pdpt = (pml4e & PTE_ADDR_MASK) as *const PageTable;
+            let pdpte = (*pdpt).0[vpn[1]];
+            if pdpte & PTE_PRESENT == 0 { return None; }
+            let pd = (pdpte & PTE_ADDR_MASK) as *const PageTable;
+            let pde = (*pd).0[vpn[2]];
+            if pde & PTE_PRESENT == 0 { return None; }
+            if pde & PTE_HUGE != 0 {
+                return Some((pde & PTE_ADDR_MASK) | (virt & (PAGE_SIZE_2M - 1)));
+            }
+            let pt = (pde & PTE_ADDR_MASK) as *const PageTable;
+            let pte = (*pt).0[vpn[3]];
+            if pte & PTE_PRESENT == 0 { return None; }
+            Some((pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE_4K - 1)))
+        }
     }
 
     fn alloc_page() -> Result<u64, &'static str> {
@@ -398,6 +437,35 @@ pub fn init() {
         pml4.0 = old_pt.0;
     }
     crate::serial::write_str("PAGING: init done\n");
+    // Dump first few PML4 entries  
+    let pml4_addr = kernel_pml4();
+    let pt = unsafe { &*(pml4_addr as *const PageTable) };
+    for i in 0..4 {
+        let e = pt.0[i];
+        if e & PTE_PRESENT != 0 {
+            crate::serial::write_str("  PML4[");
+            crate::serial::write_dec(i as u64);
+            crate::serial::write_str("]=");
+            crate::serial::write_hex(e);
+            if e & PTE_HUGE != 0 { crate::serial::write_str(" [HUGEPAGE]"); }
+            crate::serial::write_str("\n");
+        }
+    }
+    // Dump PDPT[0] entries
+    if pt.0[0] & PTE_PRESENT != 0 {
+        let pdpt = unsafe { &*((pt.0[0] & PTE_ADDR_MASK) as *const PageTable) };
+        for i in 0..4 {
+            let e = pdpt.0[i];
+            if e & PTE_PRESENT != 0 {
+                crate::serial::write_str("    PDPT[");
+                crate::serial::write_dec(i as u64);
+                crate::serial::write_str("]=");
+                crate::serial::write_hex(e);
+                if e & PTE_HUGE != 0 { crate::serial::write_str(" [1G HUGEPAGE]"); }
+                crate::serial::write_str("\n");
+            }
+        }
+    }
 }
 
 pub fn get_pte_in(pml4: u64, virt: u64) -> Option<&'static mut u64> {
@@ -435,6 +503,66 @@ pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
 
 pub fn is_user_addr(addr: u64) -> bool {
     addr < 0x0000_8000_0000_0000
+}
+
+/// Copy user page mappings from `src_pml4` to `dst_pml4`
+pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str> {
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let src = unsafe { &*(src_pml4 as *const PageTable) };
+    let dst = unsafe { &mut *(dst_pml4 as *mut PageTable) };
+    for pml4_idx in 0..256 {
+        let src_pml4e = src.0[pml4_idx];
+        if src_pml4e & PTE_PRESENT == 0 { continue; }
+        let dst_pml4e = dst.0[pml4_idx];
+        if dst_pml4e & PTE_PRESENT == 0 {
+            dst.0[pml4_idx] = src_pml4e;
+            continue;
+        }
+        // Both present — merge PDPT entries
+        let src_pdpt = (src_pml4e & PTE_ADDR_MASK) as *const PageTable;
+        let dst_pdpt = (dst_pml4e & PTE_ADDR_MASK) as *mut PageTable;
+        let src_pdpt_ref = unsafe { &*src_pdpt };
+        let dst_pdpt_ref = unsafe { &mut *dst_pdpt };
+        for pdpt_idx in 0..512 {
+            let src_pdpte = src_pdpt_ref.0[pdpt_idx];
+            if src_pdpte & PTE_PRESENT == 0 { continue; }
+            let dst_pdpte = dst_pdpt_ref.0[pdpt_idx];
+            if dst_pdpte & PTE_PRESENT == 0 {
+                dst_pdpt_ref.0[pdpt_idx] = src_pdpte;
+                continue;
+            }
+            // Both present — merge PD entries
+            let src_pd = (src_pdpte & PTE_ADDR_MASK) as *const PageTable;
+            let dst_pd = (dst_pdpte & PTE_ADDR_MASK) as *mut PageTable;
+            let src_pd_ref = unsafe { &*src_pd };
+            let dst_pd_ref = unsafe { &mut *dst_pd };
+            for pd_idx in 0..512 {
+                let src_pde = src_pd_ref.0[pd_idx];
+                if src_pde & PTE_PRESENT == 0 { continue; }
+                let dst_pde = dst_pd_ref.0[pd_idx];
+                if dst_pde & PTE_PRESENT == 0 {
+                    dst_pd_ref.0[pd_idx] = src_pde;
+                    continue;
+                }
+                if src_pde & PTE_HUGE != 0 || dst_pde & PTE_HUGE != 0 {
+                    continue;
+                }
+                // Both present — merge PT entries
+                let src_pt = (src_pde & PTE_ADDR_MASK) as *const PageTable;
+                let dst_pt = (dst_pde & PTE_ADDR_MASK) as *mut PageTable;
+                let src_pt_ref = unsafe { &*src_pt };
+                let dst_pt_ref = unsafe { &mut *dst_pt };
+                for pt_idx in 0..512 {
+                    let src_pte = src_pt_ref.0[pt_idx];
+                    if src_pte & PTE_PRESENT == 0 { continue; }
+                    if dst_pt_ref.0[pt_idx] & PTE_PRESENT == 0 {
+                        dst_pt_ref.0[pt_idx] = src_pte;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // Clone the current process's PML4 for fork.

@@ -14,7 +14,7 @@ fn exit_user_task(frame: &InterruptStackFrame, name: &str, extra: &[(&str, u64)]
         crate::serial::write_str("  rip=0x");
         crate::serial::write_hex(frame.instruction_pointer.as_u64());
         crate::serial::write_str(" cs=0x");
-        crate::serial::write_hex(frame.code_segment.rpl() as u64);
+        crate::serial::write_hex(frame.code_segment.0 as u64);
         for (label, val) in extra {
             crate::serial::write_str(" ");
             crate::serial::write_str(label);
@@ -182,19 +182,39 @@ pub extern "x86-interrupt" fn stack_fault(frame: InterruptStackFrame, code: u64)
 }
 
 pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    exit_user_task(&frame, "GPF", &[("code", code)]);
-    let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    // Read raw values from the interrupt frame on the stack
+    let raw_rip: u64 = unsafe { core::ptr::read_volatile(&frame as *const InterruptStackFrame as *const u64) };
+    let raw_cs_val: u64 = unsafe { core::ptr::read_volatile((&frame as *const InterruptStackFrame as *const u64).add(1)) };
     crate::serial::write_str("EXC: GPF code=0x");
     crate::serial::write_hex(code);
     crate::serial::write_str(" rip=0x");
-    crate::serial::write_hex(frame.instruction_pointer.as_u64());
-    crate::serial::write_str(" cs=0x");
-    crate::serial::write_hex(cs as u64);
+    crate::serial::write_hex(raw_rip);
+    crate::serial::write_str(" cs_raw=0x");
+    crate::serial::write_hex(raw_cs_val & 0xFFFF);
     crate::serial::write_str(" rsp=0x");
-    crate::serial::write_hex(frame.stack_pointer.as_u64());
+    let raw_rsp: u64 = unsafe { core::ptr::read_volatile((&frame as *const InterruptStackFrame as *const u64).add(3)) };
+    crate::serial::write_hex(raw_rsp);
     crate::serial::write_str("\n");
+    exit_user_task_early(code, raw_rip, raw_rsp, "GPF");
     halt();
+}
+
+fn exit_user_task_early(code: u64, rip: u64, rsp: u64, name: &str) {
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    if cs & 3 == 3 {
+        crate::serial::write_str("EXC: ");
+        crate::serial::write_str(name);
+        crate::serial::write_str(" (user task)\n");
+        crate::serial::write_str("  rip=0x");
+        crate::serial::write_hex(rip);
+        crate::serial::write_str(" rsp=0x");
+        crate::serial::write_hex(rsp);
+        crate::serial::write_str(" code=0x");
+        crate::serial::write_hex(code);
+        crate::serial::write_str("\n");
+        crate::task::exit_task(-6);
+    }
 }
 
 pub extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: u64) {
@@ -203,12 +223,38 @@ pub extern "x86-interrupt" fn alignment_check(frame: InterruptStackFrame, code: 
     halt();
 }
 
-// Page fault — enhanced handler
-pub extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+// Raw probe: write '!' to COM1 before any prologue.
+// If the CPU dispatches to this handler, we will see it.
+#[unsafe(naked)]
+pub unsafe extern "C" fn page_fault_probe() {
+    core::arch::naked_asm!(
+        "push rax",
+        "mov al, 0x21",
+        "mov dx, 0x3f8",
+        "out dx, al",
+        "pop rax",
+        "jmp {}",
+        sym page_fault_real,
+    );
+}
+
+pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
-
-    dump_pf(&frame, code, cr2);
+    let rip = frame.instruction_pointer.as_u64();
+    let rsp = frame.stack_pointer.as_u64();
+    let cs_val = frame.code_segment.0 as u64;
+    crate::serial::write_str("EXC: PF rip=0x");
+    crate::serial::write_hex(rip);
+    crate::serial::write_str(" cs=0x");
+    crate::serial::write_hex(cs_val);
+    crate::serial::write_str(" rsp=0x");
+    crate::serial::write_hex(rsp);
+    crate::serial::write_str(" cr2=0x");
+    crate::serial::write_hex(cr2);
+    crate::serial::write_str(" code=0x");
+    crate::serial::write_hex(code.bits() as u64);
+    crate::serial::write_str("\n");
 
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         crate::serial::write_str("  resolved\n");
@@ -226,6 +272,11 @@ pub extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u6
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem, preserves_flags)); }
     let cs: u16;
     unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    // Read TSS.rsp0
+    let rsp0 = crate::gdt::get_tss_rsp0();
+    // Read cr3
+    let cr3_val: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_str("EXC: Double Fault\n");
     crate::serial::write_str("  rip=0x");
     crate::serial::write_hex(frame.instruction_pointer.as_u64());
@@ -235,6 +286,10 @@ pub extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u6
     crate::serial::write_hex(frame.stack_pointer.as_u64());
     crate::serial::write_str(" cr2=0x");
     crate::serial::write_hex(cr2);
+    crate::serial::write_str(" cr3=0x");
+    crate::serial::write_hex(cr3_val);
+    crate::serial::write_str(" tss.rsp0=0x");
+    crate::serial::write_hex(rsp0);
     crate::serial::write_str("\n");
     halt();
 }
