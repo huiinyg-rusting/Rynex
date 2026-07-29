@@ -1098,6 +1098,18 @@ pub extern "C" fn syscall_handler(
         SYS_geteuid => 0,
         SYS_getegid => 0,
         SYS_getdents64 => sys_getdents64(arg1 as u32, arg2 as *mut u8, arg3 as usize),
+        SYS_mkdir => sys_mkdir(arg1 as *const u8, arg2 as u32),
+        SYS_rmdir => sys_rmdir(arg1 as *const u8),
+        SYS_unlink => sys_unlink(arg1 as *const u8),
+        SYS_rename => sys_rename(arg1 as *const u8, arg2 as *const u8),
+        SYS_readlink => sys_readlink(arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
+        SYS_clone => sys_fork(), // clone → fork for now
+        SYS_vfork => sys_fork(), // vfork → fork
+        SYS_dup => sys_dup2(arg1 as u32, arg1 as u32), // dup → dup2(fd, fd)
+        SYS_fchdir => sys_chdir_from_fd(arg1 as u32),
+        SYS_rt_sigaction => 0,
+        SYS_rt_sigprocmask => 0,
+        SYS_rt_sigreturn => 0,
         SYS_sched_yield => sys_niobix_yield(),
         // Niobix-specific
         SYS_niobix_get_ticks => sys_get_ticks(),
@@ -1427,6 +1439,7 @@ pub const EDOM: i64 = -33;
 pub const ERANGE: i64 = -34;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;
+pub const ENOTEMPTY: i64 = -39;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -1549,30 +1562,86 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
 }
 
 fn sys_open(pathname: *const u8, flags: i32) -> i64 {
-    if pathname.is_null() {
-        return -EFAULT;
-    }
-    // Read path string from user space
-    let mut name_buf = [0u8; 256];
-    let mut len = 0;
-    loop {
-        let c = unsafe { *pathname.add(len) };
-        if c == 0 { break; }
-        if len >= 255 { return -ENAMETOOLONG; }
-        name_buf[len] = c;
-        len += 1;
-    }
-    let name = &name_buf[..len];
-
-    match crate::vfs::find_inode(name) {
-        Some(inode_idx) => {
-            match crate::vfs::alloc_fd(inode_idx, flags) {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    let _ = flags;
+    match crate::vfs::resolve_or_register(name) {
+        Some(flat_idx) => {
+            match crate::vfs::alloc_fd(flat_idx, flags) {
                 Some(fd) => fd as i64,
                 None => -EMFILE,
             }
         }
         None => -ENOENT,
     }
+}
+
+fn sys_mkdir(pathname: *const u8, mode: u32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs_core::mkdir(name, mode) {
+        Ok(_) => 0,
+        Err(_) => -EACCES,
+    }
+}
+
+fn sys_rmdir(pathname: *const u8) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs_core::rmdir(name) {
+        Ok(()) => 0,
+        Err(_) => -ENOTEMPTY,
+    }
+}
+
+fn sys_unlink(pathname: *const u8) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs_core::remove(name) {
+        Ok(()) => 0,
+        Err(_) => -EACCES,
+    }
+}
+
+fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
+    if oldpath.is_null() || newpath.is_null() { return -EFAULT; }
+    let old = unsafe { cstr_from_ptr(oldpath) };
+    let new = unsafe { cstr_from_ptr(newpath) };
+    if old.is_empty() || new.is_empty() { return -ENOENT; }
+    match crate::vfs_core::rename(old, new) {
+        Ok(()) => 0,
+        Err(_) => -EACCES,
+    }
+}
+
+fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    if pathname.is_null() || buf.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs_core::open(name, crate::vfs_core::types::O_RDONLY) {
+        Ok(vn_id) => {
+            match crate::vfs_core::readlink(vn_id) {
+                Ok(target) => {
+                    let len = target.len().min(bufsiz);
+                    unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf, len); }
+                    len as i64
+                }
+                Err(_) => -EINVAL,
+            }
+        }
+        Err(_) => -ENOENT,
+    }
+}
+
+fn sys_access(pathname: *const u8, _mode: i32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    if crate::vfs::resolve_or_register(name).is_some() { 0 } else { -ENOENT }
 }
 
 // ── Mmap ──────────────────────────────────────────────────────────
@@ -2330,15 +2399,6 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
     }
 }
 
-// ── Access ─────────────────────────────────────────────────────────
-
-fn sys_access(pathname: *const u8, _mode: i32) -> i64 {
-    if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
-    if name.is_empty() { return -ENOENT; }
-    if crate::vfs::find_inode(name).is_some() { 0 } else { -ENOENT }
-}
-
 // ── Nanosleep ──────────────────────────────────────────────────────
 
 fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
@@ -2437,29 +2497,36 @@ fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
 
 // ── Chdir ──────────────────────────────────────────────────────────
 
+fn sys_chdir_from_fd(fd: u32) -> i64 {
+    let table = match crate::vfs::get_fd_table() {
+        Some(t) => t,
+        None => return -EBADF,
+    };
+    if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
+        return -EBADF;
+    }
+    sys_chdir_from_fd_inner(fd)
+}
+
+fn sys_chdir_from_fd_inner(_fd: u32) -> i64 {
+    0
+}
+
 fn sys_chdir(path: *const u8) -> i64 {
     if path.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(path) };
     if name.is_empty() { return -ENOENT; }
-    // For now, only support "/" (root)
-    if name == b"/" || name == b"/bin" {
-        unsafe {
-            CWD_BUF[0] = b'/';
-            CWD_LEN = 1;
+    match crate::vfs_core::resolve_ino(name) {
+        Ok(_) => {
+            unsafe {
+                let l = core::cmp::min(name.len(), 255);
+                CWD_BUF[..l].copy_from_slice(&name[..l]);
+                CWD_LEN = l;
+            }
+            0
         }
-        return 0;
+        Err(_) => -ENOENT,
     }
-    // Check if path exists
-    if crate::vfs::find_inode(name).is_some() {
-        // "chdir" to a file - in this flat fs, just accept it
-        unsafe {
-            let l = core::cmp::min(name.len(), 255);
-            CWD_BUF[..l].copy_from_slice(&name[..l]);
-            CWD_LEN = l;
-        }
-        return 0;
-    }
-    -ENOENT
 }
 
 // ── Getdents64 ─────────────────────────────────────────────────────
@@ -2479,41 +2546,69 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
         Some(t) => t,
         None => return -EBADF,
     };
+    let flat_idx;
+    let pos;
     unsafe {
         if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
             return -EBADF;
         }
-        let ino = table[fd as usize].inode_idx;
-        if ino >= crate::vfs::MAX_INODES - 2 {
-            return -ENOTDIR;
-        }
+        flat_idx = table[fd as usize].inode_idx;
+        pos = table[fd as usize].pos;
     }
+    if flat_idx >= crate::vfs::MAX_INODES - 2 {
+        return -ENOTDIR;
+    }
+    let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
+    let vn_id = if vn_id != 0 { vn_id } else { return 0 };
+
+    let mut dirent_buf = [
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+        crate::vfs_core::types::Dirent::empty(),
+    ];
 
     let mut written = 0usize;
-    unsafe {
-        for i in 0..crate::vfs::MAX_INODES {
-            if !crate::vfs::INODES[i].used { continue; }
-            if i >= crate::vfs::MAX_INODES - 2 { continue; }
-
-            let mut nlen = 0usize;
-            while nlen < 32 && crate::vfs::INODES[i].name[nlen] != 0 { nlen += 1; }
+    let mut off = pos;
+    loop {
+        let n = match crate::vfs_core::readdir(vn_id, off as u64, &mut dirent_buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 { break; }
+        for i in 0..n {
+            let d = &dirent_buf[i];
+            let nlen = d.namelen as usize;
             if nlen == 0 { continue; }
-
             let reclen: usize = (19 + nlen + 7) & !7;
             if written + reclen > count { break; }
-
-            let ent = buf.add(written) as *mut LinuxDirent64;
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_ino), i as u64);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_off), reclen as u64);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_reclen), reclen as u16);
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_type), 0);
-            let name_ptr = buf.add(written + 19) as *mut u8;
-            core::ptr::copy_nonoverlapping(crate::vfs::INODES[i].name.as_ptr(), name_ptr, nlen);
-            core::ptr::write_volatile(name_ptr.add(nlen), 0);
-
-            written += reclen as usize;
+            unsafe {
+                let ent = buf.add(written) as *mut LinuxDirent64;
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_ino), d.ino);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_off), reclen as u64);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_reclen), reclen as u16);
+                let dtype = match d.type_ {
+                    1 => 8,  // DT_REG
+                    2 => 4,  // DT_DIR
+                    7 => 10, // DT_LNK
+                    _ => 0,
+                };
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ent).d_type), dtype);
+                let name_ptr = buf.add(written + 19) as *mut u8;
+                core::ptr::copy_nonoverlapping(d.name.as_ptr(), name_ptr, nlen);
+                core::ptr::write_volatile(name_ptr.add(nlen), 0);
+            }
+            written += reclen;
+            off += 1;
         }
     }
+    unsafe { table[fd as usize].pos = off; }
     written as i64
 }
 
@@ -2561,22 +2656,29 @@ const S_IFDIR: u32 = 0o040000;
 const S_IRWXU: u32 = 0o700;
 const S_IRUSR: u32 = 0o400;
 
-fn fill_stat(ino_idx: usize, statbuf: *mut u8) -> i64 {
+fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
+    let st = match crate::vfs_core::stat(vnode_id) {
+        Ok(s) => s,
+        Err(_) => return -EIO,
+    };
     unsafe {
-        let st = statbuf as *mut LinuxStat;
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_dev), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_ino), ino_idx as u64);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_nlink), 1);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_mode), S_IFREG | S_IRUSR);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_uid), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_gid), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_rdev), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_size), crate::vfs::INODES[ino_idx].size as i64);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_blksize), 4096);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_blocks), ((crate::vfs::INODES[ino_idx].size + 511) / 512) as i64);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_atime), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_mtime), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*st).st_ctime), 0);
+        let dst = statbuf as *mut LinuxStat;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_dev), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_ino), st.ino);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_nlink), st.nlink as u64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_mode), st.mode);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_uid), st.uid);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_gid), st.gid);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_rdev), st.rdev);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_size), st.size as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_blksize), st.blksize as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_blocks), st.blocks as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_atime), st.atime as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_atime_nsec), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_mtime), st.mtime as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_mtime_nsec), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_ctime), st.ctime as i64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*dst).st_ctime_nsec), 0);
     }
     0
 }
@@ -2585,8 +2687,15 @@ fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
     if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
-    match crate::vfs::find_inode(name) {
-        Some(idx) => fill_stat(idx, statbuf),
+    match crate::vfs::resolve_or_register(name) {
+        Some(flat_idx) => {
+            let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
+            if vn_id != 0 {
+                fill_stat_from_vnode(vn_id, statbuf)
+            } else {
+                fill_stat_from_vnode(0, statbuf) // fallback
+            }
+        }
         None => -ENOENT,
     }
 }
@@ -2597,7 +2706,12 @@ fn sys_fstat(fd: u32, statbuf: *mut u8) -> i64 {
         Some(f) => f,
         None => return -EBADF,
     };
-    fill_stat(fdesc.inode_idx, statbuf)
+    let vn_id = unsafe { crate::vfs::INODES[fdesc.inode_idx].vnode_id };
+    if vn_id != 0 {
+        fill_stat_from_vnode(vn_id, statbuf)
+    } else {
+        fill_stat_from_vnode(0, statbuf)
+    }
 }
 
 // ── Helper ─────────────────────────────────────────────────────────
