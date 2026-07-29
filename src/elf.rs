@@ -230,9 +230,11 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                 Some(p) => p,
                 None => return Err("OOM for segment page"),
             };
+            // Zero the entire page before copying file data (important for BSS)
+            unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
             map_page_into(pml4, addr, phys, flags)?;
 
-            // Copy file data or zero-fill
+            // Copy file data
             let page_off = if addr == seg_start { offset_in_page } else { 0 };
             let copy_start = addr + page_off;
             let copy_size = if copy_start + phdr.filesz > addr + 4096 {
