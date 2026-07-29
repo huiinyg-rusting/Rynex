@@ -1,19 +1,10 @@
 use crate::serial;
+use crate::vfs_core::ramfs;
+use crate::vfs_core::VnodeOps;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-const DATA_POOL_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-static mut DATA_POOL: [u8; DATA_POOL_SIZE] = [0; DATA_POOL_SIZE];
-static mut POOL_OFFSET: usize = 0;
-
-fn pool_alloc(size: usize) -> Option<*mut u8> {
-    unsafe {
-        let aligned = (POOL_OFFSET + 15) & !15;
-        if aligned + size > DATA_POOL_SIZE {
-            return None;
-        }
-        POOL_OFFSET = aligned + size;
-        Some(DATA_POOL.as_mut_ptr().add(aligned))
-    }
-}
+pub const MAX_INODES: usize = 256;
+pub const MAX_FDS_PER_TASK: usize = 16;
 
 #[derive(Clone, Copy)]
 pub struct Inode {
@@ -21,6 +12,7 @@ pub struct Inode {
     pub data_ptr: *mut u8,
     pub size: usize,
     pub used: bool,
+    pub vnode_id: u16,
 }
 
 impl Inode {
@@ -30,6 +22,7 @@ impl Inode {
             data_ptr: core::ptr::null_mut(),
             size: 0,
             used: false,
+            vnode_id: 0,
         }
     }
 }
@@ -53,42 +46,25 @@ impl FileDesc {
     }
 }
 
-pub const MAX_INODES: usize = 32;
-pub const MAX_FDS_PER_TASK: usize = 16;
-
 pub static mut INODES: [Inode; MAX_INODES] = [Inode::empty(); MAX_INODES];
+static mut FD_TABLES: [[FileDesc; MAX_FDS_PER_TASK]; super::task::MAX_TASKS] =
+    [[FileDesc::empty(); MAX_FDS_PER_TASK]; super::task::MAX_TASKS];
 
-pub fn init() {
-    serial::write_str("VFS: init\n");
-}
+static NEXT_FLAT_INODE: AtomicU64 = AtomicU64::new(1);
 
-pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
+fn alloc_flat_inode(name: &[u8], size: usize) -> Option<usize> {
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used {
                 INODES[i] = Inode::empty();
                 INODES[i].used = true;
-
                 let name_len = core::cmp::min(name.len(), 31);
                 for j in 0..name_len {
                     INODES[i].name[j] = name[j];
                 }
                 INODES[i].name[name_len] = 0;
-
-                let data_ptr = pool_alloc(data.len())?;
-                core::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
-                INODES[i].data_ptr = data_ptr;
-                INODES[i].size = data.len();
-
-                serial::write_str("VFS: created file '");
-                let mut j = 0;
-                while j < 31 && INODES[i].name[j] != 0 {
-                    serial::write_char(INODES[i].name[j] as char);
-                    j += 1;
-                }
-                serial::write_str("' (");
-                serial::write_dec(data.len() as u64);
-                serial::write_str(" bytes)\n");
+                INODES[i].size = size;
+                INODES[i].data_ptr = core::ptr::null_mut();
                 return Some(i);
             }
         }
@@ -96,35 +72,96 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
     }
 }
 
-pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<usize> {
-    unsafe {
-        for i in 0..MAX_INODES {
-            if !INODES[i].used {
-                INODES[i] = Inode::empty();
-                INODES[i].used = true;
+pub fn init() {
+    serial::write_str("VFS: compatibility layer init\n");
+}
 
-                let name_len = core::cmp::min(name.len(), 31);
-                for j in 0..name_len {
-                    INODES[i].name[j] = name[j];
+pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
+    find_inode(name).or_else(|| {
+        let mode = crate::vfs_core::types::S_IFREG
+            | crate::vfs_core::types::S_IRUSR
+            | crate::vfs_core::types::S_IWUSR
+            | crate::vfs_core::types::S_IRGRP
+            | crate::vfs_core::types::S_IROTH;
+        let ino = crate::vfs_core::resolve_ino(name).ok()?;
+        let vn_id = crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS)?;
+        let flat_idx = alloc_flat_inode(name, 0)?;
+        unsafe { INODES[flat_idx].vnode_id = vn_id; }
+        Some(flat_idx)
+    })
+}
+
+pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
+    let flat_idx = alloc_flat_inode(name, data.len())?;
+
+    let mode = crate::vfs_core::types::S_IFREG
+        | crate::vfs_core::types::S_IRUSR
+        | crate::vfs_core::types::S_IWUSR
+        | crate::vfs_core::types::S_IRGRP
+        | crate::vfs_core::types::S_IROTH;
+
+    match crate::vfs_core::create(name, mode) {
+        Ok(ino) => {
+            match crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS) {
+                Some(vn_id) => {
+                    unsafe { INODES[flat_idx].vnode_id = vn_id; }
+                    if !data.is_empty() {
+                        let _ = crate::vfs_core::write(vn_id, 0, data);
+                    }
+                    serial::write_str("VFS: created '");
+                    for &c in name { serial::write_char(c as char); }
+                    serial::write_str("' (");
+                    serial::write_dec(data.len() as u64);
+                    serial::write_str(" bytes)\n");
+                    Some(flat_idx)
                 }
-                INODES[i].name[name_len] = 0;
-
-                INODES[i].data_ptr = data;
-                INODES[i].size = size;
-
-                serial::write_str("VFS: created external file '");
-                let mut j = 0;
-                while j < 31 && INODES[i].name[j] != 0 {
-                    serial::write_char(INODES[i].name[j] as char);
-                    j += 1;
+                None => {
+                    unsafe { INODES[flat_idx].used = false; }
+                    None
                 }
-                serial::write_str("' (");
-                serial::write_dec(size as u64);
-                serial::write_str(" bytes)\n");
-                return Some(i);
             }
         }
-        None
+        Err(_) => {
+            unsafe { INODES[flat_idx].used = false; }
+            None
+        }
+    }
+}
+
+pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<usize> {
+    let flat_idx = alloc_flat_inode(name, size)?;
+    unsafe { INODES[flat_idx].data_ptr = data; }
+
+    let data_slice = unsafe { core::slice::from_raw_parts(data, size) };
+    let mode = crate::vfs_core::types::S_IFREG
+        | crate::vfs_core::types::S_IRUSR
+        | crate::vfs_core::types::S_IWUSR
+        | crate::vfs_core::types::S_IRGRP
+        | crate::vfs_core::types::S_IROTH;
+
+    match crate::vfs_core::create(name, mode) {
+        Ok(ino) => {
+            match crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS) {
+                Some(vn_id) => {
+                    unsafe { INODES[flat_idx].vnode_id = vn_id; }
+                    if !data_slice.is_empty() {
+                        let _ = crate::vfs_core::write(vn_id, 0, data_slice);
+                    }
+                    serial::write_str("VFS: created external '");
+                    for &c in name { serial::write_char(c as char); }
+                    serial::write_str("'\n");
+                    Some(flat_idx)
+                }
+                None => {
+                    unsafe { INODES[flat_idx].used = false; }
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            unsafe { INODES[flat_idx].used = false; }
+            None
+        }
     }
 }
 
@@ -132,18 +169,18 @@ pub fn find_inode(name: &[u8]) -> Option<usize> {
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used { continue; }
-            let iname = core::str::from_utf8(&INODES[i].name).unwrap_or("");
-            let iname_bytes = iname.as_bytes();
-            let l = core::cmp::min(name.len(), iname_bytes.len());
-            if &name[..l] == &iname_bytes[..l] {
-                let remaining = &iname_bytes[l..];
-                if remaining.iter().all(|&c| c == 0) {
-                    return Some(i);
-                }
+            let mut matches = true;
+            let mut j = 0;
+            while j < name.len() && j < 31 {
+                if INODES[i].name[j] != name[j] { matches = false; break; }
+                j += 1;
+            }
+            if matches && (j == name.len() || name.len() == 0) && (j >= INODES[i].name.len() || INODES[i].name[j] == 0) {
+                return Some(i);
             }
         }
-        None
     }
+    None
 }
 
 pub fn inode_size(idx: usize) -> Option<usize> {
@@ -161,7 +198,16 @@ pub fn inode_read(idx: usize, pos: usize, buf: &mut [u8]) -> Option<usize> {
             return None;
         }
         let inode = &INODES[idx];
-        if pos >= inode.size || inode.data_ptr.is_null() {
+        if inode.data_ptr.is_null() && inode.vnode_id == 0 {
+            return None;
+        }
+        if inode.data_ptr.is_null() {
+            match crate::vfs_core::read(inode.vnode_id, pos as u64, buf) {
+                Ok(n) => return Some(n),
+                Err(_) => return None,
+            }
+        }
+        if pos >= inode.size {
             return Some(0);
         }
         let to_read = core::cmp::min(buf.len(), inode.size - pos);
@@ -175,8 +221,22 @@ pub fn inode_write(idx: usize, pos: usize, buf: &[u8]) -> Option<usize> {
         if idx >= MAX_INODES || !INODES[idx].used {
             return None;
         }
-        let inode = &mut INODES[idx];
-        if pos > inode.size || inode.data_ptr.is_null() {
+        let inode = &INODES[idx];
+        if inode.vnode_id != 0 {
+            match crate::vfs_core::write(inode.vnode_id, pos as u64, buf) {
+                Ok(n) => {
+                    if pos + n > inode.size {
+                        INODES[idx].size = pos + n;
+                    }
+                    return Some(n);
+                }
+                Err(_) => return None,
+            }
+        }
+        if inode.data_ptr.is_null() {
+            return None;
+        }
+        if pos > inode.size {
             return None;
         }
         let to_write = core::cmp::min(buf.len(), inode.size - pos);
@@ -184,9 +244,6 @@ pub fn inode_write(idx: usize, pos: usize, buf: &[u8]) -> Option<usize> {
         Some(to_write)
     }
 }
-
-static mut FD_TABLES: [[FileDesc; MAX_FDS_PER_TASK]; super::task::MAX_TASKS] =
-    [[FileDesc::empty(); MAX_FDS_PER_TASK]; super::task::MAX_TASKS];
 
 pub fn get_fd_table() -> Option<&'static mut [FileDesc; MAX_FDS_PER_TASK]> {
     let id = super::task::current_task_id();

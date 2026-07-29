@@ -21,6 +21,8 @@ mod pic;
 mod pit;
 mod ipc;
 mod elf;
+mod spinlock;
+mod vfs_core;
 mod vfs;
 mod keyboard;
 
@@ -170,6 +172,10 @@ memory::init(_info);
     serial::write_str("MEM: ");
     serial::write_dec(pages / 256);
     serial::write_str(" MB\n");
+
+    vfs_core::ramfs::init();
+    vfs_core::init();
+    let _root_vnode = vfs_core::mount_root();
 
     task::init_scheduler();
     task::test();
