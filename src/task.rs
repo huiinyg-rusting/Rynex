@@ -1038,6 +1038,19 @@ pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
 pub const SYS_arch_prctl: u64 = 158;
 pub const SYS_getdents64: u64 = 217;
+pub const SYS_poll: u64 = 7;
+pub const SYS_lseek: u64 = 8;
+pub const SYS_readv: u64 = 19;
+pub const SYS_writev: u64 = 20;
+pub const SYS_gettid: u64 = 186;
+pub const SYS_tkill: u64 = 200;
+pub const SYS_sched_getaffinity: u64 = 204;
+pub const SYS_set_tid_address: u64 = 218;
+pub const SYS_clock_gettime: u64 = 228;
+pub const SYS_clock_nanosleep: u64 = 230;
+pub const SYS_exit_group: u64 = 231;
+pub const SYS_set_robust_list: u64 = 274;
+pub const SYS_getrandom: u64 = 318;
 
 // Niobix-specific (high numbers, no Linux conflict)
 pub const SYS_niobix_get_ticks: u64 = 2000;
@@ -1085,7 +1098,10 @@ pub extern "C" fn syscall_handler(
         SYS_getpid => sys_getpid(),
         SYS_fork => sys_fork(),
         SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
-        SYS_exit => sys_exit(arg1 as i32),
+        SYS_exit => {
+            serial::write_str("SYS_exit called\n");
+            sys_exit(arg1 as i32)
+        },
         SYS_wait4 => sys_wait4(arg1 as i64, arg2 as *mut i32, arg3 as i32, arg4 as u64),
         SYS_kill => sys_kill(arg1 as i64, arg2 as i32),
         SYS_uname => sys_uname(arg1 as *mut u8),
@@ -1107,6 +1123,19 @@ pub extern "C" fn syscall_handler(
         SYS_vfork => sys_fork(), // vfork → fork
         SYS_dup => sys_dup2(arg1 as u32, arg1 as u32), // dup → dup2(fd, fd)
         SYS_fchdir => sys_chdir_from_fd(arg1 as u32),
+        SYS_poll => sys_poll(arg1 as u64, arg2 as u64, arg3 as i32),
+        SYS_lseek => sys_lseek(arg1 as u32, arg2 as i64, arg3 as i32),
+        SYS_readv => sys_readv(arg1 as u32, arg2 as u64, arg3 as i32),
+        SYS_writev => sys_writev(arg1 as u32, arg2 as u64, arg3 as i32),
+        SYS_gettid => CURRENT_TASK.load(Ordering::SeqCst) as i64,
+        SYS_tkill => 0,
+        SYS_sched_getaffinity => 0,
+        SYS_set_tid_address => 0,
+        SYS_clock_gettime => sys_clock_gettime(arg1 as u64, arg2 as *mut u8),
+        SYS_clock_nanosleep => sys_clock_gettime(0, core::ptr::null_mut()), // stub
+        SYS_exit_group => sys_exit(arg1 as i32),
+        SYS_set_robust_list => 0,
+        SYS_getrandom => sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32),
         SYS_rt_sigaction => 0,
         SYS_rt_sigprocmask => 0,
         SYS_rt_sigreturn => 0,
@@ -1123,7 +1152,12 @@ pub extern "C" fn syscall_handler(
         SYS_niobix_getppid => sys_getppid(),
         SYS_niobix_sleep => sys_sleep(arg1 as u64),
         SYS_niobix_yield => sys_niobix_yield(),
-        _ => { -ENOSYS }
+        _ => {
+            serial::write_str("SYS: unknown ");
+            serial::write_dec(syscall_num);
+            serial::write_str("\n");
+            -ENOSYS
+        },
     }
 }
 
@@ -1132,6 +1166,12 @@ fn sys_exit(status: i32) -> i64 {
     serial::write_dec(status as u64);
     serial::write_str("\n");
     exit_task(status);
+    // If no other task to schedule, halt
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 || unsafe { TASKS[task_idx(id)].state } == TaskState::Zombie {
+        serial::write_str("SYS_EXIT: no more tasks, halting\n");
+        unsafe { core::arch::asm!("cli; hlt", options(noreturn)); }
+    }
     0
 }
 
@@ -2128,6 +2168,13 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         None => { alloc.free(old_pml4, 0); alloc.free(buffer_phys, elford); return -ENOMEM; }
                     };
                     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+                    // Initialize musl-compatible TLS
+                    unsafe {
+                        core::ptr::write_volatile(tls_phys as *mut u64, USER_TLS_VADDR);
+                        // Set cancel=2 so exit() won't match exit_lock (which is 0 or 1)
+                        core::ptr::write_volatile((tls_phys + 0x30u64) as *mut u32, 2u32);
+                    }
+
                     let tls_flags = crate::paging::PTE_PRESENT
                         | crate::paging::PTE_WRITABLE
                         | crate::paging::PTE_USER
@@ -2765,6 +2812,59 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
     crate::paging::pt_mgr()
 }
 
+fn sys_poll(_fds: u64, _nfds: u64, _timeout: i32) -> i64 {
+    0
+}
+
+fn sys_lseek(_fd: u32, _offset: i64, _whence: i32) -> i64 {
+    -ENOSYS
+}
+
+fn sys_readv(_fd: u32, _iov: u64, _iovcnt: i32) -> i64 {
+    -ENOSYS
+}
+
+fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
+    if fd != 1 { return -ENOSYS; }
+    let mut total = 0i64;
+    for i in 0..iovcnt as usize {
+        let base: u64;
+        let len: usize;
+        unsafe {
+            base = core::ptr::read_volatile((iov + i as u64 * 16) as *const u64);
+            len = core::ptr::read_volatile((iov + i as u64 * 16 + 8) as *const usize);
+        }
+        if base == 0 || len == 0 { continue; }
+        let slice = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+        for &c in slice {
+            if c == 0 { break; }
+            serial::write_char(c as char);
+        }
+        total += len as i64;
+    }
+    total
+}
+
+fn sys_clock_gettime(_clk_id: u64, tp: *mut u8) -> i64 {
+    if tp.is_null() { return -EFAULT; }
+    let ns = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as u64 * 20_000_000 };
+    unsafe {
+        core::ptr::write_volatile(tp as *mut u64, ns / 1_000_000_000);
+        core::ptr::write_volatile((tp as *mut u64).add(1), ns % 1_000_000_000);
+    }
+    0
+}
+
+fn sys_getrandom(buf: *mut u8, len: usize, _flags: u32) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    unsafe {
+        for i in 0..len {
+            core::ptr::write_volatile(buf.add(i), (i * 0x9E) as u8);
+        }
+    }
+    len as i64
+}
+
 // ── Test / Demo ──────────────────────────────────────────────────
 
 pub fn test() {
@@ -2819,6 +2919,14 @@ pub fn test() {
                 }
             }
         }
+    }
+
+    // Create /dev/null for musl __init_libc
+    if crate::vfs::find_inode(b"/dev/null").is_none() {
+        let _ = crate::vfs_core::mkdir(b"/dev", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
+        // Use the flat VFS to create an empty file
+        crate::vfs::create_file(b"/dev/null", b"");
+        serial::write_str("VFS: created '/dev/null'\n");
     }
 
     let task0 = unsafe { &mut TASKS[0] };

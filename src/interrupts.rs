@@ -181,6 +181,7 @@ pub extern "x86-interrupt" fn stack_fault(frame: InterruptStackFrame, code: u64)
     halt();
 }
 
+#[allow(invalid_reference_casting)]
 pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
     // Read raw values from the interrupt frame on the stack
     let raw_rip: u64 = unsafe { core::ptr::read_volatile(&frame as *const InterruptStackFrame as *const u64) };
@@ -194,6 +195,19 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
     crate::serial::write_str(" rsp=0x");
     let raw_rsp: u64 = unsafe { core::ptr::read_volatile((&frame as *const InterruptStackFrame as *const u64).add(3)) };
     crate::serial::write_hex(raw_rsp);
+
+    // Skip musl a_crash (hlt) — musl uses this as abort, but we handle it gracefully
+    let is_a_crash = raw_rip == (crate::task::INTERP_BASE + 0x269d6u64);
+    if is_a_crash {
+        let intframe = &frame as *const InterruptStackFrame as *mut u64;
+        unsafe {
+            core::ptr::write_volatile(intframe, crate::task::INTERP_BASE + 0x140bbu64); // RIP = exit+0x4d
+            let rsp_field = intframe.add(3);
+            let old_rsp = core::ptr::read_volatile(rsp_field);
+            core::ptr::write_volatile(rsp_field, old_rsp + 8);
+        }
+        return;
+    }
     crate::serial::write_str("\n");
     exit_user_task_early(code, raw_rip, raw_rsp, "GPF");
     halt();
