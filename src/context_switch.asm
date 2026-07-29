@@ -50,47 +50,6 @@ syscall_entry:
     pop r11               // Restore RFLAGS
     pop rcx               // Restore RIP
 
-    // Debug: 'P' + CH high nibble + CH low nibble + CL high nibble + CL low nibble
-    push rax
-    push rcx
-    push rdx
-    mov dx, 0x3F8
-    mov al, 'P'
-    out dx, al
-    mov al, ch
-    mov ah, al
-    shr al, 4
-    and ah, 0x0F
-    cmp al, 10
-    jb 1f
-    add al, 'A' - '0' - 10
-1:  add al, '0'
-    out dx, al
-    mov al, ah
-    cmp al, 10
-    jb 2f
-    add al, 'A' - '0' - 10
-2:  add al, '0'
-    out dx, al
-    mov al, cl
-    mov ah, al
-    shr al, 4
-    and ah, 0x0F
-    cmp al, 10
-    jb 3f
-    add al, 'A' - '0' - 10
-3:  add al, '0'
-    out dx, al
-    mov al, ah
-    cmp al, 10
-    jb 4f
-    add al, 'A' - '0' - 10
-4:  add al, '0'
-    out dx, al
-    pop rdx
-    pop rcx
-    pop rax
-
     pop r15
     pop r14
     pop r13
@@ -101,47 +60,6 @@ syscall_entry:
     mov rsp, r10
     add rsp, 24
     swapgs
-
-    // Debug: 'R' + CH high nibble + CH low nibble + CL high nibble + CL low nibble
-    push rax
-    push rcx
-    push rdx
-    mov dx, 0x3F8
-    mov al, 'R'
-    out dx, al
-    mov al, ch
-    mov ah, al
-    shr al, 4
-    and ah, 0x0F
-    cmp al, 10
-    jb 5f
-    add al, 'A' - '0' - 10
-5:  add al, '0'
-    out dx, al
-    mov al, ah
-    cmp al, 10
-    jb 6f
-    add al, 'A' - '0' - 10
-6:  add al, '0'
-    out dx, al
-    mov al, cl
-    mov ah, al
-    shr al, 4
-    and ah, 0x0F
-    cmp al, 10
-    jb 7f
-    add al, 'A' - '0' - 10
-7:  add al, '0'
-    out dx, al
-    mov al, ah
-    cmp al, 10
-    jb 8f
-    add al, 'A' - '0' - 10
-8:  add al, '0'
-    out dx, al
-    pop rdx
-    pop rcx
-    pop rax
 
     sysretq
 

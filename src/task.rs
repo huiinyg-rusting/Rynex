@@ -497,29 +497,9 @@ pub fn schedule() {
 
     let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
 
-    serial::write_str("SCHED: old=");
-    serial::write_dec(old);
-    serial::write_str(" new=");
-    serial::write_dec(next_id);
-    serial::write_str(" new.cs=0x");
-    serial::write_hex(unsafe { TASKS[new_idx].regs.cs });
-    serial::write_str(" new.ss=0x");
-    serial::write_hex(unsafe { TASKS[new_idx].regs.ss });
-    serial::write_str("\n");
-
     unsafe {
         TASKS[new_idx].state = TaskState::Running;
         pt_mgr().switch_to(TASKS[new_idx].pml4);
-
-        // Sanity check: print if any saved RIP is non-canonical
-        let new_rip = TASKS[new_idx].regs.rip;
-        if (new_rip >> 47) != 0 && (new_rip >> 47) != 0x1FFFF {
-            crate::serial::write_str("SCHED: BAD RIP=0x");
-            crate::serial::write_hex(new_rip);
-            crate::serial::write_str(" cs=0x");
-            crate::serial::write_hex(TASKS[new_idx].regs.cs);
-            crate::serial::write_str("\n");
-        }
 
         let old_idx = task_idx(old);
         let old_ptr = &mut TASKS[old_idx].regs as *mut Registers;
@@ -1860,10 +1840,8 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     }
 
     // Load the ELF
-    serial::write_str("EXECVE: loading ELF...\n");
     match crate::elf::load_elf(buffer) {
         Ok(info) => {
-            serial::write_str("EXECVE: ELF loaded OK\n");
             unsafe {
                 let idx = task_idx(id);
                 let old_pml4 = TASKS[idx].pml4;
@@ -1871,20 +1849,15 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 // If dynamic: load interpreter
                 let mut interp_info = None;
                 if info.is_dynamic {
-                    serial::write_str("EXECVE: loading interpreter...\n");
                     let interp_path = core::str::from_utf8_unchecked(
                         core::slice::from_raw_parts(info.interp_path.as_ptr(), info.interp_path_len)
                     );
-                    serial::write_str("SYS_EXECVE: interp='");
-                    serial::write_str(interp_path);
-                    serial::write_str("'\n");
 
                     // Look up interpreter in VFS
                     let interp_name = interp_path.as_bytes();
                     let interp_inode = match crate::vfs::find_inode(interp_name) {
                         Some(ino) => ino,
                         None => {
-                            serial::write_str("SYS_EXECVE: interp not found\n");
                             alloc.free(buffer_phys, elford);
                             return -ENOENT;
                         }
@@ -2106,78 +2079,6 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 TASKS[idx].vmas = [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS];
 
                 alloc.free(old_pml4, 0);
-
-                serial::write_str("EXECVE: task ");
-                serial::write_dec(id);
-                serial::write_str(" entry=0x");
-                serial::write_hex(final_entry);
-                serial::write_str(" sp=0x");
-                serial::write_hex(sp);
-                if info.is_dynamic {
-                    serial::write_str(" dyn");
-                }
-                serial::write_str("\n");
-
-                serial::write_str("EXECVE: launching entry=0x");
-                serial::write_hex(final_entry);
-                serial::write_str(" sp=0x");
-                serial::write_hex(sp);
-                serial::write_str(" cs=0x");
-                serial::write_hex(TASKS[idx].regs.cs);
-                serial::write_str(" ss=0x");
-                serial::write_hex(TASKS[idx].regs.ss);
-                serial::write_str(" rflags=0x");
-                serial::write_hex(TASKS[idx].regs.rflags);
-                serial::write_str("\n");
-                // Dump first 40 qwords of the user stack
-                for i in 0..40u64 {
-                    let val = unsafe { core::ptr::read_volatile((sp + i*8) as *const u64) };
-                    serial::write_str("  [");
-                    serial::write_hex(sp + i*8);
-                    serial::write_str("] = 0x");
-                    serial::write_hex(val);
-                    serial::write_str("\n");
-                }
-
-                // If dynamic, dump DYNAMIC section and RELA table
-                if info.is_dynamic {
-                    let dynv_addr = final_entry + 0xe8e18 - 0xa9091; // base + _DYNAMIC
-                    let base_addr = final_entry - 0xa9091;
-                    serial::write_str("EXECVE: base=0x");
-                    serial::write_hex(base_addr);
-                    serial::write_str(" _DYNAMIC=0x");
-                    serial::write_hex(dynv_addr);
-                    serial::write_str("\n");
-                    // Dump DYNAMIC section (first 32 qwords)
-                    serial::write_str("  DYNAMIC dump:\n");
-                    for i in 0..32u64 {
-                        let val = unsafe { core::ptr::read_volatile((dynv_addr + i*8) as *const u64) };
-                        serial::write_str("    [0x");
-                        serial::write_hex(dynv_addr + i*8);
-                        serial::write_str("] = 0x");
-                        serial::write_hex(val);
-                        serial::write_str("\n");
-                    }
-                    // Dump RELA table (first 16 entries)
-                    let rela_addr = base_addr + 0x134b8;
-                    serial::write_str("  RELA dump (base+0x134b8=0x");
-                    serial::write_hex(rela_addr);
-                    serial::write_str("):\n");
-                    for i in 0..16u64 {
-                        let off = unsafe { core::ptr::read_volatile((rela_addr + i*24) as *const u64) };
-                        let info = unsafe { core::ptr::read_volatile((rela_addr + i*24 + 8) as *const u64) };
-                        let addend = unsafe { core::ptr::read_volatile((rela_addr + i*24 + 16) as *const u64) };
-                        serial::write_str("    [");
-                        serial::write_dec(i);
-                        serial::write_str("] off=0x");
-                        serial::write_hex(off);
-                        serial::write_str(" info=0x");
-                        serial::write_hex(info);
-                        serial::write_str(" addend=0x");
-                        serial::write_hex(addend);
-                        serial::write_str("\n");
-                    }
-                }
 
                 // Naked trampoline: loads GP regs from Registers and iretqs
                 unsafe {
@@ -2752,52 +2653,12 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
 
 // ── Test / Demo ──────────────────────────────────────────────────
 
-extern "C" fn task_spin() -> ! {
-    let mut count = 0u64;
-    let mut yields = 0u64;
-    loop {
-        if count < 3 {
-            crate::serial::write_str("TASK: spin ");
-            crate::serial::write_dec(count);
-            crate::serial::write_str(" (tid=");
-            crate::serial::write_dec(current_task_id());
-            crate::serial::write_str(")\n");
-            count += 1;
-        }
-        yields += 1;
-        if yields > 100 {
-            loop {
-                unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
-                sys_niobix_yield();
-            }
-        }
-        sys_niobix_yield();
-    }
-}
-
-extern "C" fn task_spin_minimal() -> ! {
-    crate::serial::write_str("TASK: minimal spin started\n");
-    loop {
-        sys_niobix_yield();
-    }
-}
-
 pub fn test() {
     unsafe { core::arch::asm!("cli"); }
 
-    serial::write_str("TASK: testing kernel task creation...\n");
-
-    let tid1 = create_kernel_task_prio(task_spin as *const () as u64, 19);
-    let tid2 = create_kernel_task_prio(task_spin as *const () as u64, 19);
-
-    serial::write_str("TASK: task IDs: ");
-    serial::write_dec(tid1.unwrap());
-    serial::write_str(", ");
-    serial::write_dec(tid2.unwrap());
-    serial::write_str("\n");
-
     // Load user ELF modules from multiboot2
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
+    let mut init_tid = 0u64;
     if info_addr != 0 {
         let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
@@ -2808,12 +2669,6 @@ pub fn test() {
                     (modules[i].end - modules[i].start) as usize,
                 )
             };
-            serial::write_str("TASK: module ");
-            serial::write_dec(i as u64);
-            serial::write_str(": ");
-            serial::write_dec(mod_data.len() as u64);
-            serial::write_str(" bytes\n");
-
             if mod_data.len() >= 4 && mod_data[0] == 0x7f && mod_data[1] == b'E'
                 && mod_data[2] == b'L' && mod_data[3] == b'F'
             {
@@ -2823,11 +2678,7 @@ pub fn test() {
                         match crate::elf::load_elf(mod_data) {
                             Ok(elf_info) => {
                                 if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
-                                    serial::write_str("TASK: created user init task ");
-                                    serial::write_dec(tid);
-                                    serial::write_str(" entry=0x");
-                                    serial::write_hex(elf_info.entry);
-                                    serial::write_str("\n");
+                                    init_tid = tid;
                                 }
                             }
                             Err(e) => {
@@ -2849,7 +2700,6 @@ pub fn test() {
                     }
                     4 => {
                         crate::vfs::create_file(b"/bin/hello_dynamic", mod_data);
-                        serial::write_str("TASK: registered /bin/hello_dynamic in VFS\n");
                     }
                     _ => {}
                 }
@@ -2872,16 +2722,30 @@ pub fn test() {
         core::arch::asm!("mov rsp, {}", in(reg) task0.kernel_stack);
     }
 
-    serial::write_str("TASK: switching to task 1...\n");
+    serial::write_str("TASK: switching to task ");
+    serial::write_dec(init_tid);
+    serial::write_str("...\n");
 
-    // Dequeue task 1 so it's not in the runqueue twice
-    remove_from_runqueue(1);
+    // Dequeue init task so it's not in the runqueue twice
+    remove_from_runqueue(init_tid);
 
-    let new_task = unsafe { &mut TASKS[task_idx(1)] };
+    let new_task = unsafe { &mut TASKS[task_idx(init_tid)] };
     new_task.state = TaskState::Running;
-    CURRENT_TASK.store(1, Ordering::SeqCst);
+    CURRENT_TASK.store(init_tid, Ordering::SeqCst);
+
+    unsafe { crate::gdt::set_tss_rsp0(new_task.kernel_stack); }
     pt_mgr().switch_to(new_task.pml4);
     unsafe {
+        // Restore FS base for the new task (same as schedule() does)
+        let fs_base = new_task.regs.fs_base;
+        core::arch::asm!(
+            "mov ecx, 0xC0000100",
+            "wrmsr",
+            in("eax") (fs_base as u32),
+            in("edx") ((fs_base >> 32) as u32),
+            out("ecx") _,
+            options(nostack, preserves_flags)
+        );
         let old_ptr = &mut TASKS[0].regs as *mut Registers;
         let new_ptr = &new_task.regs as *const Registers;
         core::arch::asm!(
