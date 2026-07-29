@@ -82,7 +82,6 @@ fn map_page_into(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), &'st
 }
 
 pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
-    // Check if it's a PIE (ET_DYN); if so, use a non-zero base to avoid identity map
     if data.len() >= 16 {
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == 3 {
@@ -224,16 +223,6 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
 
         let flags = pt_flags(phdr.flags);
 
-        serial::write_str("  PHDR: vaddr=0x");
-        serial::write_hex(phdr.vaddr);
-        serial::write_str(" memsz=0x");
-        serial::write_hex(phdr.memsz);
-        serial::write_str(" filesz=0x");
-        serial::write_hex(phdr.filesz);
-        serial::write_str(" flags=");
-        serial::write_dec(phdr.flags as u64);
-        serial::write_str("\n");
-
         // Map pages for this segment
         let mut addr = seg_start;
         while addr < seg_end {
@@ -284,7 +273,6 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
 
     // Allocate user stack at USER_STACK_TOP (only when creating new PML4)
     if existing_pml4.is_none() {
-        serial::write_str("EXECVE_AT: alloc stack...\n");
         let stack_start = USER_STACK_TOP - (USER_STACK_PAGES as u64 * 4096);
         let mut addr = stack_start;
         while addr < USER_STACK_TOP {
@@ -330,45 +318,6 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
             core::ptr::write(phys as *mut u64, 0);
         }
     }
-
-    serial::write_str("ELF: loaded entry=0x");
-    serial::write_hex(entry);
-    serial::write_str(" stack RSP=0x");
-    serial::write_hex(USER_STACK_TOP - 16);
-    serial::write_str(" pml4=0x");
-    serial::write_hex(pml4);
-    serial::write_str("\n");
-
-    // Debug: read first 16 bytes of ELF/loaded code
-    let first_page_phys = {
-        let vpn3 = (entry >> 12) & 0x1FF;
-        let vpn2 = (entry >> 21) & 0x1FF;
-        let vpn1 = (entry >> 30) & 0x1FF;
-        let vpn0 = (entry >> 39) & 0x1FF;
-        let pml4_base = pml4 as *const crate::paging::PageTable;
-        let pml4e = unsafe { (*pml4_base).0[vpn0 as usize] };
-        let pdpt = (pml4e & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pdpte = unsafe { (*pdpt).0[vpn1 as usize] };
-        let pd = (pdpte & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pde = unsafe { (*pd).0[vpn2 as usize] };
-        serial::write_str("  PDE=0x");
-        serial::write_hex(pde);
-        serial::write_str("\n");
-        let pt = (pde & PTE_ADDR_MASK) as *const crate::paging::PageTable;
-        let pte = unsafe { (*pt).0[vpn3 as usize] };
-        serial::write_str("  PTE=0x");
-        serial::write_hex(pte);
-        serial::write_str("\n");
-        pte & PTE_ADDR_MASK
-    };
-    // Print first instruction
-    serial::write_str("  code bytes: ");
-    for i in 0..8 {
-        let byte = unsafe { *((first_page_phys + i) as *const u8) };
-        serial::write_hex(byte as u64);
-        serial::write_char(' ');
-    }
-    serial::write_str("\n");
 
     Ok(ElfLoadInfo {
         entry,

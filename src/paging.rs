@@ -146,13 +146,6 @@ impl PageTableManager {
             }
             let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             unsafe { (*pd).0[vpn[2]] = pde_val; }
-            crate::serial::write_str("map_into: vpn2=");
-            crate::serial::write_dec(vpn[2] as u64);
-            crate::serial::write_str(" pde set to 0x");
-            crate::serial::write_hex(pde_val);
-            crate::serial::write_str(" (new_pt=0x");
-            crate::serial::write_hex(new_pt);
-            crate::serial::write_str(")\n");
             new_pt as *mut PageTable
         };
 
