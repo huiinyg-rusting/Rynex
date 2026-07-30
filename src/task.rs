@@ -1037,6 +1037,8 @@ pub const SYS_getgid: u64 = 104;
 pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
 pub const SYS_arch_prctl: u64 = 158;
+pub const SYS_reboot: u64 = 169;
+pub const SYS_openat: u64 = 257;
 pub const SYS_getdents64: u64 = 217;
 pub const SYS_poll: u64 = 7;
 pub const SYS_lseek: u64 = 8;
@@ -1118,6 +1120,7 @@ pub extern "C" fn syscall_handler(
         SYS_rmdir => sys_rmdir(arg1 as *const u8),
         SYS_unlink => sys_unlink(arg1 as *const u8),
         SYS_rename => sys_rename(arg1 as *const u8, arg2 as *const u8),
+        SYS_openat => sys_openat(arg1 as i32, arg2 as *const u8, arg3 as i32, arg4 as u32),
         SYS_readlink => sys_readlink(arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
         SYS_clone => sys_fork(), // clone → fork for now
         SYS_vfork => sys_fork(), // vfork → fork
@@ -1152,12 +1155,41 @@ pub extern "C" fn syscall_handler(
         SYS_niobix_getppid => sys_getppid(),
         SYS_niobix_sleep => sys_sleep(arg1 as u64),
         SYS_niobix_yield => sys_niobix_yield(),
+        SYS_reboot => sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
         _ => {
             serial::write_str("SYS: unknown ");
             serial::write_dec(syscall_num);
+            serial::write_str(" arg1=");
+            serial::write_hex(arg1);
+            serial::write_str(" arg2=");
+            serial::write_hex(arg2);
+            serial::write_str(" arg3=");
+            serial::write_hex(arg3);
             serial::write_str("\n");
             -ENOSYS
         },
+    }
+}
+
+fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> i64 {
+    const LINUX_REBOOT_MAGIC1: u32 = 0xFEE1DEAD;
+    const LINUX_REBOOT_MAGIC2: u32 = 0x28121969;
+    const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
+    const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
+    const LINUX_REBOOT_CMD_HALT: u32 = 0xCDEF0123;
+    if magic1 != LINUX_REBOOT_MAGIC1 || (magic2 != LINUX_REBOOT_MAGIC2 && magic2 != 0x0A1B2C3D) {
+        return -EINVAL;
+    }
+    match cmd {
+        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
+            loop { unsafe { core::arch::asm!("cli; hlt"); } }
+        }
+        LINUX_REBOOT_CMD_RESTART => {
+            // Triple fault to reboot
+            unsafe { core::arch::asm!("int3"); }
+            loop {}
+        }
+        _ => 0, // CAD on/off etc — just return success
     }
 }
 
@@ -1176,6 +1208,11 @@ fn sys_exit(status: i32) -> i64 {
 }
 
 fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
+    serial::write_str("SYS_write: fd=");
+    serial::write_dec(fd as u64);
+    serial::write_str(" cnt=");
+    serial::write_dec(count as u64);
+    serial::write_str("\n");
     if fd == 1 {
         // stdout — write to serial
         if buf.is_null() || count == 0 { return 0; }
@@ -1601,6 +1638,11 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     }
 }
 
+fn sys_openat(dirfd: i32, pathname: *const u8, flags: i32, mode: u32) -> i64 {
+    let _ = (dirfd, mode);
+    sys_open(pathname, flags)
+}
+
 fn sys_open(pathname: *const u8, flags: i32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(pathname) };
@@ -1923,7 +1965,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     // Read ELF data from the inode
     let elf_size = match crate::vfs::inode_size(inode_idx) {
         Some(sz) => sz,
-        None => return -EIO,
+        None => { serial::write_str("SYS_EXECVE: no size\n"); return -EIO; }
     };
     if elf_size < 64 || elf_size > 1024 * 1024 * 16 {
         return -EINVAL;
@@ -1951,6 +1993,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     // Load the ELF
     match crate::elf::load_elf(buffer) {
         Ok(info) => {
+            serial::write_str("SYS_EXECVE: Ok(info)\n");
             unsafe {
                 let idx = task_idx(id);
                 let old_pml4 = TASKS[idx].pml4;
@@ -2145,19 +2188,55 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     sp -= 8;
                     wv(sp as *mut u64, argc as u64);
                 } else {
-                    // Static: simple stack
-                    // envp NULL
+                    // Static: need AUX vectors too (musl reads them)
+                    use core::ptr::write_volatile as wv;
+
+                    macro_rules! aux {
+                        ($key:expr, $val:expr) => {
+                            sp -= 16;
+                            wv(sp as *mut u64, $key);
+                            wv((sp + 8) as *mut u64, $val);
+                        }
+                    }
+
+                    // 1. Random data
+                    sp -= 16;
+                    let random_data = sp;
+                    wv(sp as *mut u64, 0xdeadbeefcafebabeu64);
+                    wv((sp + 8) as *mut u64, 0x123456789abcdef0u64);
+
+                    // 2. AUX vectors
+                    aux!(0, 0u64);             // AT_NULL
+                    aux!(16, 0x0u64);          // AT_HWCAP
+                    aux!(26, 16u64);           // AT_RANDOM length
+                    aux!(25, random_data);     // AT_RANDOM
+                    aux!(23, 0u64);            // AT_SECURE
+                    aux!(17, 100u64);          // AT_CLKTCK
+                    aux!(14, 0u64);            // AT_EGID
+                    aux!(13, 0u64);            // AT_GID
+                    aux!(12, 0u64);            // AT_EUID
+                    aux!(11, 0u64);            // AT_UID
+                    aux!(9, info.entry);       // AT_ENTRY
+                    aux!(8, 0u64);             // AT_FLAGS
+                    aux!(6, 4096u64);          // AT_PAGESZ
+                    aux!(5, info.phnum as u64); // AT_PHNUM
+                    aux!(4, info.phentsize as u64); // AT_PHENT
+                    aux!(3, info.phdr_user);   // AT_PHDR
+
+                    // 3. envp NULL
                     sp -= 8;
-                    unsafe { core::ptr::write_volatile(sp as *mut u64, 0u64); }
-                    // argv pointers + NULL
+                    wv(sp as *mut u64, 0u64);
+
+                    // 4. argv pointers + NULL
                     sp -= ((argc + 1) * 8) as u64;
                     for i in 0..argc {
-                        unsafe { core::ptr::write_volatile((sp + i as u64 * 8) as *mut u64, arg_ptrs[i]); }
+                        wv((sp + i as u64 * 8) as *mut u64, arg_ptrs[i]);
                     }
-                    unsafe { core::ptr::write_volatile((sp + argc as u64 * 8) as *mut u64, 0u64); }
-                    // argc
+                    wv((sp + argc as u64 * 8) as *mut u64, 0u64);
+
+                    // 5. argc
                     sp -= 8;
-                    unsafe { core::ptr::write_volatile(sp as *mut u64, argc as u64); }
+                    wv(sp as *mut u64, argc as u64);
                 }
 
                 TASKS[idx].regs = Registers::new_user(final_entry, sp);
@@ -2188,6 +2267,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 }
                 TASKS[idx].pml4 = info.pml4;
                 // Switch to the new page table so the iretq finds the user mappings
+                serial::write_str("SYS_EXECVE: switching to new PML4\n");
                 pt_mgr().switch_to(info.pml4);
                 TASKS[idx].user_stack = info.stack_top;
                 TASKS[idx].brk_start = 0;
@@ -2196,6 +2276,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
 
                 alloc.free(old_pml4, 0);
 
+                serial::write_str("SYS_EXECVE: jumping to user entry\n");
                 // Naked trampoline: loads GP regs from Registers and iretqs
                 unsafe {
                     let r_ptr = &TASKS[idx].regs as *const Registers;
@@ -2241,7 +2322,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
         }
         Err(e) => {
             alloc.free(buffer_phys, elford);
-            serial::write_str("SYS_EXECVE: ELF load failed: ");
+            serial::write_str("SYS_EXECVE: ELF load failed [");
             let mut i = 0;
             while i < 40 {
                 let c = e.as_bytes().get(i).copied().unwrap_or(0);
@@ -2249,7 +2330,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 serial::write_char(c as char);
                 i += 1;
             }
-            serial::write_str("\n");
+            serial::write_str("]\n");
             -ENOEXEC
         }
     }
@@ -2825,6 +2906,11 @@ fn sys_readv(_fd: u32, _iov: u64, _iovcnt: i32) -> i64 {
 }
 
 fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
+    serial::write_str("SYS_writev: fd=");
+    serial::write_dec(fd as u64);
+    serial::write_str(" cnt=");
+    serial::write_dec(iovcnt as u64);
+    serial::write_str("\n");
     if fd != 1 { return -ENOSYS; }
     let mut total = 0i64;
     for i in 0..iovcnt as usize {
@@ -2914,6 +3000,9 @@ pub fn test() {
                     }
                     4 => {
                         crate::vfs::create_file(b"/bin/hello_dynamic", mod_data);
+                    }
+                    5 => {
+                        crate::vfs::create_file(b"/bin/busybox", mod_data);
                     }
                     _ => {}
                 }
