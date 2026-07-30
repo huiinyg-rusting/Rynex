@@ -196,17 +196,107 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
     let raw_rsp: u64 = unsafe { core::ptr::read_volatile((&frame as *const InterruptStackFrame as *const u64).add(3)) };
     crate::serial::write_hex(raw_rsp);
 
-    // Skip musl a_crash (hlt) — musl uses this as abort, but we handle it gracefully
-    let is_a_crash = raw_rip == (crate::task::INTERP_BASE + 0x269d6u64);
-    if is_a_crash {
-        let intframe = &frame as *const InterruptStackFrame as *mut u64;
-        unsafe {
-            core::ptr::write_volatile(intframe, crate::task::INTERP_BASE + 0x140bbu64); // RIP = exit+0x4d
-            let rsp_field = intframe.add(3);
-            let old_rsp = core::ptr::read_volatile(rsp_field);
-            core::ptr::write_volatile(rsp_field, old_rsp + 8);
+    // Detect musl a_crash (hlt in user mode) — musl uses HLT as abort
+    let is_user = (raw_cs_val & 3) == 3;
+    if is_user {
+        // Check RIP is canonical (bits 48-63 must be copies of bit 47) before reading
+        let rip_valid = (raw_rip >> 47) == 0 || (raw_rip >> 47) == 0x1FFFF;
+        if rip_valid {
+            let opcode: u8 = unsafe { core::ptr::read_volatile(raw_rip as *const u8) };
+            if opcode == 0xF4 {
+                crate::serial::write_str(" (a_crash)\n");
+                let usp = raw_rsp;
+                // Read return address at the top of the stack (pushed by call a_crash)
+                let ret_addr: u64 = unsafe { core::ptr::read_volatile(usp as *const u64) };
+                crate::serial::write_str("  ret_addr=0x");
+                crate::serial::write_hex(ret_addr);
+                crate::serial::write_str("\n");
+                // enframe locals: push at offsets 0x10(p), 0x0c(n), 0x20(addr)
+                // after call a_crash: enframe_RSP = raw_rsp + 8
+                let p_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x18) as *const u64) };
+                let n_val: u32 = unsafe { core::ptr::read_volatile((usp + 0x14) as *const u32) };
+                let addr_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x28) as *const u64) };
+                let stride_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x30) as *const u64) };
+                // Also read arg3 (size) and arg4 from the caller's stack frame
+                let size_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x08) as *const u64) };
+                crate::serial::write_str("  p=0x");
+                crate::serial::write_hex(p_val);
+                crate::serial::write_str(" n=");
+                crate::serial::write_dec(n_val as u64);
+                crate::serial::write_str(" stride=0x");
+                crate::serial::write_hex(stride_val);
+                crate::serial::write_str(" addr=0x");
+                crate::serial::write_hex(addr_val);
+                crate::serial::write_str(" size=0x");
+                crate::serial::write_hex(size_val);
+                let off_byte: u8 = unsafe { core::ptr::read_volatile((addr_val.wrapping_sub(4)) as *const u8) };
+                crate::serial::write_str(" [addr-4]=0x");
+                crate::serial::write_hex(off_byte as u64);
+                // Also read the p->off field at p+0x10
+                let poff: u64 = unsafe { core::ptr::read_volatile((p_val.wrapping_add(0x10)) as *const u64) };
+                crate::serial::write_str(" p->off=0x");
+                crate::serial::write_hex(poff);
+                // Read p+0x20 (stride metadata)
+                let p_idx: u64 = unsafe { core::ptr::read_volatile((p_val.wrapping_add(0x20)) as *const u64) };
+                crate::serial::write_str(" p+0x20=0x");
+                crate::serial::write_hex(p_idx);
+                // Dump meta struct contents (8 u64 at offsets 0x00-0x38)
+                for i in 0..8 {
+                    let off = i * 8;
+                    let v: u64 = unsafe { core::ptr::read_volatile((p_val.wrapping_add(off)) as *const u64) };
+                    if i == 0 { crate::serial::write_str("\n  meta: "); }
+                    crate::serial::write_str("+0x");
+                    crate::serial::write_hex(off);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                }
+                // Dump next meta struct too (might be overlap issue)
+                let next_p = p_val.wrapping_add(0x28);
+                for i in 0..4 {
+                    let off = i * 8;
+                    let v: u64 = unsafe { core::ptr::read_volatile((next_p.wrapping_add(off)) as *const u64) };
+                    if i == 0 { crate::serial::write_str("\n  next: "); }
+                    crate::serial::write_str("+0x");
+                    crate::serial::write_hex(off);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                }
+                // Dump physical page vs virtual page content to detect stale TLB/PTE
+                let gpf_cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) gpf_cr3, options(nostack, nomem, preserves_flags)); }
+                let page_phys = crate::paging::PageTableManager::resolve_phys(gpf_cr3, p_val & !0xFFF).unwrap_or(0);
+                crate::serial::write_str("\n  page_phys=0x");
+                crate::serial::write_hex(page_phys);
+                if page_phys != 0 {
+                    for i in 0..8 {
+                        let off = i * 8;
+                        let v: u64 = unsafe { core::ptr::read_volatile((page_phys.wrapping_add(off)) as *const u64) };
+                        if i == 0 { crate::serial::write_str("\n  phys: "); }
+                        crate::serial::write_str("+0x");
+                        crate::serial::write_hex(off);
+                        crate::serial::write_str("=0x");
+                        crate::serial::write_hex(v);
+                    }
+                }
+                // Dump the page content at the p offset range (offset 0x2C0 to 0x300)
+                let virt_page = p_val & !0xFFF;
+                let p_off = p_val & 0xFFF;
+                crate::serial::write_str("\n  p_off=0x");
+                crate::serial::write_hex(p_off);
+                for i in 0..10 {
+                    let off = p_off + i * 8;
+                    let v: u64 = unsafe { core::ptr::read_volatile((virt_page.wrapping_add(off)) as *const u64) };
+                    if i == 0 { crate::serial::write_str("\n  p_area: "); }
+                    crate::serial::write_str("+0x");
+                    crate::serial::write_hex(off);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                }
+                crate::serial::write_str("\n");
+                crate::task::exit_task(0);
+                loop { unsafe { core::arch::asm!("cli; hlt"); } }
+            }
         }
-        return;
     }
     crate::serial::write_str("\n");
     exit_user_task_early(code, raw_rip, raw_rsp, "GPF");

@@ -386,9 +386,13 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
-    // Allocate a zero-filled TLS/TCB page so __get_tp() returns 0 (first-load path)
+    // Set up TLS/TCB page for musl (minimal — __init_tp fills the rest)
+    //   [tp+0x00] = self pointer (struct pthread *)
     let tls_phys = unsafe { &mut *crate::memory::allocator() }.alloc(0)?;
-    unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+    unsafe {
+        core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096);
+        core::ptr::write((tls_phys + 0x00) as *mut u64, USER_TLS_VADDR as u64);
+    }
     let tls_flags = crate::paging::PTE_PRESENT
         | crate::paging::PTE_WRITABLE
         | crate::paging::PTE_USER
@@ -1052,6 +1056,12 @@ pub const SYS_clock_gettime: u64 = 228;
 pub const SYS_clock_nanosleep: u64 = 230;
 pub const SYS_exit_group: u64 = 231;
 pub const SYS_set_robust_list: u64 = 274;
+pub const SYS_getppid: u64 = 110;
+pub const SYS_getpgid: u64 = 121;
+pub const SYS_sigaltstack: u64 = 131;
+pub const SYS_setpgid: u64 = 109;
+pub const SYS_getpgrp: u64 = 111;
+pub const SYS_setsid: u64 = 112;
 pub const SYS_getrandom: u64 = 318;
 
 // Niobix-specific (high numbers, no Linux conflict)
@@ -1100,10 +1110,7 @@ pub extern "C" fn syscall_handler(
         SYS_getpid => sys_getpid(),
         SYS_fork => sys_fork(),
         SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
-        SYS_exit => {
-            serial::write_str("SYS_exit called\n");
-            sys_exit(arg1 as i32)
-        },
+        SYS_exit => sys_exit(arg1 as i32),
         SYS_wait4 => sys_wait4(arg1 as i64, arg2 as *mut i32, arg3 as i32, arg4 as u64),
         SYS_kill => sys_kill(arg1 as i64, arg2 as i32),
         SYS_uname => sys_uname(arg1 as *mut u8),
@@ -1131,9 +1138,9 @@ pub extern "C" fn syscall_handler(
         SYS_readv => sys_readv(arg1 as u32, arg2 as u64, arg3 as i32),
         SYS_writev => sys_writev(arg1 as u32, arg2 as u64, arg3 as i32),
         SYS_gettid => CURRENT_TASK.load(Ordering::SeqCst) as i64,
-        SYS_tkill => 0,
+        SYS_tkill => sys_tkill(arg1 as i64, arg2 as i32),
         SYS_sched_getaffinity => 0,
-        SYS_set_tid_address => 0,
+        SYS_set_tid_address => CURRENT_TASK.load(Ordering::SeqCst) as i64,
         SYS_clock_gettime => sys_clock_gettime(arg1 as u64, arg2 as *mut u8),
         SYS_clock_nanosleep => sys_clock_gettime(0, core::ptr::null_mut()), // stub
         SYS_exit_group => sys_exit(arg1 as i32),
@@ -1142,6 +1149,12 @@ pub extern "C" fn syscall_handler(
         SYS_rt_sigaction => 0,
         SYS_rt_sigprocmask => 0,
         SYS_rt_sigreturn => 0,
+        SYS_sigaltstack => 0,
+        SYS_setpgid => sys_setpgid(arg1 as i32, arg2 as i32),
+        SYS_getppid => sys_getppid(),
+        SYS_getpgid => sys_getpgid(arg1 as i32),
+        SYS_getpgrp => sys_getpgrp(),
+        SYS_setsid => sys_setsid(),
         SYS_sched_yield => sys_niobix_yield(),
         // Niobix-specific
         SYS_niobix_get_ticks => sys_get_ticks(),
@@ -1157,15 +1170,15 @@ pub extern "C" fn syscall_handler(
         SYS_niobix_yield => sys_niobix_yield(),
         SYS_reboot => sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
         _ => {
-            serial::write_str("SYS: unknown ");
-            serial::write_dec(syscall_num);
-            serial::write_str(" arg1=");
-            serial::write_hex(arg1);
-            serial::write_str(" arg2=");
-            serial::write_hex(arg2);
-            serial::write_str(" arg3=");
-            serial::write_hex(arg3);
-            serial::write_str("\n");
+            // Print first unknown syscall
+            static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                serial::write_str("SYS: unknown ");
+                serial::write_dec(syscall_num);
+                serial::write_str(" arg1=0x");
+                serial::write_hex(arg1);
+                serial::write_str("\n");
+            }
             -ENOSYS
         },
     }
@@ -1208,13 +1221,7 @@ fn sys_exit(status: i32) -> i64 {
 }
 
 fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
-    serial::write_str("SYS_write: fd=");
-    serial::write_dec(fd as u64);
-    serial::write_str(" cnt=");
-    serial::write_dec(count as u64);
-    serial::write_str("\n");
-    if fd == 1 {
-        // stdout — write to serial
+    if fd == 1 || fd == 2 {
         if buf.is_null() || count == 0 { return 0; }
         let slice = unsafe { core::slice::from_raw_parts(buf, count) };
         for &c in slice {
@@ -1572,30 +1579,14 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if fd == 0 {
         if buf.is_null() || count == 0 { return 0; }
-        let addr = &raw const crate::keyboard::RING_BUF as u64;
         let mut written = 0usize;
-        loop {
-            if crate::keyboard::KEY_COUNT.load(Ordering::SeqCst) > 0 {
-                while written < count {
-                    match crate::keyboard::pop_char() {
-                        Some(c) => {
-                            crate::serial::write_char(c as char);
-                            unsafe { *buf.add(written) = c; }
-                            written += 1;
-                            if c == b'\n' || c == b'\r' { return written as i64; }
-                        }
-                        None => break,
-                    }
-                }
-                if written >= count { return written as i64; }
-            }
-            unsafe {
-                let idx = task_idx(current_task_id());
-                TASKS[idx].blocked_on = addr;
-                TASKS[idx].state = TaskState::Blocked;
-            }
-            schedule();
+        while written < count {
+            let c = crate::serial::read_byte();
+            unsafe { *buf.add(written) = c; }
+            written += 1;
+            if c == b'\n' || c == b'\r' { break; }
         }
+        return written as i64;
     } else {
         let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
             Some(f) => f,
@@ -1812,14 +1803,6 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
             return -ENOMEM; // Too many VMAs
         }
 
-        serial::write_str("SYS_MMAP: addr=0x");
-        serial::write_hex(final_addr);
-        serial::write_str(" size=0x");
-        serial::write_hex(size);
-        serial::write_str(" prot=");
-        serial::write_dec(prot as u64);
-        serial::write_str("\n");
-
         final_addr as i64
     }
 }
@@ -1929,7 +1912,6 @@ fn sys_fork() -> i64 {
 // ── Execve ────────────────────────────────────────────────────────
 
 fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
-    serial::write_str("EXECVE: entered\n");
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
@@ -1948,10 +1930,6 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
         len += 1;
     }
     let path = &path_buf[..len];
-
-    serial::write_str("SYS_EXECVE: '");
-    for &c in path { serial::write_char(c as char); }
-    serial::write_str("'\n");
 
     // Look up the file in VFS
     let inode_idx = match crate::vfs::find_inode(path) {
@@ -1993,7 +1971,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     // Load the ELF
     match crate::elf::load_elf(buffer) {
         Ok(info) => {
-            serial::write_str("SYS_EXECVE: Ok(info)\n");
+
             unsafe {
                 let idx = task_idx(id);
                 let old_pml4 = TASKS[idx].pml4;
@@ -2240,18 +2218,16 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 }
 
                 TASKS[idx].regs = Registers::new_user(final_entry, sp);
-                // Allocate zero-filled TLS page so __get_tp() returns 0 (first-load path)
+                // Allocate TLS page for musl.  __init_tp will fill self/tid/cancel;
+                // we just need a self-pointer so __get_tp() doesn't return 0.
                 if info.is_dynamic {
                     let tls_phys = match alloc.alloc(0) {
                         Some(p) => p,
                         None => { alloc.free(old_pml4, 0); alloc.free(buffer_phys, elford); return -ENOMEM; }
                     };
                     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
-                    // Initialize musl-compatible TLS
                     unsafe {
                         core::ptr::write_volatile(tls_phys as *mut u64, USER_TLS_VADDR);
-                        // Set cancel=2 so exit() won't match exit_lock (which is 0 or 1)
-                        core::ptr::write_volatile((tls_phys + 0x30u64) as *mut u32, 2u32);
                     }
 
                     let tls_flags = crate::paging::PTE_PRESENT
@@ -2267,16 +2243,16 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 }
                 TASKS[idx].pml4 = info.pml4;
                 // Switch to the new page table so the iretq finds the user mappings
-                serial::write_str("SYS_EXECVE: switching to new PML4\n");
+
                 pt_mgr().switch_to(info.pml4);
                 TASKS[idx].user_stack = info.stack_top;
-                TASKS[idx].brk_start = 0;
-                TASKS[idx].brk_end = 0;
+                TASKS[idx].brk_start = info.brk_base;
+                TASKS[idx].brk_end = info.brk_base;
                 TASKS[idx].vmas = [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS];
 
                 alloc.free(old_pml4, 0);
 
-                serial::write_str("SYS_EXECVE: jumping to user entry\n");
+
                 // Naked trampoline: loads GP regs from Registers and iretqs
                 unsafe {
                     let r_ptr = &TASKS[idx].regs as *const Registers;
@@ -2428,12 +2404,24 @@ fn sys_brk(addr: u64) -> i64 {
             // First brk call: use addr as start
             TASKS[idx].brk_start = addr;
             TASKS[idx].brk_end = addr;
+            addr
+        } else {
+            TASKS[idx].brk_start
+        };
 
-            // Register VMA for heap
+        // Ensure VMA exists for the brk range
+        let mut vma_found = false;
+        for v in vma.iter() {
+            if v.start == brk_start {
+                vma_found = true;
+                break;
+            }
+        }
+        if !vma_found {
             for v in vma.iter_mut() {
                 if v.start == 0 && v.end == 0 {
-                    v.start = addr;
-                    v.end = addr;
+                    v.start = brk_start;
+                    v.end = brk_start;
                     v.flags = crate::paging::PTE_PRESENT
                         | crate::paging::PTE_WRITABLE
                         | crate::paging::PTE_USER
@@ -2441,10 +2429,7 @@ fn sys_brk(addr: u64) -> i64 {
                     break;
                 }
             }
-            addr
-        } else {
-            TASKS[idx].brk_start
-        };
+        }
 
         if addr < brk_start {
             // Can't shrink below start
@@ -2462,9 +2447,53 @@ fn sys_brk(addr: u64) -> i64 {
             }
         }
 
-        serial::write_str("SYS_BRK: brk=0x");
-        serial::write_hex(addr);
-        serial::write_str("\n");
+        // Pre-allocate zeroed pages for the extended brk range to overwrite
+        // stale identity-map PTEs inherited from the bootloader (PML4[0]).
+        if addr > old_end {
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3);
+            let start_page = crate::memory::buddy::page_align_down(old_end);
+            let end_page = crate::memory::buddy::page_align_up(addr);
+            crate::serial::write_str("  BRK: pre-zero pages 0x");
+            crate::serial::write_hex(start_page);
+            crate::serial::write_str("-0x");
+            crate::serial::write_hex(end_page);
+            crate::serial::write_str(" cr3=0x");
+            crate::serial::write_hex(cr3);
+            crate::serial::write_str("\n");
+            let mut page = start_page;
+            while page < end_page {
+                let phys = {
+                    let alloc = &mut *crate::memory::allocator();
+                    alloc.alloc(0)
+                };
+                if let Some(phys) = phys {
+                    core::ptr::write_bytes(phys as *mut u8, 0, 4096);
+                    // Force compiler to emit the write by reading back
+                    let zero_check = core::ptr::read_volatile(phys as *const u64);
+                    crate::serial::write_str("  BRK: zero=");
+                    crate::serial::write_hex(zero_check);
+                    let flags = crate::paging::PTE_PRESENT
+                        | crate::paging::PTE_WRITABLE
+                        | crate::paging::PTE_USER
+                        | crate::paging::PTE_NO_EXECUTE;
+                    let res = crate::paging::PageTableManager::map_into(
+                        cr3, page, phys, flags
+                    );
+                    if res.is_ok() {
+                        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
+                    }
+                    crate::serial::write_str(" map=0x");
+                    crate::serial::write_hex(page);
+                    if res.is_ok() {
+                        crate::serial::write_str(" OK\n");
+                    } else {
+                        crate::serial::write_str(" FAIL\n");
+                    }
+                }
+                page += 4096;
+            }
+        }
 
         addr as i64
     }
@@ -2540,6 +2569,25 @@ fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
     0
 }
 
+// ── Process groups (stubs) ──────────────────────────────────────────
+
+fn sys_setpgid(_pid: i32, _pgid: i32) -> i64 { 0 }
+fn sys_getpgid(_pid: i32) -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    unsafe { TASKS[task_idx(id)].id as i64 } // return own PID as PGID
+}
+fn sys_getpgrp() -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    unsafe { TASKS[task_idx(id)].id as i64 }
+}
+fn sys_setsid() -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    unsafe { TASKS[task_idx(id)].id as i64 }
+}
+
 // ── Wait4 ──────────────────────────────────────────────────────────
 
 fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64 {
@@ -2550,9 +2598,31 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
 
 // ── Kill ───────────────────────────────────────────────────────────
 
-fn sys_kill(_pid: i64, _sig: i32) -> i64 {
-    // Stub: no actual signal support yet
-    -ENOSYS
+fn sys_kill(pid: i64, sig: i32) -> i64 {
+    if sig == 0 { return 0; }
+    handle_default_signal(pid, sig);
+    0
+}
+fn sys_tkill(tid: i64, sig: i32) -> i64 {
+    if sig == 0 { return 0; }
+    handle_default_signal(tid, sig);
+    0
+}
+
+fn handle_default_signal(target: i64, sig: i32) {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return; }
+    if target == 0 || target == id as i64 || target == -1 || target == -(id as i64) {
+        match sig {
+            2 | 3 | 6 | 9 | 15 => {
+                serial::write_str("SYS:KILL signal ");
+                serial::write_dec(sig as u64);
+                serial::write_str(" -> exit\n");
+                exit_task(128 + sig);
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── Uname ──────────────────────────────────────────────────────────
@@ -2574,23 +2644,71 @@ fn sys_uname(buf: *mut u8) -> i64 {
 
 // ── Ioctl ──────────────────────────────────────────────────────────
 
-fn sys_ioctl(fd: u32, request: u64, _arg3: u64) -> i64 {
-    // Only handle TCGETS (0x5401) on stdin — report it's a TTY
-    if fd == 0 && request == 0x5401 {
-        // Return 0 to indicate it IS a tty
-        return 0;
+fn sys_ioctl(_fd: u32, request: u64, arg3: u64) -> i64 {
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGPGRP: u64 = 0x540F;
+    match request {
+        TCGETS => {
+            let ptr = arg3 as *mut u8;
+            if ptr.is_null() { return -EFAULT; }
+            unsafe {
+                core::ptr::write_volatile(ptr.add(0) as *mut u32, 0x0006);
+                core::ptr::write_volatile(ptr.add(4) as *mut u32, 0x0005);
+                core::ptr::write_volatile(ptr.add(8) as *mut u32, 0x00000BFD);
+                core::ptr::write_volatile(ptr.add(12) as *mut u32, 0x00000CF5);
+                for i in 16..48 { core::ptr::write_volatile(ptr.add(i), 0); }
+                core::ptr::write_volatile(ptr.add(16), 3);
+                core::ptr::write_volatile(ptr.add(17), 28);
+                core::ptr::write_volatile(ptr.add(18), 127);
+                core::ptr::write_volatile(ptr.add(19), 21);
+                core::ptr::write_volatile(ptr.add(20), 4);
+                core::ptr::write_volatile(ptr.add(21), 23);
+                core::ptr::write_volatile(ptr.add(48) as *mut u32, 0x0F);
+                core::ptr::write_volatile(ptr.add(52) as *mut u32, 0x0F);
+            }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => 0,
+        TIOCGWINSZ => {
+            let ws = arg3 as *mut u16;
+            if ws.is_null() { return -EFAULT; }
+            unsafe {
+                core::ptr::write_volatile(ws, 25);
+                core::ptr::write_volatile(ws.add(1), 80);
+                core::ptr::write_volatile(ws.add(2), 0);
+                core::ptr::write_volatile(ws.add(3), 0);
+            }
+            0
+        }
+        TIOCSPGRP => 0,
+        TIOCGPGRP => {
+            let pgrp = arg3 as *mut i32;
+            if pgrp.is_null() { return -EFAULT; }
+            let id = current_task_id();
+            unsafe {
+                let idx = task_idx(id);
+                core::ptr::write_volatile(pgrp, TASKS[idx].id as i32);
+            }
+            0
+        }
+        _ => -ENOTTY,
     }
-    // Other ioctls fail
-    -ENOTTY
 }
 
 // ── Fcntl ──────────────────────────────────────────────────────────
 
 fn sys_fcntl(fd: u32, cmd: i32, _arg: u64) -> i64 {
     match cmd {
-        0 => { // F_DUPFD
-            sys_dup2(fd, fd) // dup to lowest available — simplified
-        }
+        0 => sys_dup2(fd, fd),
+        1 => 0,  // F_GETFD
+        2 => 0,  // F_SETFD
+        3 => 2,  // F_GETFL → return O_RDWR (2)
+        4 => 0,  // F_SETFL
         _ => -EINVAL,
     }
 }
@@ -2714,7 +2832,7 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
             let d = &dirent_buf[i];
             let nlen = d.namelen as usize;
             if nlen == 0 { continue; }
-            let reclen: usize = (19 + nlen + 7) & !7;
+            let reclen: usize = (19 + nlen + 1 + 7) & !7; // +1 for null terminator
             if written + reclen > count { break; }
             unsafe {
                 let ent = buf.add(written) as *mut LinuxDirent64;
@@ -2776,6 +2894,7 @@ struct LinuxStat {
     st_mtime_nsec: i64,
     st_ctime: i64,
     st_ctime_nsec: i64,
+    _unused: [i64; 3],
 }
 
 const S_IFMT: u32 = 0o170000;
@@ -2873,6 +2992,8 @@ pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
                     Some(p) => p,
                     None => return false,
                 };
+                // Zero the page so heap metadata (musl malloc) works correctly
+                core::ptr::write_bytes(phys as *mut u8, 0, 4096);
                 let page_addr = cr2 & !0xFFF;
                 if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
                     return false;
@@ -2906,12 +3027,8 @@ fn sys_readv(_fd: u32, _iov: u64, _iovcnt: i32) -> i64 {
 }
 
 fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
-    serial::write_str("SYS_writev: fd=");
-    serial::write_dec(fd as u64);
-    serial::write_str(" cnt=");
-    serial::write_dec(iovcnt as u64);
-    serial::write_str("\n");
-    if fd != 1 { return -ENOSYS; }
+    if fd != 1 && fd != 2 { return -ENOSYS; }
+    if iovcnt <= 0 { return 0; }
     let mut total = 0i64;
     for i in 0..iovcnt as usize {
         let base: u64;
@@ -2928,6 +3045,7 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
         }
         total += len as i64;
     }
+    if total > 0 { serial::write_str("\n"); }
     total
 }
 
