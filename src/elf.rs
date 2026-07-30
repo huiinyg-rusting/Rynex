@@ -54,6 +54,7 @@ pub struct ElfLoadInfo {
     pub phdr_user: u64,
     pub phnum: u16,
     pub phentsize: u16,
+    pub brk_base: u64,
 }
 
 fn page_align_up(addr: u64) -> u64 {
@@ -70,7 +71,10 @@ fn alloc_page() -> Option<u64> {
 }
 
 fn pt_flags(elf_flags: u32) -> u64 {
-    let mut f = PTE_PRESENT | PTE_USER | PTE_WRITABLE;
+    let mut f = PTE_PRESENT | PTE_USER;
+    if elf_flags & PF_W != 0 {
+        f |= PTE_WRITABLE;
+    }
     if elf_flags & PF_X == 0 {
         f |= PTE_NO_EXECUTE;
     }
@@ -175,6 +179,15 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                         }
                     }
                 }
+                // Clear the first PD entry (virtual 0x0 – 0x1FFFFF) to unmap the null page.
+                // The identity map makes it user-accessible, allowing musl's guard check
+                // at p->mem[-1] to silently read firmware data instead of cleanly faulting.
+                // Only do this if PDPT[0] is NOT a 1G huge page (after ELF side-effects).
+                if pdpt.0[0] & crate::paging::PTE_PRESENT != 0 && pdpt.0[0] & crate::paging::PTE_HUGE == 0 {
+                    let pd0_addr = pdpt.0[0] & crate::paging::PTE_ADDR_MASK;
+                    let pd0 = &mut *(pd0_addr as *mut crate::paging::PageTable);
+                    pd0.0[0] = 0; // Clear 2M entry covering 0x0-0x1FFFFF
+                }
             }
         }
         p
@@ -237,10 +250,11 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
             // Copy file data
             let page_off = if addr == seg_start { offset_in_page } else { 0 };
             let copy_start = addr + page_off;
-            let copy_size = if copy_start + phdr.filesz > addr + 4096 {
+            let file_end_va = vaddr_base + phdr.filesz;
+            let copy_size = if file_end_va > addr + 4096 {
                 addr + 4096 - copy_start
             } else {
-                phdr.filesz.saturating_sub(copy_start - vaddr_base)
+                file_end_va.saturating_sub(copy_start)
             };
 
             if copy_size > 0 {
@@ -338,5 +352,6 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         phdr_user,
         phnum: phnum as u16,
         phentsize: phentsize as u16,
+        brk_base: page_align_up(max_end),
     })
 }
