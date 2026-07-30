@@ -106,7 +106,16 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
                 Some(vn_id) => {
                     unsafe { INODES[flat_idx].vnode_id = vn_id; }
                     if !data.is_empty() {
-                        let _ = crate::vfs_core::write(vn_id, 0, data);
+                        match crate::vfs_core::write(vn_id, 0, data) {
+                            Ok(n) if n == data.len() => {}
+                            _ => {
+                                serial::write_str("VFS: write failed for '");
+                                for &c in name { serial::write_char(c as char); }
+                                serial::write_str("'\n");
+                                unsafe { INODES[flat_idx].used = false; }
+                                return None;
+                            }
+                        }
                     }
                     serial::write_str("VFS: created '");
                     for &c in name { serial::write_char(c as char); }

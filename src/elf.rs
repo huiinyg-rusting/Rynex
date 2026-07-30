@@ -264,14 +264,21 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         }
     }
 
-    // PHDR is within the first PT_LOAD segment — no separate page needed.
-    // The ld.so computes base as AT_PHDR - phdr_vaddr, so AT_PHDR must
-    // point to the actual PHDR location in the loaded image.
-    let phdr_user = if is_dynamic {
-        load_addr + hdr.phoff as u64
-    } else {
-        0
-    };
+    // PHDR is within a PT_LOAD segment — compute its user-space VA.
+    let mut phdr_user = 0u64;
+    for i in 0..phnum {
+        let phdr = unsafe {
+            let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
+            &*p
+        };
+        if phdr.type_ == PT_LOAD
+            && hdr.phoff >= phdr.offset
+            && hdr.phoff < phdr.offset + phdr.filesz
+        {
+            phdr_user = load_addr + phdr.vaddr + (hdr.phoff - phdr.offset);
+            break;
+        }
+    }
 
     // Allocate user stack at USER_STACK_TOP (only when creating new PML4)
     if existing_pml4.is_none() {

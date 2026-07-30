@@ -8,7 +8,7 @@ use super::VnodeOps;
 pub const MAX_INODES: usize = 256;
 pub const MAX_DIRENTS: usize = 64;
 pub const RAMFS_BLOCK: usize = 4096;
-pub const MAX_BLOCKS_PER_INODE: usize = 64;
+pub const MAX_BLOCKS_PER_INODE: usize = 512;
 pub const MAX_SYMLINK_LEN: usize = 256;
 
 const FT_REG_FILE: u8 = 1;
