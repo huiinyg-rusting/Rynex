@@ -2758,6 +2758,14 @@ fn sys_brk(addr: u64) -> i64 {
                         crate::serial::write_str(" MISMATCH!");
                     }
                     crate::serial::write_str("\n");
+                    // Reserve meta-area phys page so buddy never reuses it
+                    if page == 0x500000 {
+                        let alloc = &mut *crate::memory::allocator();
+                        alloc.reserve(phys);
+                        crate::serial::write_str("  BRK: reserved meta phys=0x");
+                        crate::serial::write_hex(phys);
+                        crate::serial::write_str("\n");
+                    }
                 }
                 page += 4096;
             }
