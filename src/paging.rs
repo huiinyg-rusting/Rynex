@@ -689,6 +689,14 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
         );
     }
 
+    // Reserve meta-area phys page so buddy never reuses it
+    if virt == 0x500000 {
+        alloc.reserve(new_phys);
+        crate::serial::write_str("  COW: reserved meta phys=0x");
+        crate::serial::write_hex(new_phys);
+        crate::serial::write_str("\n");
+    }
+
     // Update PTE: new phys + writable
     *pte = new_phys | flags | PTE_WRITABLE;
     unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }

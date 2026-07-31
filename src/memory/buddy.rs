@@ -2,6 +2,7 @@ use core::ptr;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: usize = 10;
+const MAX_RESERVED: usize = 32;
 
 const MAGIC: u32 = 0xDEADBEEF;
 
@@ -16,6 +17,8 @@ pub struct BuddyAllocator {
     base: u64,
     pages: u64,
     free_lists: [*mut Block; MAX_ORDER + 1],
+    reserved: [u64; MAX_RESERVED],
+    reserved_count: usize,
 }
 
 impl BuddyAllocator {
@@ -24,6 +27,8 @@ impl BuddyAllocator {
             base: 0,
             pages: 0,
             free_lists: [ptr::null_mut(); MAX_ORDER + 1],
+            reserved: [0; MAX_RESERVED],
+            reserved_count: 0,
         }
     }
 
@@ -118,6 +123,9 @@ impl BuddyAllocator {
     }
 
     pub fn free(&mut self, addr: u64, order: usize) {
+        if self.is_reserved(addr) {
+            return;
+        }
         self.free_one(addr, order as u8);
     }
 
@@ -155,6 +163,24 @@ impl BuddyAllocator {
 
     pub fn total_pages(&self) -> u64 {
         self.pages
+    }
+
+    pub fn reserve(&mut self, addr: u64) {
+        if self.reserved_count < MAX_RESERVED {
+            self.reserved[self.reserved_count] = addr;
+            self.reserved_count += 1;
+            // Also ensure it's not in free lists
+            self.mark_allocated(addr, PAGE_SIZE);
+        }
+    }
+
+    pub fn is_reserved(&self, addr: u64) -> bool {
+        for i in 0..self.reserved_count {
+            if self.reserved[i] == addr {
+                return true;
+            }
+        }
+        false
     }
 }
 
