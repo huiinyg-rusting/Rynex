@@ -112,14 +112,6 @@ pub extern "x86-interrupt" fn debug(mut frame: InterruptStackFrame) {
             }
             core::arch::asm!("mov {}, dr6", in(reg) (dr6 & !0xF), options(nostack, nomem));
         }
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags));
-        if let Some(phys) = crate::paging::PageTableManager::resolve_phys(cr3, 0x500000) {
-            let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER
-                | crate::paging::PTE_NO_EXECUTE;
-            let _ = crate::paging::PageTableManager::map_into(cr3, 0x500000, phys, flags);
-            core::arch::asm!("invlpg [0x500000]", options(nostack));
-        }
         // clear TF
         let v = frame.as_mut();
         let mut inner = v.read();
@@ -574,58 +566,6 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::serial::write_str(" code=0x");
     crate::serial::write_hex(code.bits() as u64);
     crate::serial::write_str("\n");
-
-    // Trap writes to the mallocng meta-area page to observe meta creation
-    if cr2 >= 0x500000 && cr2 < 0x501000 && code.bits() & 3 == 3 {
-        static MTRAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        let n = MTRAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 60 {
-            crate::serial::write_str("  META-WRITE rip=0x");
-            crate::serial::write_hex(rip);
-            crate::serial::write_str(" cr2=0x");
-            crate::serial::write_hex(cr2);
-            crate::serial::write_str(" n=");
-            crate::serial::write_dec(n as u64);
-            crate::serial::write_str("\n");
-        }
-        // Remap writable and set TF so the debug handler re-arms RO
-        let pml4 = crate::task::current_task_pml4();
-        if let Some(phys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
-            let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE
-                | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
-            let _ = crate::paging::PageTableManager::map_into(pml4, 0x500000, phys, flags);
-            unsafe {
-                core::arch::asm!("invlpg [0x500000]", options(nostack));
-            }
-        }
-        // Arm DR0-DR3 write watchpoints on the mem fields of metas m[0],m[2],m[4],m[6]
-        // (VA 0x500000 + 0x18 + slot*0x28 + 0x10) to log the writer RIP on first write.
-        unsafe {
-            core::arch::asm!("mov rax, 0x500028", options(nostack));
-            core::arch::asm!("mov dr0, rax", options(nostack));
-            core::arch::asm!("mov rax, 0x500078", options(nostack));
-            core::arch::asm!("mov dr1, rax", options(nostack));
-            core::arch::asm!("mov rax, 0x5000c8", options(nostack));
-            core::arch::asm!("mov dr2, rax", options(nostack));
-            core::arch::asm!("mov rax, 0x500118", options(nostack));
-            core::arch::asm!("mov dr3, rax", options(nostack));
-            let dr7: u64 = 0x55
-                | (0b01 << 16) | (0b10 << 18)
-                | (0b01 << 20) | (0b10 << 22)
-                | (0b01 << 24) | (0b10 << 26)
-                | (0b01 << 28) | (0b10 << 30);
-            core::arch::asm!("mov rax, {}", in(reg) dr7, options(nostack));
-            core::arch::asm!("mov dr7, rax", options(nostack));
-        }
-        // Set TF in the saved RFLAGS so the faulting instruction single-steps.
-        let mut frame = frame;
-        unsafe {
-            let v = frame.as_mut();
-            let mut inner = v.read();
-            inner.cpu_flags.insert(x86_64::registers::rflags::RFlags::TRAP_FLAG);
-        }
-        return;
-    }
 
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         crate::serial::write_str("  resolved\n");
