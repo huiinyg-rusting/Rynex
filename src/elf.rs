@@ -179,14 +179,37 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                         }
                     }
                 }
-                // Clear the first PD entry (virtual 0x0 – 0x1FFFFF) to unmap the null page.
-                // The identity map makes it user-accessible, allowing musl's guard check
-                // at p->mem[-1] to silently read firmware data instead of cleanly faulting.
-                // Only do this if PDPT[0] is NOT a 1G huge page (after ELF side-effects).
+                // Map VA 0x0-0xFFF to a zero page so musl's guard read at p->mem[-1]
+                // returns 0 instead of silently reading firmware data from physical page 0.
+                // We must NOT clear PD[0] entirely because that unmaps VA 0x100000
+                // (the kernel itself, loaded at physical 1 MB via identity map).
                 if pdpt.0[0] & crate::paging::PTE_PRESENT != 0 && pdpt.0[0] & crate::paging::PTE_HUGE == 0 {
                     let pd0_addr = pdpt.0[0] & crate::paging::PTE_ADDR_MASK;
                     let pd0 = &mut *(pd0_addr as *mut crate::paging::PageTable);
-                    pd0.0[0] = 0; // Clear 2M entry covering 0x0-0x1FFFFF
+                    let pde0 = pd0.0[0];
+                    if pde0 & crate::paging::PTE_PRESENT != 0 {
+                        let zero_page = alloc_page().ok_or("OOM: zero page")?;
+                        unsafe { core::ptr::write_bytes(zero_page as *mut u8, 0, 4096); }
+                        if pde0 & crate::paging::PTE_HUGE != 0 {
+                            // 2 MB huge page – split into 4 KB pages
+                            let huge_phys = pde0 & crate::paging::PTE_ADDR_MASK;
+                            let new_pt = alloc_page().ok_or("OOM: null PT split")?;
+                            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+                            let pt = unsafe { &mut *(new_pt as *mut crate::paging::PageTable) };
+                            for i in 0..512 {
+                                let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER;
+                                pt.0[i] = (huge_phys + (i as u64) * 4096) | flags;
+                            }
+                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
+                            let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_ACCESSED | crate::paging::PTE_DIRTY;
+                            pd0.0[0] = new_pt | flags;
+                        } else {
+                            // Already 4 KB pages – redirect PT[0] to zero page
+                            let pt_addr = pde0 & crate::paging::PTE_ADDR_MASK;
+                            let pt = unsafe { &mut *(pt_addr as *mut crate::paging::PageTable) };
+                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
+                        }
+                    }
                 }
             }
         }
@@ -337,6 +360,11 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         let page_off = last_stack_vaddr & 0xFFF;
         unsafe {
             let phys = last_stack_phys + page_off;
+            crate::serial::write_str("  stack: last_stack_vaddr=0x");
+            crate::serial::write_hex(last_stack_vaddr);
+            crate::serial::write_str(" phys=0x");
+            crate::serial::write_hex(phys);
+            crate::serial::write_str("\n");
             core::ptr::write((phys - 8) as *mut u64, 0);
             core::ptr::write(phys as *mut u64, 0);
         }
