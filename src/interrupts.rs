@@ -94,11 +94,39 @@ pub extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
     halt();
 }
 
-pub extern "x86-interrupt" fn debug(_frame: InterruptStackFrame) {
-    crate::serial::write_str("EXC: Debug\n");
-    halt();
+pub extern "x86-interrupt" fn debug(mut frame: InterruptStackFrame) {
+    unsafe {
+        let dr6: u64;
+        core::arch::asm!("mov {}, dr6", out(reg) dr6, options(nostack, nomem, preserves_flags));
+        if dr6 & 0xF != 0 {
+            static WBCNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let wbn = WBCNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if wbn < 48 {
+                crate::serial::write_str("  WB# rip=0x");
+                crate::serial::write_hex(frame.instruction_pointer.as_u64());
+                crate::serial::write_str(" B=0x");
+                crate::serial::write_hex(dr6 & 0xF);
+                crate::serial::write_str(" n=");
+                crate::serial::write_dec(wbn as u64);
+                crate::serial::write_str("\n");
+            }
+            core::arch::asm!("mov {}, dr6", in(reg) (dr6 & !0xF), options(nostack, nomem));
+        }
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags));
+        if let Some(phys) = crate::paging::PageTableManager::resolve_phys(cr3, 0x500000) {
+            let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER
+                | crate::paging::PTE_NO_EXECUTE;
+            let _ = crate::paging::PageTableManager::map_into(cr3, 0x500000, phys, flags);
+            core::arch::asm!("invlpg [0x500000]", options(nostack));
+        }
+        // clear TF
+        let v = frame.as_mut();
+        let mut inner = v.read();
+        inner.cpu_flags.remove(x86_64::registers::rflags::RFlags::TRAP_FLAG);
+    }
+    return;
 }
-
 pub extern "x86-interrupt" fn nmi(_frame: InterruptStackFrame) {
     crate::serial::write_str("EXC: NMI\n");
     halt();
@@ -219,6 +247,35 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                 let stride_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x30) as *const u64) };
                 // Also read arg3 (size) and arg4 from the caller's stack frame
                 let size_val: u64 = unsafe { core::ptr::read_volatile((usp + 0x08) as *const u64) };
+                let get_meta_p: u64 = unsafe { core::ptr::read_volatile((usp + 0x08) as *const u64) };
+                let get_meta_caller: u64 = unsafe { core::ptr::read_volatile((usp + 0x40) as *const u64) };
+                let realloc_ret: u64 = unsafe { core::ptr::read_volatile((usp + 0xB0) as *const u64) };
+                let wrapper_ret: u64 = unsafe { core::ptr::read_volatile((usp + 0xC0) as *const u64) };
+                crate::serial::write_str("  get_meta_p=0x");
+                crate::serial::write_hex(get_meta_p);
+                crate::serial::write_str(" caller=0x");
+                crate::serial::write_hex(get_meta_caller);
+                crate::serial::write_str(" realloc_ret=0x");
+                crate::serial::write_hex(realloc_ret);
+                crate::serial::write_str(" wrapper_ret=0x");
+                crate::serial::write_hex(wrapper_ret);
+                crate::serial::write_str("\n");
+                for i in 0..24 {
+                    let v: u64 = unsafe { core::ptr::read_volatile((usp + 0xA0 + i * 8) as *const u64) };
+                    crate::serial::write_str("  usp+0x");
+                    crate::serial::write_hex(0xA0 + i * 8);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                }
+                crate::serial::write_str("\n");
+                for i in 0..32 {
+                    let v: u64 = unsafe { core::ptr::read_volatile((usp + 0x1A0 + i * 8) as *const u64) };
+                    crate::serial::write_str("  usp+0x");
+                    crate::serial::write_hex(0x1A0 + i * 8);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                }
+                crate::serial::write_str("\n");
                 crate::serial::write_str("  p=0x");
                 crate::serial::write_hex(p_val);
                 crate::serial::write_str(" n=");
@@ -264,11 +321,17 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                 // Dump physical page vs virtual page content to detect stale TLB/PTE
                 let gpf_cr3: u64;
                 unsafe { core::arch::asm!("mov {}, cr3", out(reg) gpf_cr3, options(nostack, nomem, preserves_flags)); }
+                crate::serial::write_str(" gpf_cr3=0x");
+                crate::serial::write_hex(gpf_cr3);
                 let page_phys = crate::paging::PageTableManager::resolve_phys(gpf_cr3, p_val & !0xFFF).unwrap_or(0);
+                // Also resolve the stack address to compare
+                let stack_phys = crate::paging::PageTableManager::resolve_phys(gpf_cr3, raw_rsp & !0xFFF).unwrap_or(0);
+                crate::serial::write_str(" stack_page_phys=0x");
+                crate::serial::write_hex(stack_phys);
                 crate::serial::write_str("\n  page_phys=0x");
                 crate::serial::write_hex(page_phys);
                 if page_phys != 0 {
-                    for i in 0..8 {
+                    for i in 0..64 {
                         let off = i * 8;
                         let v: u64 = unsafe { core::ptr::read_volatile((page_phys.wrapping_add(off)) as *const u64) };
                         if i == 0 { crate::serial::write_str("\n  phys: "); }
@@ -293,6 +356,158 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                     crate::serial::write_hex(v);
                 }
                 crate::serial::write_str("\n");
+                let grp = addr_val & !0x0;
+                if (grp >> 47) == 0 || (grp >> 47) == 0x1FFFF {
+                    let gphys = crate::paging::PageTableManager::resolve_phys(gpf_cr3, grp).unwrap_or(0);
+                    crate::serial::write_str("  group_v=0x");
+                    crate::serial::write_hex(grp);
+                    crate::serial::write_str(" gphys=0x");
+                    crate::serial::write_hex(gphys);
+                    if gphys != 0 {
+                        for i in 0..4 {
+                            let v: u64 = unsafe { core::ptr::read_volatile((gphys.wrapping_add(i * 8)) as *const u64) };
+                            crate::serial::write_str(" g+0x");
+                            crate::serial::write_hex(i * 8);
+                            crate::serial::write_str("=0x");
+                            crate::serial::write_hex(v);
+                        }
+                    }
+                    crate::serial::write_str("\n");
+                }
+                // Dump the group struct for the first meta slot (mem at phys page +0x28)
+                if page_phys != 0 {
+                    let first_mem: u64 = unsafe { core::ptr::read_volatile((page_phys.wrapping_add(0x28)) as *const u64) };
+                    crate::serial::write_str("  slots[0].mem=0x");
+                    crate::serial::write_hex(first_mem);
+                    let first_gphys = crate::paging::PageTableManager::resolve_phys(gpf_cr3, first_mem).unwrap_or(0);
+                    crate::serial::write_str(" gphys=0x");
+                    crate::serial::write_hex(first_gphys);
+                    if first_gphys != 0 {
+                        for i in 0..4 {
+                            let v: u64 = unsafe { core::ptr::read_volatile((first_gphys.wrapping_add(i * 8)) as *const u64) };
+                            crate::serial::write_str(" g+0x");
+                            crate::serial::write_hex(i * 8);
+                            crate::serial::write_str("=0x");
+                            crate::serial::write_hex(v);
+                        }
+                    }
+                    crate::serial::write_str("\n");
+                }
+                // Dump malloc context at libc 0xE9B00 (loaded at 0x100000)
+                let ctx_v = 0x100000E9B00u64;
+                crate::serial::write_str("  ctx: ");
+                for i in 0..10 {
+                    let v: u64 = unsafe { core::ptr::read_volatile((ctx_v + i * 8) as *const u64) };
+                    crate::serial::write_str("+0x");
+                    crate::serial::write_hex(i * 8);
+                    crate::serial::write_str("=0x");
+                    crate::serial::write_hex(v);
+                    if i == 9 { crate::serial::write_str("\n"); }
+                }
+                crate::serial::write_str("  active: ");
+                for i in 0..48 {
+                    let v: u64 = unsafe { core::ptr::read_volatile((ctx_v + 0x50 + i * 8) as *const u64) };
+                    crate::serial::write_str("[");
+                    crate::serial::write_dec(i as u64);
+                    crate::serial::write_str("]=");
+                    crate::serial::write_hex(v);
+                    if (i & 7) == 7 { crate::serial::write_str("\n  active: "); }
+                }
+                // Decode meta slots 0..24 in the meta area page at VA 0x500000
+                crate::serial::write_str("\n  metas: ");
+                for k in 0..25u64 {
+                    let base = 0x500018u64 + k * 0x28;
+                    let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
+                    let avail: u32 = unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) };
+                    let freed: u32 = unsafe { core::ptr::read_volatile((base + 0x1C) as *const u32) };
+                    let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
+                    let last_idx = packed & 31;
+                    let freeable = (packed >> 5) & 1;
+                    let sc = (packed >> 6) & 63;
+                    crate::serial::write_str("\n  m[");
+                    crate::serial::write_dec(k);
+                    crate::serial::write_str("]@0x");
+                    crate::serial::write_hex(base);
+                    crate::serial::write_str(" mem=0x");
+                    crate::serial::write_hex(mem);
+                    crate::serial::write_str(" a=");
+                    crate::serial::write_hex(avail as u64);
+                    crate::serial::write_str(" f=");
+                    crate::serial::write_hex(freed as u64);
+                    crate::serial::write_str(" li=");
+                    crate::serial::write_dec(last_idx);
+                    crate::serial::write_str(" fr=");
+                    crate::serial::write_dec(freeable);
+                    crate::serial::write_str(" sc=");
+                    crate::serial::write_dec(sc);
+                    crate::serial::write_str(" mp=");
+                    crate::serial::write_dec(packed >> 12);
+                }
+                crate::serial::write_str("\n");
+                for probe in [0x6Cu64, 0x2Cu64, 0x4FE280u64, 0x4FE270u64, 0x4FE000u64, 0x10000EC0D0u64, 0x10000EC000u64, 0x500000u64, 0x70000000u64, 0x4FF000u64] {
+                    let pp = crate::paging::PageTableManager::resolve_phys(gpf_cr3, probe).unwrap_or(0);
+                    crate::serial::write_str("  probe 0x");
+                    crate::serial::write_hex(probe);
+                    crate::serial::write_str(" phys=0x");
+                    crate::serial::write_hex(pp);
+                    if pp != 0 {
+                        for i in 0..4 {
+                            let v: u64 = unsafe { core::ptr::read_volatile((pp.wrapping_add(i * 8)) as *const u64) };
+                            crate::serial::write_str(" +");
+                            crate::serial::write_hex(i * 8);
+                            crate::serial::write_str("=0x");
+                            crate::serial::write_hex(v);
+                        }
+                    }
+                    crate::serial::write_str("\n");
+                }
+                // Scan user page tables for aliases of key phys pages
+                let targets = [0x3A29000u64, 0x0B30000u64, 0x3D27000u64, 0x3A2A000u64];
+                for tgt in targets {
+                    crate::serial::write_str("  alias-phys=0x");
+                    crate::serial::write_hex(tgt);
+                    crate::serial::write_str(": ");
+                    let mut any = false;
+                    for pm in 0..512u64 {
+                        let pmle = unsafe { core::ptr::read_volatile((gpf_cr3 + pm * 8) as *const u64) };
+                        if pmle & 1 == 0 { continue; }
+                        let pdptp = pmle & 0xFFFFFFFFFF000;
+                        for pt_ in 0..512u64 {
+                            let pdpte = unsafe { core::ptr::read_volatile((pdptp + pt_ * 8) as *const u64) };
+                            if pdpte & 1 == 0 { continue; }
+                            if pdpte & (1 << 7) != 0 { continue; }
+                            let pdp = pdpte & 0xFFFFFFFFFF000;
+                            for pd_ in 0..512u64 {
+                                let pde = unsafe { core::ptr::read_volatile((pdp + pd_ * 8) as *const u64) };
+                                if pde & 1 == 0 { continue; }
+                                if pde & (1 << 7) != 0 {
+                                    if (pde & 0xFFFFFFFFFF000) == (tgt & 0xFFFFFFFFFF000) {
+                                        let va = (pm << 39) | (pt_ << 30) | (pd_ << 21);
+                                        crate::serial::write_str("0x");
+                                        crate::serial::write_hex(va);
+                                        crate::serial::write_str(" ");
+                                        any = true;
+                                    }
+                                    continue;
+                                }
+                                let ptp = pde & 0xFFFFFFFFFF000;
+                                for pte_ in 0..512u64 {
+                                    let pte = unsafe { core::ptr::read_volatile((ptp + pte_ * 8) as *const u64) };
+                                    if pte & 1 == 0 { continue; }
+                                    if (pte & 0xFFFFFFFFFF000) == (tgt & 0xFFFFFFFFFF000) {
+                                        let va = (pm << 39) | (pt_ << 30) | (pd_ << 21) | (pte_ << 12);
+                                        crate::serial::write_str("0x");
+                                        crate::serial::write_hex(va);
+                                        crate::serial::write_str(" ");
+                                        any = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !any { crate::serial::write_str("none"); }
+                    crate::serial::write_str("\n");
+                }
                 crate::task::exit_task(0);
                 loop { unsafe { core::arch::asm!("cli; hlt"); } }
             }
@@ -359,6 +574,58 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::serial::write_str(" code=0x");
     crate::serial::write_hex(code.bits() as u64);
     crate::serial::write_str("\n");
+
+    // Trap writes to the mallocng meta-area page to observe meta creation
+    if cr2 >= 0x500000 && cr2 < 0x501000 && code.bits() & 3 == 3 {
+        static MTRAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = MTRAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 60 {
+            crate::serial::write_str("  META-WRITE rip=0x");
+            crate::serial::write_hex(rip);
+            crate::serial::write_str(" cr2=0x");
+            crate::serial::write_hex(cr2);
+            crate::serial::write_str(" n=");
+            crate::serial::write_dec(n as u64);
+            crate::serial::write_str("\n");
+        }
+        // Remap writable and set TF so the debug handler re-arms RO
+        let pml4 = crate::task::current_task_pml4();
+        if let Some(phys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
+            let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE
+                | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
+            let _ = crate::paging::PageTableManager::map_into(pml4, 0x500000, phys, flags);
+            unsafe {
+                core::arch::asm!("invlpg [0x500000]", options(nostack));
+            }
+        }
+        // Arm DR0-DR3 write watchpoints on the mem fields of metas m[0],m[2],m[4],m[6]
+        // (VA 0x500000 + 0x18 + slot*0x28 + 0x10) to log the writer RIP on first write.
+        unsafe {
+            core::arch::asm!("mov rax, 0x500028", options(nostack));
+            core::arch::asm!("mov dr0, rax", options(nostack));
+            core::arch::asm!("mov rax, 0x500078", options(nostack));
+            core::arch::asm!("mov dr1, rax", options(nostack));
+            core::arch::asm!("mov rax, 0x5000c8", options(nostack));
+            core::arch::asm!("mov dr2, rax", options(nostack));
+            core::arch::asm!("mov rax, 0x500118", options(nostack));
+            core::arch::asm!("mov dr3, rax", options(nostack));
+            let dr7: u64 = 0x55
+                | (0b01 << 16) | (0b10 << 18)
+                | (0b01 << 20) | (0b10 << 22)
+                | (0b01 << 24) | (0b10 << 26)
+                | (0b01 << 28) | (0b10 << 30);
+            core::arch::asm!("mov rax, {}", in(reg) dr7, options(nostack));
+            core::arch::asm!("mov dr7, rax", options(nostack));
+        }
+        // Set TF in the saved RFLAGS so the faulting instruction single-steps.
+        let mut frame = frame;
+        unsafe {
+            let v = frame.as_mut();
+            let mut inner = v.read();
+            inner.cpu_flags.insert(x86_64::registers::rflags::RFlags::TRAP_FLAG);
+        }
+        return;
+    }
 
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         crate::serial::write_str("  resolved\n");
