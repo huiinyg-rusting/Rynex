@@ -2,7 +2,7 @@ use crate::spinlock::Mutex;
 use crate::vfs_core::types::*;
 use crate::vfs_core::VnodeOps;
 use crate::serial;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const TTY_BUFFER_SIZE: usize = 4096;
 const VGA_WIDTH: usize = 80;
@@ -26,7 +26,6 @@ pub struct TtyDevice {
     termios: Mutex<Termios>,
     winsize: Mutex<Winsize>,
     fg_pgrp: Mutex<i32>,
-    read_futex: AtomicU32,
 }
 
 struct InputBuffer {
@@ -91,7 +90,6 @@ impl TtyDevice {
                 ws_ypixel: 0,
             }),
             fg_pgrp: Mutex::new(1),
-            read_futex: AtomicU32::new(0),
         }
     }
 
@@ -125,11 +123,6 @@ impl TtyDevice {
         input.buf[head] = c;
         input.head = (head + 1) % TTY_BUFFER_SIZE;
         input.count += 1;
-
-        // Wake up any task blocked on read
-        self.read_futex.store(1, Ordering::SeqCst);
-        let futex_addr = &self.read_futex as *const AtomicU32 as *const u32;
-        crate::task::futex_wake(futex_addr, 1);
     }
 
     fn pop_input(&self, buf: &mut [u8]) -> usize {
@@ -264,24 +257,33 @@ impl VnodeOps for TtyDevice {
         if buf.is_empty() {
             return Ok(0);
         }
-        debug!("read called, buf_len={}", buf.len());
+        crate::serial::write_str("[TTY_READ] start\n");
+        let mut wait_count = 0u64;
         loop {
             let n = self.pop_input(buf);
             if n > 0 {
-                debug!("read: got {} bytes", n);
+                crate::serial::write_str("[TTY_READ] got ");
+                crate::serial::write_dec(n as u64);
+                crate::serial::write_str(" bytes\n");
                 return Ok(n);
             }
-            // No input available, check serial port for input (for -serial stdio)
+            // No complete line available (canonical mode) or no data at all
+            // Check serial port for input (for -serial stdio)
             if let Some(c) = crate::serial::read_byte_nonblocking() {
-                // Echo to output
+                crate::serial::write_str("[TTY_READ] serial char: ");
+                crate::serial::write_dec(c as u64);
+                crate::serial::write_str("\n");
                 self.put_char_raw(c);
-                // Add to input buffer
                 self.push_input(c);
                 continue;
             }
-            // No input available, wait for interrupt
+            // No input available, enable interrupts briefly to allow timer/serial interrupts
+            wait_count += 1;
+            if wait_count % 100000 == 0 {
+                crate::serial::write_str("[TTY_READ] waiting...\n");
+            }
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nostack, preserves_flags));
+                core::arch::asm!("sti; pause; cli", options(nostack, preserves_flags));
             }
         }
     }
