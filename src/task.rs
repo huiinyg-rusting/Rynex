@@ -1,18 +1,27 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 use crate::memory::buddy::PAGE_SIZE;
 use crate::paging::PageTableManager;
 use crate::paging::PAGE_SIZE_4K;
 use crate::serial;
 
+// Export for assembly access
+#[no_mangle]
+pub static mut CURRENT_TASK_ID: u64 = 0;
+#[no_mangle]
+pub static mut TASKS_PTR: *mut Task = core::ptr::null_mut();
+
 pub const MAX_TASKS: usize = 64;
-pub const KERNEL_STACK_PAGES: usize = 2;
+pub const KERNEL_STACK_PAGES: usize = 8;
 pub const USER_STACK_PAGES: usize = 8;
 pub const IRQ_BASE: u8 = 0x30;
 pub const TIMER_IRQ_VECTOR: u8 = IRQ_BASE + 0;
 
 // Virtual address for the user TLS/TCB page (one page below user stack)
 pub const USER_TLS_VADDR: u64 = 0x0000_7FFF_FFFF_A000;
+
+// 设为 true 显示调试信息，false 隐藏
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub const KERNEL_CODE_SELECTOR: u64 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u64 = 0x10;
@@ -41,8 +50,10 @@ fn initial_time_slice(prio: u8) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn debug_print_hex(val: u64) {
-    serial::write_str(".");
-    serial::write_hex(val);
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str(".");
+        serial::write_hex(val);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,16 +376,18 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
 
     enqueue_task(tid, task.prio);
 
-    serial::write_str("TASK: created kernel task ");
-    serial::write_dec(tid);
-    serial::write_str(" nice=");
-    if nice < 0 {
-        serial::write_char('-');
-        serial::write_dec((-nice) as u64);
-    } else {
-        serial::write_dec(nice as u64);
-    }
-    serial::write_str("\n");
+if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            serial::write_str("TASK: created kernel task ");
+            serial::write_dec(tid);
+            serial::write_str(" nice=");
+            if nice < 0 {
+                serial::write_char('-');
+                serial::write_dec((-nice) as u64);
+            } else {
+                serial::write_dec(nice as u64);
+            }
+            serial::write_str("\n");
+        }
     Some(tid)
 }
 
@@ -407,15 +420,17 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.state = TaskState::Ready;
     task.regs = Registers::new_user(entry, user_stack_top);
     task.regs.fs_base = USER_TLS_VADDR;
-    serial::write_str("USER_TASK[");
-    serial::write_dec(tid);
-    serial::write_str("].cs=0x");
-    serial::write_hex(task.regs.cs);
-    serial::write_str(" ss=0x");
-    serial::write_hex(task.regs.ss);
-    serial::write_str(" entry=0x");
-    serial::write_hex(entry);
-    serial::write_str("\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("USER_TASK[");
+        serial::write_dec(tid);
+        serial::write_str("].cs=0x");
+        serial::write_hex(task.regs.cs);
+        serial::write_str(" ss=0x");
+        serial::write_hex(task.regs.ss);
+        serial::write_str(" entry=0x");
+        serial::write_hex(entry);
+        serial::write_str("\n");
+    }
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
@@ -425,25 +440,36 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.time_slice = initial_time_slice(task.prio);
     task.parent = Some(current_task_id());
 
+    // Set up stdin/stdout/stderr to /dev/console
+    if let Some(console_idx) = crate::vfs::find_inode(b"/dev/console") {
+        crate::vfs::alloc_fd_for_task(tid, console_idx, 0); // fd 0 O_RDONLY
+        crate::vfs::alloc_fd_for_task(tid, console_idx, 1); // fd 1 O_WRONLY
+        crate::vfs::alloc_fd_for_task(tid, console_idx, 1); // fd 2 O_WRONLY
+    }
+
     enqueue_task(tid, task.prio);
 
-    serial::write_str("TASK: created user task ");
-    serial::write_dec(tid);
-    serial::write_str(" nice=");
-    if nice < 0 {
-        serial::write_char('-');
-        serial::write_dec((-nice) as u64);
-    } else {
-        serial::write_dec(nice as u64);
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("TASK: created user task ");
+        serial::write_dec(tid);
+        serial::write_str(" nice=");
+        if nice < 0 {
+            serial::write_char('-');
+            serial::write_dec((-nice) as u64);
+        } else {
+            serial::write_dec(nice as u64);
+        }
+        serial::write_str("\n");
     }
-    serial::write_str("\n");
     Some(tid)
 }
 
 // ── Scheduler core ───────────────────────────────────────────────
 
 pub fn init_scheduler() {
-    serial::write_str("SCHED: initialized (priority runqueue)\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            serial::write_str("SCHED: initialized (priority runqueue)\n");
+        }
 }
 
 pub fn schedule() {
@@ -491,7 +517,7 @@ pub fn schedule() {
     let new_idx = task_idx(next_id);
 
     let sc = SWITCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if sc % 1000 == 0 {
+    if sc % 1000 == 0 && DEBUG_ENABLED.load(Ordering::Relaxed) {
         crate::serial::write_str("SW#");
         crate::serial::write_dec(sc);
         crate::serial::write_str("\n");
@@ -898,6 +924,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
         CURRENT_TASK.store(next_id, Ordering::SeqCst);
+        unsafe { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
         crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack);
         build_kernel_preempt_frame(TASKS[new_idx].kernel_stack, &raw const TASKS[new_idx])
@@ -1091,7 +1118,7 @@ pub extern "C" fn syscall_handler(
 ) -> i64 {
     static SC_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let scn = SC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if scn < 30 {
+    if scn < 30 && DEBUG_ENABLED.load(Ordering::Relaxed) {
         let id = CURRENT_TASK.load(Ordering::SeqCst);
         if id != 0 {
             let cr3 = unsafe { TASKS[task_idx(id)].pml4 };
@@ -1246,41 +1273,32 @@ fn sys_exit(status: i32) -> i64 {
 }
 
 fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
-    if fd == 1 || fd == 2 {
-        if buf.is_null() || count == 0 { return 0; }
+    if buf.is_null() || count == 0 { return 0; }
+    let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+        Some(f) => f,
+        None => return -EBADF,
+    };
+    // Pipe write end?
+    if inode_fd.inode_idx == crate::vfs::MAX_INODES - 2 {
         let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-        for &c in slice {
-            if c == 0 { break; }
-            serial::write_char(c as char);
+        unsafe {
+            for &c in slice {
+                if c == 0 { break; }
+                if PIPE_WPOS < 4096 {
+                    PIPE_BUF[PIPE_WPOS] = c;
+                    PIPE_WPOS += 1;
+                }
+            }
         }
-        count as i64
+        slice.len() as i64
     } else {
-        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
-            Some(f) => f,
-            None => return -EBADF,
-        };
-        // Pipe write end?
-        if inode_fd.inode_idx == crate::vfs::MAX_INODES - 2 {
-            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-            unsafe {
-                for &c in slice {
-                    if c == 0 { break; }
-                    if PIPE_WPOS < 4096 {
-                        PIPE_BUF[PIPE_WPOS] = c;
-                        PIPE_WPOS += 1;
-                    }
-                }
+        let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+        match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
+            Some(n) => {
+                inode_fd.pos += n;
+                n as i64
             }
-            slice.len() as i64
-        } else {
-            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-            match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
-                Some(n) => {
-                    inode_fd.pos += n;
-                    n as i64
-                }
-                None => -EIO,
-            }
+            None => -EIO,
         }
     }
 }
@@ -1353,7 +1371,7 @@ fn sys_futex(uaddr: *const u32, op: i32, val: u32,
     }
 }
 
-fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
+pub fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
     let actual = unsafe { core::ptr::read_volatile(uaddr) };
     if actual != val {
         return -EAGAIN;
@@ -1602,72 +1620,43 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 }
 
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
-    if fd == 0 {
-        if buf.is_null() || count == 0 { return 0; }
-        // Blocking read from the serial console. Interrupts stay disabled for
-        // the duration so a PIT tick cannot preempt mid-syscall (the kernel's
-        // kernel->kernel preempt resume is unreliable for user tasks caught
-        // inside a syscall on the shared syscall_stack). Poll the UART
-        // directly instead of relying on the timer-fed keyboard ring. Note:
-        // syscall_entry already cli'd on the way in, and IF is restored from
-        // the user RFLAGS by sysretq, so we must NOT sti here -- re-enabling
-        // interrupts during the syscall return path (while RSP is a user
-        // address) lets a PIT tick clobber the user stack.
+    if buf.is_null() || count == 0 { return 0; }
+    let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+        Some(f) => f,
+        None => return -EBADF,
+    };
+    // Pipe read end?
+    if inode_fd.inode_idx == crate::vfs::MAX_INODES - 1 {
         unsafe {
             let mut written = 0usize;
             loop {
-                match crate::serial::read_byte_nonblocking() {
-                    Some(c) => {
-                        unsafe { *buf.add(written) = c; }
-                        written += 1;
-                        if written >= count { break; }
-                    }
-                    None => {
-                        if written > 0 { break; }
-                        core::arch::asm!("pause", options(nostack, nomem));
+                if PIPE_RPOS < PIPE_WPOS {
+                    let avail = PIPE_WPOS - PIPE_RPOS;
+                    let to_read = core::cmp::min(count - written, avail);
+                    core::ptr::copy_nonoverlapping(PIPE_BUF.as_ptr().add(PIPE_RPOS), buf.add(written), to_read);
+                    PIPE_RPOS += to_read;
+                    written += to_read;
+                    if written > 0 {
+                        if PIPE_RPOS == PIPE_WPOS { PIPE_RPOS = 0; PIPE_WPOS = 0; }
+                        return written as i64;
                     }
                 }
+                // No data - block
+                let addr = &raw mut PIPE_BUF as u64;
+                let idx = task_idx(current_task_id());
+                TASKS[idx].blocked_on = addr;
+                TASKS[idx].state = TaskState::Blocked;
+                schedule();
             }
-            return written as i64;
         }
     } else {
-        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
-            Some(f) => f,
-            None => return -EBADF,
-        };
-        // Pipe read end?
-        if inode_fd.inode_idx == crate::vfs::MAX_INODES - 1 {
-            unsafe {
-                let mut written = 0usize;
-                loop {
-                    if PIPE_RPOS < PIPE_WPOS {
-                        let avail = PIPE_WPOS - PIPE_RPOS;
-                        let to_read = core::cmp::min(count - written, avail);
-                        core::ptr::copy_nonoverlapping(PIPE_BUF.as_ptr().add(PIPE_RPOS), buf.add(written), to_read);
-                        PIPE_RPOS += to_read;
-                        written += to_read;
-                        if written > 0 {
-                            if PIPE_RPOS == PIPE_WPOS { PIPE_RPOS = 0; PIPE_WPOS = 0; }
-                            return written as i64;
-                        }
-                    }
-                    // No data - block
-                    let addr = &raw mut PIPE_BUF as u64;
-                    let idx = task_idx(current_task_id());
-                    TASKS[idx].blocked_on = addr;
-                    TASKS[idx].state = TaskState::Blocked;
-                    schedule();
-                }
+        let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
+        match crate::vfs::inode_read(inode_fd.inode_idx, inode_fd.pos, slice) {
+            Some(n) => {
+                inode_fd.pos += n;
+                n as i64
             }
-        } else {
-            let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-            match crate::vfs::inode_read(inode_fd.inode_idx, inode_fd.pos, slice) {
-                Some(n) => {
-                    inode_fd.pos += n;
-                    n as i64
-                }
-                None => -EIO,
-            }
+            None => -EIO,
         }
     }
 }
@@ -1779,17 +1768,19 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
 
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    serial::write_str("MMAP addr=0x");
-    serial::write_hex(addr as u64);
-    serial::write_str(" len=0x");
-    serial::write_hex(length as u64);
-    serial::write_str(" prot=0x");
-    serial::write_hex(prot as u64);
-    serial::write_str(" flags=0x");
-    serial::write_hex(flags as u64);
-    serial::write_str(" fd=");
-    serial::write_dec(fd as u64);
-    serial::write_str("\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("MMAP addr=0x");
+        serial::write_hex(addr as u64);
+        serial::write_str(" len=0x");
+        serial::write_hex(length as u64);
+        serial::write_str(" prot=0x");
+        serial::write_hex(prot as u64);
+        serial::write_str(" flags=0x");
+        serial::write_hex(flags as u64);
+        serial::write_str(" fd=");
+        serial::write_dec(fd as u64);
+        serial::write_str("\n");
+    }
     // Dump musl reclaim/VMA-tracking struct (app.5 @ libc 0x100000EB940)
     {
         let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
@@ -1801,35 +1792,39 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
             let count = unsafe { core::ptr::read_volatile((app_p + 0x30) as *const u32) } as u32;
             let c_lo = rd(0x120);
             let c_hi = rd(0x128);
-            crate::serial::write_str("  APP base=0x");
-            crate::serial::write_hex(base);
-            crate::serial::write_str(" vlist=0x");
-            crate::serial::write_hex(vlist);
-            crate::serial::write_str(" cnt=");
-            crate::serial::write_dec(count as u64);
-            crate::serial::write_str(" clamp=0x");
-            crate::serial::write_hex(c_lo);
-            crate::serial::write_str("-0x");
-            crate::serial::write_hex(c_hi);
-            crate::serial::write_str("\n");
-            for vi in 0..count.min(8) as u64 {
-                let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
-                if vp == 0 { continue; }
-                let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
-                let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
-                let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
-                let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
-                crate::serial::write_str("    VMA[");
-                crate::serial::write_dec(vi);
-                crate::serial::write_str("] type=");
-                crate::serial::write_dec(ty as u64);
-                crate::serial::write_str(" fl=0x");
-                crate::serial::write_hex(fl as u64);
-                crate::serial::write_str(" 0x");
-                crate::serial::write_hex(vb);
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                crate::serial::write_str("  APP base=0x");
+                crate::serial::write_hex(base);
+                crate::serial::write_str(" vlist=0x");
+                crate::serial::write_hex(vlist);
+                crate::serial::write_str(" cnt=");
+                crate::serial::write_dec(count as u64);
+                crate::serial::write_str(" clamp=0x");
+                crate::serial::write_hex(c_lo);
                 crate::serial::write_str("-0x");
-                crate::serial::write_hex(vb.wrapping_add(vs));
+                crate::serial::write_hex(c_hi);
                 crate::serial::write_str("\n");
+            }
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                for vi in 0..count.min(8) as u64 {
+                    let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
+                    if vp == 0 { continue; }
+                    let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
+                    let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
+                    let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
+                    let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
+                    crate::serial::write_str("    VMA[");
+                    crate::serial::write_dec(vi);
+                    crate::serial::write_str("] type=");
+                    crate::serial::write_dec(ty as u64);
+                    crate::serial::write_str(" fl=0x");
+                    crate::serial::write_hex(fl as u64);
+                    crate::serial::write_str(" 0x");
+                    crate::serial::write_hex(vb);
+                    crate::serial::write_str("-0x");
+                    crate::serial::write_hex(vb.wrapping_add(vs));
+                    crate::serial::write_str("\n");
+                }
             }
         }
     }
@@ -1838,24 +1833,26 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
     if META_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 25 {
         let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
         let mpage = crate::paging::PageTableManager::resolve_phys(mlog_cr3, 0x500000).unwrap_or(0);
-        crate::serial::write_str("  metapage=0x");
-        crate::serial::write_hex(mpage);
-        crate::serial::write_str(" m: ");        for mk in 0..8u64 {
-            let base = mpage.wrapping_add(0x18 + mk * 0x28);
-            let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
-            let avail: u32 = unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) };
-            let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
-            crate::serial::write_str("[");
-            crate::serial::write_dec(mk);
-            crate::serial::write_str("]=0x");
-            crate::serial::write_hex(mem);
-            crate::serial::write_str("a");
-            crate::serial::write_hex(avail as u64);
-            crate::serial::write_str("s");
-            crate::serial::write_dec((packed >> 6) & 63);
-            crate::serial::write_str(" ");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            crate::serial::write_str("  metapage=0x");
+            crate::serial::write_hex(mpage);
+            crate::serial::write_str(" m: ");        for mk in 0..8u64 {
+                let base = mpage.wrapping_add(0x18 + mk * 0x28);
+                let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
+                let avail: u32 = unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) };
+                let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
+                crate::serial::write_str("[");
+                crate::serial::write_dec(mk);
+                crate::serial::write_str("]=0x");
+                crate::serial::write_hex(mem);
+                crate::serial::write_str("a");
+                crate::serial::write_hex(avail as u64);
+                crate::serial::write_str("s");
+                crate::serial::write_dec((packed >> 6) & 63);
+                crate::serial::write_str(" ");
+            }
+            crate::serial::write_str("\n");
         }
-        crate::serial::write_str("\n");
     }
 
     let page_addr = if addr.is_null() {
@@ -1902,16 +1899,20 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
                 candidate += PAGE_SIZE_4K;
             }
             if !found {
-                serial::write_str("MMAP -> -ENOMEM\n");
+                if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                    serial::write_str("MMAP -> -ENOMEM\n");
+                }
                 return -ENOMEM;
             }
             candidate
         } else {
             page_addr
         };
-        serial::write_str("MMAP -> 0x");
-        serial::write_hex(final_addr);
-        serial::write_str("\n");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            serial::write_str("MMAP -> 0x");
+            serial::write_hex(final_addr);
+            serial::write_str("\n");
+        }
 
         // Register VMA for demand paging
         let mut vma_added = false;
@@ -1925,45 +1926,51 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
             }
         }
         if !vma_added {
-            serial::write_str("MMAP -> -ENOMEM (vma)\n");
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                serial::write_str("MMAP -> -ENOMEM (vma)\n");
+            }
             return -ENOMEM; // Too many VMAs
         }
 
         // Dump meta slots after the mmap completes (before returning to user)
-        if let Some(mpage) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
-            crate::serial::write_str("  POST-MMAP m[0]=0x");
-            let m0: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28) as *const u64) };
-            crate::serial::write_hex(m0);
-            crate::serial::write_str(" m[8]=0x");
-            let m8: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x140) as *const u64) };
-            crate::serial::write_hex(m8);
-            crate::serial::write_str(" m[11]=0x");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            if let Some(mpage) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
+                crate::serial::write_str("  POST-MMAP m[0]=0x");
+                let m0: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28) as *const u64) };
+                crate::serial::write_hex(m0);
+                crate::serial::write_str(" m[8]=0x");
+                let m8: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x140) as *const u64) };
+                crate::serial::write_hex(m8);
+                crate::serial::write_str(" m[11]=0x");
             let m11: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x28 * 11) as *const u64) };
             crate::serial::write_hex(m11);
             crate::serial::write_str("\n");
         }
-        // Dump malloc_context.active[] and usage_by_class[] early
-        if let Some(cphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9B50) {
-            crate::serial::write_str("  CTX-ACTIVE: ");
-            for ck in 0..8usize {
-                let a: u64 = unsafe { core::ptr::read_volatile((cphys + (ck as u64) * 8) as *const u64) };
-                crate::serial::write_dec(ck as u64);
-                crate::serial::write_str("=");
-                crate::serial::write_hex(a);
-                crate::serial::write_str(" ");
-            }
-            crate::serial::write_str("\n");
         }
-        if let Some(uphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9CD0) {
-            crate::serial::write_str("  CTX-USAGE: ");
-            for ck in 0..8usize {
-                let u: u64 = unsafe { core::ptr::read_volatile((uphys + (ck as u64) * 8) as *const u64) };
-                crate::serial::write_dec(ck as u64);
-                crate::serial::write_str("=");
-                crate::serial::write_hex(u);
-                crate::serial::write_str(" ");
+        // Dump malloc_context.active[] and usage_by_class[] early
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            if let Some(cphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9B50) {
+                crate::serial::write_str("  CTX-ACTIVE: ");
+                for ck in 0..8usize {
+                    let a: u64 = unsafe { core::ptr::read_volatile((cphys + (ck as u64) * 8) as *const u64) };
+                    crate::serial::write_dec(ck as u64);
+                    crate::serial::write_str("=");
+                    crate::serial::write_hex(a);
+                    crate::serial::write_str(" ");
+                }
+                crate::serial::write_str("\n");
             }
-            crate::serial::write_str("\n");
+            if let Some(uphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9CD0) {
+                crate::serial::write_str("  CTX-USAGE: ");
+                for ck in 0..8usize {
+                    let u: u64 = unsafe { core::ptr::read_volatile((uphys + (ck as u64) * 8) as *const u64) };
+                    crate::serial::write_dec(ck as u64);
+                    crate::serial::write_str("=");
+                    crate::serial::write_hex(u);
+                    crate::serial::write_str(" ");
+                }
+                crate::serial::write_str("\n");
+            }
         }
         return final_addr as i64;
     }
@@ -1972,15 +1979,17 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
 fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    serial::write_str("MPROT addr=0x");
-    serial::write_hex(addr);
-    serial::write_str(" len=0x");
-    serial::write_hex(len as u64);
-    serial::write_str(" prot=0x");
-    serial::write_hex(prot as u64);
-    serial::write_str("\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("MPROT addr=0x");
+        serial::write_hex(addr);
+        serial::write_str(" len=0x");
+        serial::write_hex(len as u64);
+        serial::write_str(" prot=0x");
+        serial::write_hex(prot as u64);
+        serial::write_str("\n");
+    }
     static MPROT_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if MPROT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3 {
+    if MPROT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3 && DEBUG_ENABLED.load(Ordering::Relaxed) {
         let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
         for (tag, app_va) in [("APP", 0x100000_EB940u64), ("LDSO", 0x100000_EB6A0u64)] {
             if let Some(app_p) = crate::paging::PageTableManager::resolve_phys(mlog_cr3, app_va) {
@@ -2003,42 +2012,46 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
                 crate::serial::write_str("-0x");
                 crate::serial::write_hex(c_hi);
                 crate::serial::write_str("\n");
-                for vi in 0..count.min(10) as u64 {
-                    let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
-                    if vp == 0 { continue; }
-                    let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
-                    let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
-                    let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
-                    let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
-                    crate::serial::write_str("    VMA[");
-                    crate::serial::write_dec(vi);
-                    crate::serial::write_str("] type=");
-                    crate::serial::write_dec(ty as u64);
-                    crate::serial::write_str(" fl=0x");
-                    crate::serial::write_hex(fl as u64);
-                    crate::serial::write_str(" 0x");
-                    crate::serial::write_hex(vb);
-                    crate::serial::write_str("-0x");
-                    crate::serial::write_hex(vb.wrapping_add(vs));
-                    crate::serial::write_str("\n");
+                if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                    for vi in 0..count.min(10) as u64 {
+                        let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
+                        if vp == 0 { continue; }
+                        let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
+                        let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
+                        let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
+                        let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
+                        crate::serial::write_str("    VMA[");
+                        crate::serial::write_dec(vi);
+                        crate::serial::write_str("] type=");
+                        crate::serial::write_dec(ty as u64);
+                        crate::serial::write_str(" fl=0x");
+                        crate::serial::write_hex(fl as u64);
+                        crate::serial::write_str(" 0x");
+                        crate::serial::write_hex(vb);
+                        crate::serial::write_str("-0x");
+                        crate::serial::write_hex(vb.wrapping_add(vs));
+crate::serial::write_str("\n");
+                    }
                 }
             }
         }
         let mpage = crate::paging::PageTableManager::resolve_phys(mlog_cr3, 0x500000).unwrap_or(0);
-        crate::serial::write_str("  META m: ");
-        for mk in 0..14u64 {
-            let base = mpage.wrapping_add(0x18 + mk * 0x28);
-            let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
-            let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
-            crate::serial::write_str("[");
-            crate::serial::write_dec(mk);
-            crate::serial::write_str("]=0x");
-            crate::serial::write_hex(mem);
-            crate::serial::write_str("(");
-            crate::serial::write_hex(packed);
-            crate::serial::write_str(") ");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            crate::serial::write_str("  META m: ");
+            for mk in 0..14u64 {
+                let base = mpage.wrapping_add(0x18 + mk * 0x28);
+                let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
+                let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
+                crate::serial::write_str("[");
+                crate::serial::write_dec(mk);
+                crate::serial::write_str("]=0x");
+                crate::serial::write_hex(mem);
+                crate::serial::write_str("(");
+                crate::serial::write_hex(packed);
+                crate::serial::write_str(") ");
+            }
+            crate::serial::write_str("\n");
         }
-        crate::serial::write_str("\n");
     }
     unsafe {
         let idx = task_idx(id);
@@ -2930,7 +2943,7 @@ fn sys_uname(buf: *mut u8) -> i64 {
 
 // ── Ioctl ──────────────────────────────────────────────────────────
 
-fn sys_ioctl(_fd: u32, request: u64, _arg3: u64) -> i64 {
+fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
@@ -2938,25 +2951,83 @@ fn sys_ioctl(_fd: u32, request: u64, _arg3: u64) -> i64 {
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCGPGRP: u64 = 0x540F;
-    // No fd in this kernel is a real TTY, so every terminal ioctl must fail
-    // with ENOTTY. Otherwise isatty() lies and shells enter interactive/job
-    // control mode, where they block forever waiting for input that never
-    // arrives through the serial console.
-    match request {
-        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSPGRP | TIOCGPGRP => ENOTTY,
-        _ => ENOTTY,
+
+    // For fd 0,1,2 (stdin, stdout, stderr), handle essential TTY ioctls directly
+    // to ensure isatty() works and shells can enter interactive mode.
+    if fd <= 2 {
+        match request {
+            TCGETS => {
+                if arg3 != 0 {
+                    let termios = [0u8; 60];
+                    unsafe { core::ptr::copy_nonoverlapping(termios.as_ptr(), arg3 as *mut u8, 60); }
+                }
+                return 0;
+            }
+            TIOCGWINSZ => {
+                if arg3 != 0 {
+                    let winsz = [0u16; 4];
+                    unsafe { core::ptr::copy_nonoverlapping(winsz.as_ptr(), arg3 as *mut u16, 4); }
+                }
+                return 0;
+            }
+            TCSETS | TCSETSW | TCSETSF | TIOCSPGRP | TIOCGPGRP => return 0,
+            _ => {}
+        }
     }
+
+    // For all other fds (including /dev/tty opened by shell), use VFS
+    let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+        Some(f) => f,
+        None => return -EBADF,
+    };
+
+    crate::serial::write_str("[SYS_IOCTL] fd=");
+    crate::serial::write_dec(fd as u64);
+    crate::serial::write_str(" request=0x");
+    crate::serial::write_hex(request);
+    crate::serial::write_str("\n");
+
+    // Use VFS ioctl
+    let mut msg = crate::vfs_core::VfsMessage::new();
+    msg.op = crate::vfs_core::VfsOp::Ioctl;
+    msg.extra1 = inode_fd.inode_idx as u64;
+    msg.offset = request;
+    msg.data = arg3 as *mut u8;
+    msg.data_len = 0;
+    crate::vfs_core::dispatch(&mut msg);
+    msg.result
 }
 
 // ── Fcntl ──────────────────────────────────────────────────────────
 
-fn sys_fcntl(fd: u32, cmd: i32, _arg: u64) -> i64 {
+fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
     match cmd {
         0 => sys_dup2(fd, fd),
         1 => 0,  // F_GETFD
         2 => 0,  // F_SETFD
         3 => 2,  // F_GETFL → return O_RDWR (2)
         4 => 0,  // F_SETFL
+        1030 => { // F_DUPFD_CLOEXEC
+            // Find lowest available fd >= arg
+            let table = match crate::vfs::get_fd_table() {
+                Some(t) => t,
+                None => return -EBADF,
+            };
+            let start_fd = arg as usize;
+            for newfd in start_fd..crate::vfs::MAX_FDS_PER_TASK {
+                if !table[newfd].used {
+                    unsafe {
+                        if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
+                            return -EBADF;
+                        }
+                        table[newfd] = table[fd as usize];
+                        table[newfd].pos = 0;
+                    }
+                    return newfd as i64;
+                }
+            }
+            -EMFILE
+        }
         _ => -EINVAL,
     }
 }
@@ -3246,11 +3317,13 @@ pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
                 if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
                     return false;
                 }
+                if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 crate::serial::write_str("  DMD: allocated page for 0x");
                 crate::serial::write_hex(page_addr);
                 crate::serial::write_str(" phys=0x");
                 crate::serial::write_hex(phys);
                 crate::serial::write_str("\n");
+            }
                 return true;
             }
         }
@@ -3322,6 +3395,55 @@ fn sys_getrandom(buf: *mut u8, len: usize, _flags: u32) -> i64 {
 pub fn test() {
     unsafe { core::arch::asm!("cli"); }
 
+    // Initialize TTY devices FIRST (before creating any user tasks)
+    crate::tty::init();
+    let _ = crate::vfs_core::mkdir(b"/dev", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
+    if crate::vfs::find_inode(b"/dev/console").is_none() {
+        let vn_id = crate::vfs_core::vnode_alloc(1, 0, 0, &crate::tty::TTY_DEVICE);
+        if let Some(vn_id) = vn_id {
+            crate::vfs_core::create(b"/dev/console", crate::vfs_core::types::S_IFCHR | 0o666).ok();
+            crate::vfs::create_file(b"/dev/console", b"");
+            if let Some(idx) = crate::vfs::find_inode(b"/dev/console") {
+                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
+            }
+            serial::write_str("VFS: created '/dev/console' (char device)\n");
+        }
+    }
+    if crate::vfs::find_inode(b"/dev/tty").is_none() {
+        let vn_id = crate::vfs_core::vnode_alloc(2, 0, 0, &crate::tty::TTY_DEVICE);
+        if let Some(vn_id) = vn_id {
+            crate::vfs_core::create(b"/dev/tty", crate::vfs_core::types::S_IFCHR | 0o666).ok();
+            crate::vfs::create_file(b"/dev/tty", b"");
+            if let Some(idx) = crate::vfs::find_inode(b"/dev/tty") {
+                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
+            }
+            serial::write_str("VFS: created '/dev/tty' (char device)\n");
+        }
+    }
+    if crate::vfs::find_inode(b"/dev/tty0").is_none() {
+        let vn_id = crate::vfs_core::vnode_alloc(3, 0, 0, &crate::tty::TTY_DEVICE);
+        if let Some(vn_id) = vn_id {
+            crate::vfs_core::create(b"/dev/tty0", crate::vfs_core::types::S_IFCHR | 0o666).ok();
+            crate::vfs::create_file(b"/dev/tty0", b"");
+            if let Some(idx) = crate::vfs::find_inode(b"/dev/tty0") {
+                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
+            }
+            serial::write_str("VFS: created '/dev/tty0' (char device)\n");
+        }
+    }
+    if crate::vfs::find_inode(b"/dev/null").is_none() {
+        crate::vfs::create_file(b"/dev/null", b"");
+        serial::write_str("VFS: created '/dev/null'\n");
+    }
+
+    // Create minimal /etc/passwd for busybox ash
+    if crate::vfs::find_inode(b"/etc/passwd").is_none() {
+        let _ = crate::vfs_core::mkdir(b"/etc", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
+        let passwd_content = b"root:x:0:0:root:/root:/bin/ash\n";
+        crate::vfs::create_file(b"/etc/passwd", passwd_content);
+        serial::write_str("VFS: created '/etc/passwd'\n");
+    }
+
     // Load user ELF modules from multiboot2
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     let mut init_tid = 0u64;
@@ -3376,14 +3498,6 @@ pub fn test() {
         }
     }
 
-    // Create /dev/null for musl __init_libc
-    if crate::vfs::find_inode(b"/dev/null").is_none() {
-        let _ = crate::vfs_core::mkdir(b"/dev", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
-        // Use the flat VFS to create an empty file
-        crate::vfs::create_file(b"/dev/null", b"");
-        serial::write_str("VFS: created '/dev/null'\n");
-    }
-
     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
     task0.state = TaskState::Running;
@@ -3394,6 +3508,7 @@ pub fn test() {
     task0.normal_prio = task0.static_prio;
     task0.prio = task0.static_prio;
     CURRENT_TASK.store(0, Ordering::SeqCst);
+    unsafe { CURRENT_TASK_ID = 0; TASKS_PTR = TASKS.as_mut_ptr(); }
 
     unsafe {
         core::arch::asm!("mov rsp, {}", in(reg) task0.kernel_stack);
@@ -3409,6 +3524,7 @@ pub fn test() {
     let new_task = unsafe { &mut TASKS[task_idx(init_tid)] };
     new_task.state = TaskState::Running;
     CURRENT_TASK.store(init_tid, Ordering::SeqCst);
+    unsafe { CURRENT_TASK_ID = init_tid; }
 
     unsafe { crate::gdt::set_tss_rsp0(new_task.kernel_stack); }
     pt_mgr().switch_to(new_task.pml4);

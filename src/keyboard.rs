@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 const KEYBOARD_DATA: u16 = 0x60;
 const KEYBOARD_STATUS: u16 = 0x64;
@@ -10,10 +10,16 @@ static mut RING_HEAD: usize = 0;
 static mut RING_TAIL: usize = 0;
 pub static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
 
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
 fn inb(port: u16) -> u8 {
     let val: u8;
     unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nostack, preserves_flags)); }
     val
+}
+
+fn outb(port: u16, val: u8) {
+    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags)); }
 }
 
 // Simple US keyboard layout: scancode set 1
@@ -82,6 +88,8 @@ pub fn push_char(c: u8) {
         }
     }
     KEY_COUNT.fetch_add(1, Ordering::SeqCst);
+    // Also push to TTY device for /dev/tty, /dev/console
+    crate::tty::push_key(c);
     // Wake up any task blocked on stdin
     let addr = &raw const RING_BUF as u64;
     crate::task::futex_wake(addr as *const u32, 1);
@@ -161,11 +169,74 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
 }
 
 pub fn init() {
-    crate::serial::write_str("KBD: init\n");
-    // Clear stale scancodes left by keyboard controller initialization
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        crate::serial::write_str("KBD: init\n");
+    }
     unsafe {
+        // Wait for input buffer to be empty
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        // Disable keyboard (command 0xAD)
+        outb(KEYBOARD_STATUS, 0xAD);
+        // Flush output buffer
+        while inb(KEYBOARD_STATUS) & 0x01 != 0 {
+            let _ = inb(KEYBOARD_DATA);
+        }
+        // Set command byte: enable IRQ1 (bit 0), translation (bit 6)
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        outb(KEYBOARD_STATUS, 0x20); // Read command byte
+        while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        let mut cmd = inb(KEYBOARD_DATA);
+        cmd |= 0x01; // Enable IRQ1
+        cmd |= 0x40; // Translation
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        outb(KEYBOARD_STATUS, 0x60); // Write command byte
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        outb(KEYBOARD_DATA, cmd);
+        // Enable keyboard (command 0xAE)
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        outb(KEYBOARD_STATUS, 0xAE);
+        // Reset keyboard (command 0xFF)
+        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+            core::arch::asm!("pause", options(nostack, nomem));
+        }
+        outb(KEYBOARD_DATA, 0xFF);
+        // Wait for ACK (0xFA) and BAT completion (0xAA)
+        loop {
+            while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+                core::arch::asm!("pause", options(nostack, nomem));
+            }
+            let resp = inb(KEYBOARD_DATA);
+            if resp == 0xFA { break; } // ACK
+        }
+        loop {
+            while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+                core::arch::asm!("pause", options(nostack, nomem));
+            }
+            let resp = inb(KEYBOARD_DATA);
+            if resp == 0xAA { break; } // BAT success
+        }
+        // Flush any remaining
+        while inb(KEYBOARD_STATUS) & 0x01 != 0 {
+            let _ = inb(KEYBOARD_DATA);
+        }
+
         RING_HEAD = 0;
         RING_TAIL = 0;
     }
     KEY_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        crate::serial::write_str("KBD: OK\n");
+    }
 }

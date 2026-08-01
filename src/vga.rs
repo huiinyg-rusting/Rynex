@@ -5,6 +5,10 @@ const HEIGHT: usize = 25;
 static mut COL: usize = 0;
 static mut ROW: usize = 0;
 
+pub fn write_char(c: char) {
+    put_char(c as u8);
+}
+
 pub fn clear() {
     for y in 0..HEIGHT {
         for x in 0..WIDTH {

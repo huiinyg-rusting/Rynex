@@ -1,11 +1,14 @@
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 pub const PAGE_SIZE_4K: u64 = 4096;
 pub const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
 pub const PAGE_SIZE_1G: u64 = 1024 * 1024 * 1024;
 
 pub const PTE_PRESENT: u64 = 1 << 0;
+
+// 调试开关
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 pub const PTE_WRITABLE: u64 = 1 << 1;
 pub const PTE_USER: u64 = 1 << 2;
 pub const PTE_WRITE_THROUGH: u64 = 1 << 3;
@@ -679,9 +682,11 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     // Reserve old meta phys page so buddy never reuses it
     if virt == 0x500000 {
         alloc.reserve(old_phys);
-        crate::serial::write_str("  COW: reserved old meta phys=0x");
-        crate::serial::write_hex(old_phys);
-        crate::serial::write_str("\n");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            crate::serial::write_str("  COW: reserved old meta phys=0x");
+            crate::serial::write_hex(old_phys);
+            crate::serial::write_str("\n");
+        }
     }
 
     let new_phys = match alloc.alloc(0) {
@@ -701,9 +706,11 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     // Reserve meta-area phys page so buddy never reuses it
     if virt == 0x500000 {
         alloc.reserve(new_phys);
-        crate::serial::write_str("  COW: reserved meta phys=0x");
-        crate::serial::write_hex(new_phys);
-        crate::serial::write_str("\n");
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            crate::serial::write_str("  COW: reserved meta phys=0x");
+            crate::serial::write_hex(new_phys);
+            crate::serial::write_str("\n");
+        }
     }
 
     // Update PTE: new phys + writable
@@ -730,9 +737,11 @@ pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
     // since CR0.WP=1 prevents kernel writes to read-only pages too)
     if is_write && is_present {
         if cow_remap_in(task_pml4, cr2) {
-            crate::serial::write_str("  COW: copied page for 0x");
-            crate::serial::write_hex(cr2);
-            crate::serial::write_str("\n");
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                crate::serial::write_str("  COW: copied page for 0x");
+                crate::serial::write_hex(cr2);
+                crate::serial::write_str("\n");
+            }
             return true;
         }
     }

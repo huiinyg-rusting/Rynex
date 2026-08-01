@@ -25,10 +25,13 @@ mod spinlock;
 mod vfs_core;
 mod vfs;
 mod keyboard;
+mod tty;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     fn syscall_entry();
@@ -43,7 +46,9 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     MULTIBOOT_INFO.store(_info as u64, Ordering::SeqCst);
 
     serial::init();
-    serial::write_str("Niobix v0.1.0\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("Niobix v0.1.0\n");
+    }
     vga::clear();
 
     vga::write_str("Niobix v0.1.0\n");
@@ -51,28 +56,39 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
 
     gdt::init();
     vga::write_str("GDT: OK\n");
-    serial::write_str("GDT: OK\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("GDT: OK\n");
+    }
 
     idt::init();
     vga::write_str("IDT: OK\n");
-    serial::write_str("IDT: OK\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("IDT: OK\n");
+    }
 
     pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
     pic::mask_all();
     pic::unmask(0);
     pic::unmask(1);
     vga::write_str("PIC: OK\n");
-    serial::write_str("PIC: OK\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("PIC: OK\n");
+    }
 
-    pit::init(100);
-    vga::write_str("PIT: OK\n");
-    serial::write_str("PIT: OK\n");
-
+    // Initialize keyboard BEFORE timer so UART input during boot isn't lost
     keyboard::init();
     let kbd_vec = pic::IRQ_BASE + 1;
     idt::register_irq(kbd_vec, keyboard::keyboard_interrupt_handler as u64);
     vga::write_str("KBD: OK\n");
-    serial::write_str("KBD: OK\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("KBD: OK\n");
+    }
+
+    pit::init(100);
+    vga::write_str("PIT: OK\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("PIT: OK\n");
+    };
 
 memory::init(_info);
     // Enable SSE (required by libc/musl which uses SSE instructions)
@@ -169,9 +185,11 @@ memory::init(_info);
     vga::write_str("MEM: ");
     vga::write_dec(pages / 256);
     vga::write_str(" MB\n");
-    serial::write_str("MEM: ");
-    serial::write_dec(pages / 256);
-    serial::write_str(" MB\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("MEM: ");
+        serial::write_dec(pages / 256);
+        serial::write_str(" MB\n");
+    }
 
     vfs_core::ramfs::init();
     vfs_core::init();
@@ -181,7 +199,9 @@ memory::init(_info);
     task::test();
 
     vga::write_str("\nSystem halted.\n");
-    serial::write_str("System halted.\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("System halted.\n");
+    }
 
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }

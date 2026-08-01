@@ -439,6 +439,10 @@ impl VnodeOps for RamFs {
         inode.size = size;
         Ok(())
     }
+
+    fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> {
+        Err("ENOTTY")
+    }
 }
 
 pub static RAMFS: RamFs = RamFs;

@@ -88,6 +88,7 @@ pub trait VnodeOps: Sync {
     fn setxattr(&self, ino: u64, name: &[u8], value: &[u8]) -> Result<(), &'static str>;
     fn listxattr(&self, ino: u64, buf: &mut [u8]) -> Result<usize, &'static str>;
     fn truncate(&self, ino: u64, size: u64) -> Result<(), &'static str>;
+    fn ioctl(&self, ino: u64, request: u64, arg: u64) -> Result<usize, &'static str>;
 }
 
 #[derive(Clone, Copy)]
@@ -124,12 +125,13 @@ impl VnodeOps for NopVnode {
     fn stat(&self, _ino: u64) -> Result<Stat, &'static str> { Err("no fs") }
     fn readlink(&self, _ino: u64) -> Result<&[u8], &'static str> { Err("no fs") }
     fn symlink(&self, _parent_ino: u64, _name: &[u8], _target: &[u8]) -> Result<u64, &'static str> { Err("no fs") }
-    fn rename(&self, _op: u64, _on: &[u8], _np: u64, _nn: &[u8]) -> Result<(), &'static str> { Err("no fs") }
+    fn rename(&self, _old_parent: u64, _old_name: &[u8], _new_parent: u64, _new_name: &[u8]) -> Result<(), &'static str> { Err("no fs") }
     fn setattr(&self, _ino: u64, _attr: &Attr) -> Result<(), &'static str> { Err("no fs") }
     fn getxattr(&self, _ino: u64, _name: &[u8], _value: &mut [u8]) -> Result<usize, &'static str> { Err("no fs") }
     fn setxattr(&self, _ino: u64, _name: &[u8], _value: &[u8]) -> Result<(), &'static str> { Err("no fs") }
     fn listxattr(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, &'static str> { Err("no fs") }
     fn truncate(&self, _ino: u64, _size: u64) -> Result<(), &'static str> { Err("no fs") }
+    fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> { Err("ENOTTY") }
 }
 
 pub static NOP_VNODE: NopVnode = NopVnode;
@@ -734,6 +736,16 @@ pub fn dispatch(msg: &mut VfsMessage) -> i64 {
             };
             match vnode.ops.truncate(vnode.ino, msg.offset) {
                 Ok(()) => msg.result = 0,
+                Err(_) => msg.result = -1,
+            }
+        }
+        VfsOp::Ioctl => {
+            let vnode = match vnode_get(msg.extra1 as u16) {
+                Some(v) => v,
+                None => { msg.result = -1; return -1; }
+            };
+            match vnode.ops.ioctl(vnode.ino, msg.offset, msg.data as u64) {
+                Ok(n) => msg.result = n as i64,
                 Err(_) => msg.result = -1,
             }
         }
