@@ -101,7 +101,7 @@ pub struct Vma {
     pub flags: u64,
 }
 
-pub const MAX_VMAS: usize = 16;
+pub const MAX_VMAS: usize = 4096;
 
 #[derive(Copy, Clone)]
 pub struct Task {
@@ -1604,22 +1604,32 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if fd == 0 {
         if buf.is_null() || count == 0 { return 0; }
-        let mut written = 0usize;
-        // Non-blocking read from serial
-        while written < count {
-            match crate::serial::read_byte_nonblocking() {
-                Some(c) => {
-                    unsafe { *buf.add(written) = c; }
-                    written += 1;
-                    if c == b'\n' || c == b'\r' { break; }
-                }
-                None => {
-                    if written > 0 { return written as i64; }
-                    return 0; // No data available
+        // Blocking read from the serial console. Interrupts stay disabled for
+        // the duration so a PIT tick cannot preempt mid-syscall (the kernel's
+        // kernel->kernel preempt resume is unreliable for user tasks caught
+        // inside a syscall on the shared syscall_stack). Poll the UART
+        // directly instead of relying on the timer-fed keyboard ring. Note:
+        // syscall_entry already cli'd on the way in, and IF is restored from
+        // the user RFLAGS by sysretq, so we must NOT sti here -- re-enabling
+        // interrupts during the syscall return path (while RSP is a user
+        // address) lets a PIT tick clobber the user stack.
+        unsafe {
+            let mut written = 0usize;
+            loop {
+                match crate::serial::read_byte_nonblocking() {
+                    Some(c) => {
+                        unsafe { *buf.add(written) = c; }
+                        written += 1;
+                        if written >= count { break; }
+                    }
+                    None => {
+                        if written > 0 { break; }
+                        core::arch::asm!("pause", options(nostack, nomem));
+                    }
                 }
             }
+            return written as i64;
         }
-        return written as i64;
     } else {
         let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
             Some(f) => f,
@@ -2920,7 +2930,7 @@ fn sys_uname(buf: *mut u8) -> i64 {
 
 // ── Ioctl ──────────────────────────────────────────────────────────
 
-fn sys_ioctl(_fd: u32, request: u64, arg3: u64) -> i64 {
+fn sys_ioctl(_fd: u32, request: u64, _arg3: u64) -> i64 {
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
@@ -2928,51 +2938,13 @@ fn sys_ioctl(_fd: u32, request: u64, arg3: u64) -> i64 {
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSPGRP: u64 = 0x5410;
     const TIOCGPGRP: u64 = 0x540F;
+    // No fd in this kernel is a real TTY, so every terminal ioctl must fail
+    // with ENOTTY. Otherwise isatty() lies and shells enter interactive/job
+    // control mode, where they block forever waiting for input that never
+    // arrives through the serial console.
     match request {
-        TCGETS => {
-            let ptr = arg3 as *mut u8;
-            if ptr.is_null() { return -EFAULT; }
-            unsafe {
-                core::ptr::write_volatile(ptr.add(0) as *mut u32, 0x0006);
-                core::ptr::write_volatile(ptr.add(4) as *mut u32, 0x0005);
-                core::ptr::write_volatile(ptr.add(8) as *mut u32, 0x00000BFD);
-                core::ptr::write_volatile(ptr.add(12) as *mut u32, 0x00000CF5);
-                for i in 16..48 { core::ptr::write_volatile(ptr.add(i), 0); }
-                core::ptr::write_volatile(ptr.add(16), 3);
-                core::ptr::write_volatile(ptr.add(17), 28);
-                core::ptr::write_volatile(ptr.add(18), 127);
-                core::ptr::write_volatile(ptr.add(19), 21);
-                core::ptr::write_volatile(ptr.add(20), 4);
-                core::ptr::write_volatile(ptr.add(21), 23);
-                core::ptr::write_volatile(ptr.add(48) as *mut u32, 0x0F);
-                core::ptr::write_volatile(ptr.add(52) as *mut u32, 0x0F);
-            }
-            0
-        }
-        TCSETS | TCSETSW | TCSETSF => 0,
-        TIOCGWINSZ => {
-            let ws = arg3 as *mut u16;
-            if ws.is_null() { return -EFAULT; }
-            unsafe {
-                core::ptr::write_volatile(ws, 25);
-                core::ptr::write_volatile(ws.add(1), 80);
-                core::ptr::write_volatile(ws.add(2), 0);
-                core::ptr::write_volatile(ws.add(3), 0);
-            }
-            0
-        }
-        TIOCSPGRP => 0,
-        TIOCGPGRP => {
-            let pgrp = arg3 as *mut i32;
-            if pgrp.is_null() { return -EFAULT; }
-            let id = current_task_id();
-            unsafe {
-                let idx = task_idx(id);
-                core::ptr::write_volatile(pgrp, TASKS[idx].id as i32);
-            }
-            0
-        }
-        _ => -ENOTTY,
+        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSPGRP | TIOCGPGRP => ENOTTY,
+        _ => ENOTTY,
     }
 }
 

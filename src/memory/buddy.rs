@@ -21,6 +21,50 @@ pub struct BuddyAllocator {
     reserved_count: usize,
 }
 
+const USED_BMP_WORDS: usize = 65536 / 64;
+static mut USED_BMP: [u64; USED_BMP_WORDS] = [0; USED_BMP_WORDS];
+static DOUBLE_ALLOC_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn used_word(page: u64) -> (usize, u64) {
+    ((page as usize) >> 6, 1u64 << ((page as usize) & 63))
+}
+
+fn used_set(page: u64) -> bool {
+    let (w, b) = used_word(page);
+    unsafe { (USED_BMP[w] & b) != 0 }
+}
+
+fn used_mark(page: u64) {
+    let (w, b) = used_word(page);
+    unsafe {
+        let prev = USED_BMP[w] & b;
+        if prev != 0 {
+            let p = (w as u64) * 64 + (b.trailing_zeros() as u64);
+            if DOUBLE_ALLOC_FIRST.compare_exchange(0, p, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+                crate::serial::write_str("BUDDY: DOUBLE-ALLOC page=0x");
+                crate::serial::write_hex(p);
+                crate::serial::write_str("\n");
+            }
+        }
+        USED_BMP[w] |= b;
+    }
+}
+
+fn used_clear(page: u64) {
+    let (w, b) = used_word(page);
+    unsafe {
+        if USED_BMP[w] & b == 0 {
+            let p = (w as u64) * 64 + (b.trailing_zeros() as u64);
+            if DOUBLE_ALLOC_FIRST.compare_exchange(0, p, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+                crate::serial::write_str("BUDDY: DOUBLE-FREE page=0x");
+                crate::serial::write_hex(p);
+                crate::serial::write_str("\n");
+            }
+        }
+        USED_BMP[w] &= !b;
+    }
+}
+
 impl BuddyAllocator {
     pub const fn new() -> Self {
         BuddyAllocator {
@@ -35,6 +79,10 @@ impl BuddyAllocator {
     pub fn init(&mut self, base: u64, pages: u64) {
         self.base = base;
         self.pages = pages;
+    }
+
+    fn page_index(&self, addr: u64) -> u64 {
+        (addr - self.base) / PAGE_SIZE
     }
 
     fn block_size(order: usize) -> u64 {
@@ -102,17 +150,36 @@ impl BuddyAllocator {
         for o in order..=MAX_ORDER {
             let block = self.free_lists[o];
             if !block.is_null() {
-                self.free_lists[o] = unsafe { (*block).next };
                 let addr = block as u64;
+                if self.is_reserved(addr) {
+                    // Skip reserved pages that somehow ended up in free lists
+                    self.free_lists[o] = unsafe { (*block).next };
+                    continue;
+                }
+                let pidx = self.page_index(addr);
+                if used_set(pidx) {
+                    if DOUBLE_ALLOC_FIRST.compare_exchange(0, pidx,
+                        core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+                        crate::serial::write_str("BUDDY: ALLOC-already-used page=0x");
+                        crate::serial::write_hex(addr);
+                        crate::serial::write_str(" idx=");
+                        crate::serial::write_dec(pidx);
+                        crate::serial::write_str("\n");
+                    }
+                }
+                used_mark(pidx);
+                self.free_lists[o] = unsafe { (*block).next };
 
                 for so in (order..o).rev() {
                     let buddy = addr + Self::block_size(so);
-                    unsafe {
-                        let h = &mut *(buddy as *mut Block);
-                        h.magic = MAGIC;
-                        h.order = so as u32;
-                        h.next = self.free_lists[so];
-                        self.free_lists[so] = h;
+                    if !self.is_reserved(buddy) {
+                        unsafe {
+                            let h = &mut *(buddy as *mut Block);
+                            h.magic = MAGIC;
+                            h.order = so as u32;
+                            h.next = self.free_lists[so];
+                            self.free_lists[so] = h;
+                        }
                     }
                 }
 
@@ -126,6 +193,8 @@ impl BuddyAllocator {
         if self.is_reserved(addr) {
             return;
         }
+        let pidx = self.page_index(addr);
+        used_clear(pidx);
         self.free_one(addr, order as u8);
     }
 

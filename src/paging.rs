@@ -118,7 +118,7 @@ impl PageTableManager {
             unsafe { core::ptr::write_bytes(new_pd as *mut u8, 0, 4096); }
             if pdpte & PTE_HUGE != 0 {
                 let gb_base = pdpte & (0xFFFFFFFFFF << 30);
-                let gb_flags = (pdpte & !PTE_ADDR_MASK) | PTE_HUGE;
+                let gb_flags = ((pdpte & !PTE_ADDR_MASK) | PTE_HUGE) & !PTE_USER;
                 let pd_arr = unsafe { &mut *(new_pd as *mut PageTable) };
                 for i in 0..512u64 {
                     pd_arr.0[i as usize] = (gb_base + i * 0x200000) | gb_flags;
@@ -138,7 +138,8 @@ impl PageTableManager {
             // by filling the new PT with the huge page's physical addresses.
             if pde & PTE_HUGE != 0 {
                 let huge_base = pde & (0xFFFFFFFFFF << 21);
-                let huge_flags = pde & 0x7F;
+                // Clear USER so identity sub-pages aren't reachable from user mode.
+                let huge_flags = (pde & 0x7F) & !PTE_USER;
                 let pt_arr = unsafe { &mut *(new_pt as *mut PageTable) };
                 for i in 0..512u64 {
                     pt_arr.0[i as usize] = (huge_base + i * 4096) | huge_flags;
@@ -675,6 +676,14 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     let flags = *pte & !PTE_ADDR_MASK;
 
     let alloc = unsafe { &mut *crate::memory::allocator() };
+    // Reserve old meta phys page so buddy never reuses it
+    if virt == 0x500000 {
+        alloc.reserve(old_phys);
+        crate::serial::write_str("  COW: reserved old meta phys=0x");
+        crate::serial::write_hex(old_phys);
+        crate::serial::write_str("\n");
+    }
+
     let new_phys = match alloc.alloc(0) {
         Some(p) => p,
         None => return false,
