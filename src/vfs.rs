@@ -82,14 +82,21 @@ pub fn init() {
 
 pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
     find_inode(name).or_else(|| {
-        let mode = crate::vfs_core::types::S_IFREG
-            | crate::vfs_core::types::S_IRUSR
-            | crate::vfs_core::types::S_IWUSR
-            | crate::vfs_core::types::S_IRGRP
-            | crate::vfs_core::types::S_IROTH;
-        let ino = crate::vfs_core::resolve_ino(name).ok()?;
-        let vn_id = crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS)?;
         let flat_idx = alloc_flat_inode(name, 0)?;
+        // If this inode already has a vnode_id (e.g., char device), use it
+        let vn_id = unsafe {
+            if INODES[flat_idx].vnode_id != 0 {
+                INODES[flat_idx].vnode_id
+            } else {
+                let mode = crate::vfs_core::types::S_IFREG
+                    | crate::vfs_core::types::S_IRUSR
+                    | crate::vfs_core::types::S_IWUSR
+                    | crate::vfs_core::types::S_IRGRP
+                    | crate::vfs_core::types::S_IROTH;
+                let ino = crate::vfs_core::resolve_ino(name).ok()?;
+                crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS)?
+            }
+        };
         unsafe { INODES[flat_idx].vnode_id = vn_id; }
         Some(flat_idx)
     })
@@ -212,15 +219,28 @@ pub fn inode_size(idx: usize) -> Option<usize> {
 }
 
 pub fn inode_read(idx: usize, pos: usize, buf: &mut [u8]) -> Option<usize> {
+    crate::serial::write_str("[VFS_READ] idx=");
+    crate::serial::write_dec(idx as u64);
+    crate::serial::write_str(" pos=");
+    crate::serial::write_dec(pos as u64);
+    crate::serial::write_str("\n");
     unsafe {
         if idx >= MAX_INODES || !INODES[idx].used {
+            crate::serial::write_str("[VFS_READ] invalid idx\n");
             return None;
         }
         let inode = &INODES[idx];
+        crate::serial::write_str("[VFS_READ] vnode_id=");
+        crate::serial::write_dec(inode.vnode_id as u64);
+        crate::serial::write_str(" data_ptr=");
+        crate::serial::write_hex(inode.data_ptr as u64);
+        crate::serial::write_str("\n");
         if inode.data_ptr.is_null() && inode.vnode_id == 0 {
+            crate::serial::write_str("[VFS_READ] null ptr & no vnode\n");
             return None;
         }
         if inode.data_ptr.is_null() {
+            crate::serial::write_str("[VFS_READ] calling vfs_core::read\n");
             match crate::vfs_core::read(inode.vnode_id, pos as u64, buf) {
                 Ok(n) => return Some(n),
                 Err(_) => return None,

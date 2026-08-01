@@ -21,7 +21,22 @@ pub const TIMER_IRQ_VECTOR: u8 = IRQ_BASE + 0;
 pub const USER_TLS_VADDR: u64 = 0x0000_7FFF_FFFF_A000;
 
 // 设为 true 显示调试信息，false 隐藏
-static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
+
+// Track if current CPU is in a syscall (to prevent context switches during syscalls)
+static IN_SYSCALL: AtomicBool = AtomicBool::new(false);
+
+pub fn in_syscall_enter() {
+    IN_SYSCALL.store(true, Ordering::SeqCst);
+}
+
+pub fn in_syscall_exit() {
+    IN_SYSCALL.store(false, Ordering::SeqCst);
+}
+
+pub fn in_syscall() -> bool {
+    IN_SYSCALL.load(Ordering::SeqCst)
+}
 
 pub const KERNEL_CODE_SELECTOR: u64 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u64 = 0x10;
@@ -475,6 +490,12 @@ pub fn init_scheduler() {
 pub fn schedule() {
     unsafe { core::arch::asm!("cli", options(nostack, nomem, preserves_flags)); }
 
+    // Don't context switch if we're in a syscall (interrupts enabled for I/O wait)
+    if in_syscall() {
+        unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
+        return;
+    }
+
     let current = CURRENT_TASK.load(Ordering::SeqCst);
 
     // Pick a different task. If the highest-priority task IS current,
@@ -498,7 +519,17 @@ pub fn schedule() {
                 return;
             }
             None => {
-                unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
+                // No other tasks to run - halt until interrupt makes a task ready
+                loop {
+                    unsafe {
+                        core::arch::asm!("sti; hlt", options(nostack, nomem));
+                        core::arch::asm!("cli", options(nostack, nomem, preserves_flags));
+                    }
+                    // Check if any task became ready
+                    if unsafe { RUNQUEUE.nr_running > 0 } {
+                        break;
+                    }
+                }
                 return;
             }
         }
@@ -845,7 +876,10 @@ pub extern "C" fn timer_schedule() -> u64 {
     crate::pic::send_eoi(0);
     // Poll UART for serial input and feed into keyboard buffer
     while let Some(c) = crate::serial::read_byte_nonblocking() {
-        crate::keyboard::push_char(c);
+        // Filter: only accept printable ASCII and common control chars
+        if c >= 0x20 && c <= 0x7E || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F {
+            crate::keyboard::push_char(c);
+        }
     }
 
     // Wake up sleeping tasks whose wakeup tick has arrived
@@ -1110,38 +1144,41 @@ pub const INTERP_BASE: u64 = 0x100_0000_0000;
 
 pub const WNOHANG: u32 = 1;
 
+static SHELL_TASK_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[no_mangle]
 pub extern "C" fn syscall_handler(
     syscall_num: u64,
     arg1: u64, arg2: u64, arg3: u64,
     arg4: u64, arg5: u64, arg6: u64
 ) -> i64 {
-    static SC_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let scn = SC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if scn < 30 && DEBUG_ENABLED.load(Ordering::Relaxed) {
-        let id = CURRENT_TASK.load(Ordering::SeqCst);
-        if id != 0 {
-            let cr3 = unsafe { TASKS[task_idx(id)].pml4 };
-            let mpage = crate::paging::PageTableManager::resolve_phys(cr3, 0x500000).unwrap_or(0);
-            crate::serial::write_str("SC#");
-            crate::serial::write_dec(scn as u64);
-            crate::serial::write_str(" num=");
-            crate::serial::write_dec(syscall_num);
-            crate::serial::write_str(" m[0]=0x");
-            if mpage != 0 {
-                let mem: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28) as *const u64) };
-                crate::serial::write_hex(mem);
-                crate::serial::write_str(" m[2]=0x");
-                let mem2: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x50) as *const u64) };
-                crate::serial::write_hex(mem2);
-                crate::serial::write_str(" m[8]=0x");
-                let mem8: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x140) as *const u64) };
-                crate::serial::write_hex(mem8);
-            }
-            crate::serial::write_str("\n");
+    in_syscall_enter();
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if syscall_num == SYS_execve && arg2 != 0 {
+        // Check if executing busybox
+        let filename_bytes = unsafe { core::slice::from_raw_parts(arg1 as *const u8, 64) };
+        let filename_str = core::str::from_utf8(filename_bytes).unwrap_or("");
+        if filename_str.contains("busybox") {
+            SHELL_TASK_ID.store(id, Ordering::SeqCst);
+            crate::serial::write_str("[SHELL] Task ");
+            crate::serial::write_dec(id);
+            crate::serial::write_str(" is now busybox shell\n");
         }
     }
-    match syscall_num {
+    
+    // Trace ALL syscalls from shell task
+    if id == SHELL_TASK_ID.load(Ordering::SeqCst) {
+        crate::serial::write_str("[SHELL_SC] num=");
+        crate::serial::write_dec(syscall_num);
+        crate::serial::write_str(" arg1=");
+        crate::serial::write_hex(arg1);
+        crate::serial::write_str(" arg2=");
+        crate::serial::write_hex(arg2);
+        crate::serial::write_str(" arg3=");
+        crate::serial::write_hex(arg3);
+        crate::serial::write_str("\n");
+    }
+    let result = match syscall_num {
         SYS_read => sys_read(arg1 as u32, arg2 as *mut u8, arg3 as usize),
         SYS_write => sys_write(arg1 as u32, arg2 as *const u8, arg3 as usize),
         SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
@@ -1233,7 +1270,9 @@ pub extern "C" fn syscall_handler(
             }
             -ENOSYS
         },
-    }
+    };
+    in_syscall_exit();
+    result
 }
 
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> i64 {
@@ -1379,6 +1418,9 @@ pub fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
 
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
+
+    // Remove from run queue before blocking
+    remove_from_runqueue(id);
 
     unsafe {
         let idx = task_idx(id);
@@ -1621,6 +1663,11 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if buf.is_null() || count == 0 { return 0; }
+    crate::serial::write_str("[SYS_READ] fd=");
+    crate::serial::write_dec(fd as u64);
+    crate::serial::write_str(" count=");
+    crate::serial::write_dec(count as u64);
+    crate::serial::write_str("\n");
     let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
         Some(f) => f,
         None => return -EBADF,
@@ -3335,8 +3382,76 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
     crate::paging::pt_mgr()
 }
 
-fn sys_poll(_fds: u64, _nfds: u64, _timeout: i32) -> i64 {
-    0
+fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
+    if fds == 0 || nfds == 0 {
+        return -EFAULT;
+    }
+    
+    crate::serial::write_str("[SYS_POLL] nfds=");
+    crate::serial::write_dec(nfds);
+    crate::serial::write_str(" timeout=");
+    crate::serial::write_dec(timeout as u64);
+    crate::serial::write_str("\n");
+    
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+    
+    let mut ready_count = 0i64;
+    
+    for i in 0..nfds as usize {
+        let fd_ptr = unsafe { (fds + i as u64 * 8) as *const u32 };
+        let events_ptr = unsafe { (fds + i as u64 * 8 + 4) as *const i16 };
+        let revents_ptr = unsafe { (fds + i as u64 * 8 + 6) as *mut i16 };
+        
+        let fd = unsafe { core::ptr::read_volatile(fd_ptr) };
+        let events = unsafe { core::ptr::read_volatile(events_ptr) };
+        
+        crate::serial::write_str("[SYS_POLL] fd=");
+        crate::serial::write_dec(fd as u64);
+        crate::serial::write_str(" events=");
+        crate::serial::write_hex(events as u64);
+        crate::serial::write_str("\n");
+        
+        let mut revents = 0i16;
+        
+        // Check if fd is valid
+        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+            Some(f) => f,
+            None => {
+                revents = POLLNVAL;
+                unsafe { core::ptr::write_volatile(revents_ptr, revents); }
+                continue;
+            }
+        };
+        
+        // For TTY devices (including console on fd 0,1,2), check if data is available
+        if events & POLLIN != 0 {
+            // Check if there's input data available in TTY buffer
+            // For now, assume TTY is always ready for read if it's a valid TTY fd
+            // This makes poll return immediately with POLLIN, which should make shell proceed to read
+            revents |= POLLIN;
+        }
+        
+        if events & POLLOUT != 0 {
+            // Writing is usually always ready for TTY
+            revents |= POLLOUT;
+        }
+        
+        unsafe { core::ptr::write_volatile(revents_ptr, revents); }
+        
+        if revents != 0 {
+            ready_count += 1;
+        }
+    }
+    
+    crate::serial::write_str("[SYS_POLL] ready_count=");
+    crate::serial::write_dec(ready_count as u64);
+    crate::serial::write_str("\n");
+    
+    ready_count
 }
 
 fn sys_lseek(_fd: u32, _offset: i64, _whence: i32) -> i64 {
@@ -3398,8 +3513,12 @@ pub fn test() {
     // Initialize TTY devices FIRST (before creating any user tasks)
     crate::tty::init();
     let _ = crate::vfs_core::mkdir(b"/dev", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
+
+    // Use the global TTY_DEVICE for all consoles
+    let tty_dev = &crate::tty::TTY_DEVICE;
+
     if crate::vfs::find_inode(b"/dev/console").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(1, 0, 0, &crate::tty::TTY_DEVICE);
+        let vn_id = crate::vfs_core::vnode_alloc(1, 0, 0, tty_dev);
         if let Some(vn_id) = vn_id {
             crate::vfs_core::create(b"/dev/console", crate::vfs_core::types::S_IFCHR | 0o666).ok();
             crate::vfs::create_file(b"/dev/console", b"");
@@ -3410,7 +3529,7 @@ pub fn test() {
         }
     }
     if crate::vfs::find_inode(b"/dev/tty").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(2, 0, 0, &crate::tty::TTY_DEVICE);
+        let vn_id = crate::vfs_core::vnode_alloc(2, 0, 0, tty_dev);
         if let Some(vn_id) = vn_id {
             crate::vfs_core::create(b"/dev/tty", crate::vfs_core::types::S_IFCHR | 0o666).ok();
             crate::vfs::create_file(b"/dev/tty", b"");
@@ -3421,7 +3540,7 @@ pub fn test() {
         }
     }
     if crate::vfs::find_inode(b"/dev/tty0").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(3, 0, 0, &crate::tty::TTY_DEVICE);
+        let vn_id = crate::vfs_core::vnode_alloc(3, 0, 0, tty_dev);
         if let Some(vn_id) = vn_id {
             crate::vfs_core::create(b"/dev/tty0", crate::vfs_core::types::S_IFCHR | 0o666).ok();
             crate::vfs::create_file(b"/dev/tty0", b"");
