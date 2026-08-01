@@ -1,10 +1,12 @@
 use crate::serial;
 use crate::vfs_core::ramfs;
 use crate::vfs_core::VnodeOps;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 pub const MAX_INODES: usize = 256;
 pub const MAX_FDS_PER_TASK: usize = 16;
+
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub struct Inode {
@@ -73,7 +75,9 @@ fn alloc_flat_inode(name: &[u8], size: usize) -> Option<usize> {
 }
 
 pub fn init() {
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
     serial::write_str("VFS: compatibility layer init\n");
+}
 }
 
 pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
@@ -109,19 +113,23 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
                         match crate::vfs_core::write(vn_id, 0, data) {
                             Ok(n) if n == data.len() => {}
                             _ => {
-                                serial::write_str("VFS: write failed for '");
-                                for &c in name { serial::write_char(c as char); }
-                                serial::write_str("'\n");
+if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                            serial::write_str("VFS: write failed for '");
+                            for &c in name { serial::write_char(c as char); }
+                            serial::write_str("'\n");
+                        }
                                 unsafe { INODES[flat_idx].used = false; }
                                 return None;
                             }
                         }
                     }
-                    serial::write_str("VFS: created '");
-                    for &c in name { serial::write_char(c as char); }
-                    serial::write_str("' (");
-                    serial::write_dec(data.len() as u64);
-                    serial::write_str(" bytes)\n");
+                    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                        serial::write_str("VFS: created '");
+                        for &c in name { serial::write_char(c as char); }
+                        serial::write_str("' (");
+                        serial::write_dec(data.len() as u64);
+                        serial::write_str(" bytes)\n");
+                    }
                     Some(flat_idx)
                 }
                 None => {
@@ -156,9 +164,11 @@ pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<u
                     if !data_slice.is_empty() {
                         let _ = crate::vfs_core::write(vn_id, 0, data_slice);
                     }
+                    if DEBUG_ENABLED.load(Ordering::Relaxed) {
                     serial::write_str("VFS: created external '");
                     for &c in name { serial::write_char(c as char); }
                     serial::write_str("'\n");
+                }
                     Some(flat_idx)
                 }
                 None => {
@@ -295,4 +305,23 @@ pub fn close_fd(fd: usize) -> bool {
     }
     table[fd].used = false;
     true
+}
+
+pub fn alloc_fd_for_task(task_id: u64, inode_idx: usize, flags: i32) -> Option<usize> {
+    let idx = (task_id % super::task::MAX_TASKS as u64) as usize;
+    unsafe {
+        let table = &mut FD_TABLES[idx];
+        for i in 0..MAX_FDS_PER_TASK {
+            if !table[i].used {
+                table[i] = FileDesc {
+                    inode_idx,
+                    pos: 0,
+                    used: true,
+                    flags,
+                };
+                return Some(i);
+            }
+        }
+    }
+    None
 }

@@ -6,7 +6,7 @@
 .section .bss
 .align 16
 syscall_stack:
-    .space 16384
+    .space 131072        # 128 KB (was 16 KB; syscall_handler zeroes ~96 KB)
 syscall_stack_top:
 
 .text
