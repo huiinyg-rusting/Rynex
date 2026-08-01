@@ -171,12 +171,10 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                             continue;
                         }
                         let pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
-                        let pd = &mut *(pd_addr as *mut crate::paging::PageTable);
-                        for j in 0..512 {
-                            if pd.0[j] & crate::paging::PTE_PRESENT != 0 {
-                                pd.0[j] |= crate::paging::PTE_USER;
-                            }
-                        }
+                        // PD entries (2MB identity hugepages) stay NON-USER so user
+                        // mode cannot access VA==phys (which would alias buddy-allocated
+                        // pages with their identity VA and corrupt heap/LDSO memory).
+                        // map_into replaces the specific PD entries it needs with USER PTs.
                     }
                 }
                 // Map VA 0x0-0xFFF to a zero page so musl's guard read at p->mem[-1]
@@ -197,17 +195,19 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
                             let pt = unsafe { &mut *(new_pt as *mut crate::paging::PageTable) };
                             for i in 0..512 {
-                                let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER;
+                                // Identity sub-pages stay kernel-only (non-USER) to prevent
+                                // user-mode aliasing of physical memory via VA==phys.
+                                let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE;
                                 pt.0[i] = (huge_phys + (i as u64) * 4096) | flags;
                             }
-                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
+                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
                             let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_ACCESSED | crate::paging::PTE_DIRTY;
                             pd0.0[0] = new_pt | flags;
                         } else {
                             // Already 4 KB pages – redirect PT[0] to zero page
                             let pt_addr = pde0 & crate::paging::PTE_ADDR_MASK;
                             let pt = unsafe { &mut *(pt_addr as *mut crate::paging::PageTable) };
-                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_WRITABLE | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
+                            pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
                         }
                     }
                 }

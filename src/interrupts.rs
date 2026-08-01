@@ -260,6 +260,17 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                 crate::serial::write_str(" wrapper_ret=0x");
                 crate::serial::write_hex(wrapper_ret);
                 crate::serial::write_str("\n");
+                crate::serial::write_str("  META-WRITES (rip,cr2):\n");
+                for i in 0..16usize {
+                    let (r, c) = unsafe { META_WR[i] };
+                    crate::serial::write_str("    [");
+                    crate::serial::write_dec(i as u64);
+                    crate::serial::write_str("] rip=0x");
+                    crate::serial::write_hex(r);
+                    crate::serial::write_str(" cr2=0x");
+                    crate::serial::write_hex(c);
+                    crate::serial::write_str("\n");
+                }
                 for i in 0..24 {
                     let v: u64 = unsafe { core::ptr::read_volatile((usp + 0xA0 + i * 8) as *const u64) };
                     crate::serial::write_str("  usp+0x");
@@ -415,7 +426,7 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                 }
                 // Decode meta slots 0..24 in the meta area page at VA 0x500000
                 crate::serial::write_str("\n  metas: ");
-                for k in 0..25u64 {
+                for k in 0..40u64 {
                     let base = 0x500018u64 + k * 0x28;
                     let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
                     let avail: u32 = unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) };
@@ -461,51 +472,109 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                     }
                     crate::serial::write_str("\n");
                 }
-                // Scan user page tables for aliases of key phys pages
-                let targets = [0x3A29000u64, 0x0B30000u64, 0x3D27000u64, 0x3A2A000u64];
-                for tgt in targets {
-                    crate::serial::write_str("  alias-phys=0x");
-                    crate::serial::write_hex(tgt);
-                    crate::serial::write_str(": ");
-                    let mut any = false;
-                    for pm in 0..512u64 {
-                        let pmle = unsafe { core::ptr::read_volatile((gpf_cr3 + pm * 8) as *const u64) };
-                        if pmle & 1 == 0 { continue; }
-                        let pdptp = pmle & 0xFFFFFFFFFF000;
-                        for pt_ in 0..512u64 {
-                            let pdpte = unsafe { core::ptr::read_volatile((pdptp + pt_ * 8) as *const u64) };
-                            if pdpte & 1 == 0 { continue; }
-                            if pdpte & (1 << 7) != 0 { continue; }
-                            let pdp = pdpte & 0xFFFFFFFFFF000;
-                            for pd_ in 0..512u64 {
-                                let pde = unsafe { core::ptr::read_volatile((pdp + pd_ * 8) as *const u64) };
-                                if pde & 1 == 0 { continue; }
-                                if pde & (1 << 7) != 0 {
-                                    if (pde & 0xFFFFFFFFFF000) == (tgt & 0xFFFFFFFFFF000) {
-                                        let va = (pm << 39) | (pt_ << 30) | (pd_ << 21);
-                                        crate::serial::write_str("0x");
-                                        crate::serial::write_hex(va);
-                                        crate::serial::write_str(" ");
-                                        any = true;
-                                    }
-                                    continue;
+                // Full alias scan: find any phys page mapped at 2+ distinct user VAs
+                const MAX_ALIAS: usize = 2048;
+                static mut ALIAS_TBL: [u64; MAX_ALIAS * 3] = [0; MAX_ALIAS * 3];
+                let mut ac = 0usize;
+                for pm in 0..512u64 {
+                    let pmle = unsafe { core::ptr::read_volatile((gpf_cr3 + pm * 8) as *const u64) };
+                    if pmle & 1 == 0 { continue; }
+                    let pdptp = pmle & 0xFFFFFFFFFF000;
+                    for pt_ in 0..512u64 {
+                        let pdpte = unsafe { core::ptr::read_volatile((pdptp + pt_ * 8) as *const u64) };
+                        if pdpte & 1 == 0 { continue; }
+                        if pdpte & (1 << 7) != 0 {
+                            if ac < MAX_ALIAS {
+                                unsafe {
+                                    ALIAS_TBL[ac * 3] = pdpte & 0xFFFFFFFFFF000;
+                                    ALIAS_TBL[ac * 3 + 1] = (pm << 39) | (pt_ << 30);
+                                    ALIAS_TBL[ac * 3 + 2] = pdpte & 0xFFF;
                                 }
-                                let ptp = pde & 0xFFFFFFFFFF000;
-                                for pte_ in 0..512u64 {
-                                    let pte = unsafe { core::ptr::read_volatile((ptp + pte_ * 8) as *const u64) };
-                                    if pte & 1 == 0 { continue; }
-                                    if (pte & 0xFFFFFFFFFF000) == (tgt & 0xFFFFFFFFFF000) {
-                                        let va = (pm << 39) | (pt_ << 30) | (pd_ << 21) | (pte_ << 12);
-                                        crate::serial::write_str("0x");
-                                        crate::serial::write_hex(va);
-                                        crate::serial::write_str(" ");
-                                        any = true;
+                                ac += 1;
+                            }
+                            continue;
+                        }
+                        let pdp = pdpte & 0xFFFFFFFFFF000;
+                        for pd_ in 0..512u64 {
+                            let pde = unsafe { core::ptr::read_volatile((pdp + pd_ * 8) as *const u64) };
+                            if pde & 1 == 0 { continue; }
+                            if pde & (1 << 7) != 0 {
+                                if ac < MAX_ALIAS {
+                                    unsafe {
+                                        ALIAS_TBL[ac * 3] = pde & 0xFFFFFFFFFF000;
+                                        ALIAS_TBL[ac * 3 + 1] = (pm << 39) | (pt_ << 30) | (pd_ << 21);
+                                        ALIAS_TBL[ac * 3 + 2] = pde & 0xFFF;
                                     }
+                                    ac += 1;
+                                }
+                                continue;
+                            }
+                            let ptp = pde & 0xFFFFFFFFFF000;
+                            for pte_ in 0..512u64 {
+                                let pte = unsafe { core::ptr::read_volatile((ptp + pte_ * 8) as *const u64) };
+                                if pte & 1 == 0 { continue; }
+                                if ac < MAX_ALIAS {
+                                    unsafe {
+                                        ALIAS_TBL[ac * 3] = pte & 0xFFFFFFFFFF000;
+                                        ALIAS_TBL[ac * 3 + 1] = (pm << 39) | (pt_ << 30) | (pd_ << 21) | (pte_ << 12);
+                                        ALIAS_TBL[ac * 3 + 2] = pte & 0xFFF;
+                                    }
+                                    ac += 1;
                                 }
                             }
                         }
                     }
-                    if !any { crate::serial::write_str("none"); }
+                }
+                crate::serial::write_str("  aliases(");
+                crate::serial::write_dec(ac as u64);
+                crate::serial::write_str("):\n");
+                let mut any = false;
+                for i in 0..ac {
+                    for j in (i + 1)..ac {
+                        unsafe {
+                            if ALIAS_TBL[i * 3] != 0 && ALIAS_TBL[i * 3] == ALIAS_TBL[j * 3] {
+                                let u1 = (ALIAS_TBL[i * 3 + 2] & 4) != 0;
+                                let u2 = (ALIAS_TBL[j * 3 + 2] & 4) != 0;
+                                let w1 = (ALIAS_TBL[i * 3 + 2] & 2) != 0;
+                                let w2 = (ALIAS_TBL[j * 3 + 2] & 2) != 0;
+                                crate::serial::write_str("    phys=0x");
+                                crate::serial::write_hex(ALIAS_TBL[i * 3]);
+                                crate::serial::write_str(" va1=0x");
+                                crate::serial::write_hex(ALIAS_TBL[i * 3 + 1]);
+                                crate::serial::write_str(" fl1=");
+                                if u1 { crate::serial::write_str("USR"); } else { crate::serial::write_str("---"); }
+                                if w1 { crate::serial::write_str("|WR"); }
+                                crate::serial::write_str(" va2=0x");
+                                crate::serial::write_hex(ALIAS_TBL[j * 3 + 1]);
+                                crate::serial::write_str(" fl2=");
+                                if u2 { crate::serial::write_str("USR"); } else { crate::serial::write_str("---"); }
+                                if w2 { crate::serial::write_str("|WR"); }
+                                crate::serial::write_str("\n");
+                                any = true;
+                            }
+                        }
+                    }
+                }
+                if !any { crate::serial::write_str("    none\n"); }
+                // Phys layout of key user VAs + identity-mapping check
+                for probe in [0x4FE000u64, 0x4FE280u64, 0x4FF000u64, 0x500000u64,
+                    0x70000000u64, 0x70001000u64, 0x70003000u64, 0x70011000u64,
+                    0x100000AB000u64, 0x100000E9B00u64, 0x3A2A000u64] {
+                    let pp = crate::paging::PageTableManager::resolve_phys(gpf_cr3, probe).unwrap_or(0);
+                    crate::serial::write_str("  UVA 0x");
+                    crate::serial::write_hex(probe);
+                    crate::serial::write_str(" -> phys=0x");
+                    crate::serial::write_hex(pp);
+                    if pp != 0 {
+                        let ident = crate::paging::PageTableManager::resolve_phys(gpf_cr3, pp).unwrap_or(0);
+                        crate::serial::write_str(" ident(VA=phys)=0x");
+                        crate::serial::write_hex(ident);
+                        if ident == pp {
+                            crate::serial::write_str(" [IDMAP]");
+                        } else {
+                            crate::serial::write_str(" [NO]");
+                        }
+                    }
                     crate::serial::write_str("\n");
                 }
                 crate::task::exit_task(0);
@@ -557,27 +626,97 @@ pub unsafe extern "C" fn page_fault_probe() {
     );
 }
 
+// Watchdog ring for writes to the mallocng meta page (VA 0x500000)
+static mut META_WR: [(u64, u64); 16] = [(0, 0); 16];
+static mut MWI: usize = 0;
+
 pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
     let rip = frame.instruction_pointer.as_u64();
     let rsp = frame.stack_pointer.as_u64();
     let cs_val = frame.code_segment.0 as u64;
+    // Watchdog ring: record every write to the mallocng meta page (VA 0x500000)
+    if cr2 >= 0x500000 && cr2 < 0x501000 && (code.bits() & 2) != 0 {
+        unsafe {
+            META_WR[MWI] = (rip, cr2);
+            MWI = (MWI + 1) & 15;
+        }
+        if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
+            return;
+        }
+    }
+    // Low-VA write trap: catch corrupt mallocng group writes into the VA 0x0 page
+    if cr2 < 0x1000 && (code.bits() & 2) != 0 {
+        crate::serial::write_str("LOWWR: rip=0x");
+        crate::serial::write_hex(rip);
+        crate::serial::write_str(" rsp=0x");
+        crate::serial::write_hex(rsp);
+        crate::serial::write_str(" cr2=0x");
+        crate::serial::write_hex(cr2);
+        crate::serial::write_str(" code=0x");
+        crate::serial::write_hex(code.bits() as u64);
+        crate::serial::write_str("\n");
+        if let Some(mpp) = crate::paging::PageTableManager::resolve_phys(
+            crate::task::current_task_pml4(),
+            0x500000,
+        ) {
+            for k in [17u64, 18, 19] {
+                let base = mpp + 0x18 + k * 0x28;
+                let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
+                let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
+                crate::serial::write_str("  m[");
+                crate::serial::write_dec(k);
+                crate::serial::write_str("] mem=0x");
+                crate::serial::write_hex(mem);
+                crate::serial::write_str(" sc=");
+                crate::serial::write_dec((packed >> 6) & 63);
+                crate::serial::write_str("\n");
+            }
+        }
+    }
+    if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
+        return;
+    }
+
     crate::serial::write_str("EXC: PF rip=0x");
     crate::serial::write_hex(rip);
     crate::serial::write_str(" cs=0x");
     crate::serial::write_hex(cs_val);
     crate::serial::write_str(" rsp=0x");
     crate::serial::write_hex(rsp);
+    crate::serial::write_str(" intr_rsp=0x");
+    crate::serial::write_hex(frame.stack_pointer.as_u64());
     crate::serial::write_str(" cr2=0x");
     crate::serial::write_hex(cr2);
     crate::serial::write_str(" code=0x");
     crate::serial::write_hex(code.bits() as u64);
     crate::serial::write_str("\n");
-
-    if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
-        crate::serial::write_str("  resolved\n");
-        return;
+    if cs_val == 8 {
+        // Dump the interrupted kernel stack for a backtrace
+        let base = frame.stack_pointer.as_u64();
+        crate::serial::write_str("  stack[");
+        for i in 0..32u64 {
+            let p = (base + i * 8) as *const u64;
+            let v = unsafe { core::ptr::read_volatile(p) };
+            if i % 4 == 0 { crate::serial::write_str("\n   "); }
+            crate::serial::write_hex(v);
+            crate::serial::write_str(" ");
+        }
+        crate::serial::write_str("\n");
+    } else if (cs_val & 3) == 3 && cr2 == rip && (code.bits() & 0x14) == 0x14 {
+        // User-mode instruction fetch fault (NX / execute of stack/data):
+        // dump the user stack to trace the corrupted return-address chain.
+        let base = frame.stack_pointer.as_u64();
+        crate::serial::write_str("  ustack[");
+        for i in 0..32u64 {
+            let p = (base + i * 8) as *const u64;
+            let v = unsafe { core::ptr::read_volatile(p) };
+            if i % 4 == 0 { crate::serial::write_str("\n   "); }
+            crate::serial::write_hex(v);
+            crate::serial::write_str(" ");
+        }
+        crate::serial::write_str("\n");
     }
 
     exit_user_task(&frame, "Page Fault", &[("addr", cr2), ("pf_code", code.bits())]);
