@@ -3,6 +3,11 @@
 .global syscall_return
 .global debug_print_hex
 
+.extern SYSCALL_USER_RIP
+.extern SYSCALL_USER_RSP
+.extern SYSCALL_USER_RFLAGS
+.extern SYSCALL_USER_FS_BASE
+
 .section .bss
 .align 16
 syscall_stack:
@@ -32,7 +37,28 @@ syscall_entry:
     push r15
     push rcx              // Save return RIP
     push r11              // Save return RFLAGS
-    
+
+    // Capture the exact user-mode resume context for fork():
+    // return RIP=rcx, return RFLAGS=r11, post-syscall RSP=r10+24, TLS FS base.
+    // Runs AFTER rcx/r11 are pushed so we may clobber them freely; rdx is a
+    // caller-saved scratch (overwritten later by arg setup), rbp/r12 were
+    // pushed above and get popped back, and rax (syscall_num) is preserved.
+    lea rdx, [rip + SYSCALL_USER_RIP]
+    mov [rdx], rcx
+    lea rdx, [rip + SYSCALL_USER_RSP]
+    lea rbp, [r10 + 24]
+    mov [rdx], rbp
+    lea rdx, [rip + SYSCALL_USER_RFLAGS]
+    mov [rdx], r11
+    mov r12, rax            // save syscall_num
+    mov ecx, 0xC0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    lea rdx, [rip + SYSCALL_USER_FS_BASE]
+    mov [rdx], rax
+    mov rax, r12            // restore syscall_num
+
     mov r11, [r10 + 16]   // r11 = arg4
     mov r8,  [r10 + 8]    // r8  = arg5
     mov r9,  [r10]        // r9  = arg6

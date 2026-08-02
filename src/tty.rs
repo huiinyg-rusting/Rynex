@@ -151,7 +151,14 @@ impl TtyDevice {
             read += 1;
 
             if canonical && (c == b'\n' || c == b'\r') {
-                input.line_ready = false;
+                // A line was consumed. Keep line_ready asserted if there is
+                // still an unconsumed newline in the buffer (multiple lines
+                // arrived in one burst), so the next read returns immediately
+                // instead of blocking on input that is already there.
+                input.line_ready = (0..input.count).any(|i| {
+                    let c2 = input.buf[(input.tail + i) % TTY_BUFFER_SIZE];
+                    c2 == b'\n' || c2 == b'\r'
+                });
                 break;
             }
         }
@@ -171,10 +178,42 @@ impl TtyDevice {
 
     fn write_output(&self, data: &[u8]) -> usize {
         let mut written = 0;
+        let mut esc_buf = [0u8; 64];
+        let mut esc_len = 0usize;
+        let mut in_esc = false;
         for &c in data {
-            self.put_char_raw(c);
-            // Also output to serial for debugging
             crate::serial::write_char(c as char);
+            if in_esc {
+                if esc_len < esc_buf.len() {
+                    esc_buf[esc_len] = c;
+                    esc_len += 1;
+                }
+                // A CSI sequence is "ESC [ params... final" where final is the
+                // FIRST byte in 0x40-0x7E after the '[' (0x5B) that starts the
+                // parameter bytes. The '[' itself must NOT terminate the
+                // sequence (it is 0x5B, inside 0x40-0x7E). Flush the whole
+                // sequence once its final byte arrives or the buffer fills.
+                if esc_len >= 3 && (0x40..=0x7E).contains(&c) {
+                    if let Ok(s) = core::str::from_utf8(&esc_buf[..esc_len]) {
+                        crate::vga::write_str(s);
+                    }
+                    in_esc = false;
+                    esc_len = 0;
+                } else if esc_len >= esc_buf.len() {
+                    if let Ok(s) = core::str::from_utf8(&esc_buf[..esc_len]) {
+                        crate::vga::write_str(s);
+                    }
+                    in_esc = false;
+                    esc_len = 0;
+                }
+            } else if c == 0x1B {
+                in_esc = true;
+                esc_buf[0] = c;
+                esc_len = 1;
+                // A lone ESC with no following byte: emit nothing (keep pending)
+            } else {
+                self.put_char_raw(c);
+            }
             written += 1;
         }
         written
@@ -257,22 +296,16 @@ impl VnodeOps for TtyDevice {
         if buf.is_empty() {
             return Ok(0);
         }
-        crate::serial::write_str("[TTY_READ] start\n");
+        crate::serial::write_str("");
         let mut wait_count = 0u64;
         loop {
             let n = self.pop_input(buf);
             if n > 0 {
-                crate::serial::write_str("[TTY_READ] got ");
-                crate::serial::write_dec(n as u64);
-                crate::serial::write_str(" bytes\n");
                 return Ok(n);
             }
             // No complete line available (canonical mode) or no data at all
             // Check serial port for input (for -serial stdio)
             if let Some(c) = crate::serial::read_byte_nonblocking() {
-                crate::serial::write_str("[TTY_READ] serial char: ");
-                crate::serial::write_dec(c as u64);
-                crate::serial::write_str("\n");
                 self.put_char_raw(c);
                 self.push_input(c);
                 continue;
@@ -280,7 +313,7 @@ impl VnodeOps for TtyDevice {
             // No input available, enable interrupts briefly to allow timer/serial interrupts
             wait_count += 1;
             if wait_count % 100000 == 0 {
-                crate::serial::write_str("[TTY_READ] waiting...\n");
+                crate::serial::write_str("");
             }
             unsafe {
                 core::arch::asm!("sti; pause; cli", options(nostack, preserves_flags));
