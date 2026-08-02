@@ -581,6 +581,7 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
                 loop { unsafe { core::arch::asm!("cli; hlt"); } }
             }
         }
+        crate::serial::write_str("\n");
     }
     crate::serial::write_str("\n");
     exit_user_task_early(code, raw_rip, raw_rsp, "GPF");
@@ -693,6 +694,13 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::serial::write_hex(code.bits() as u64);
     crate::serial::write_str("\n");
     if cs_val == 8 {
+        // Identify the task and its kernel stack before dumping
+        let tid = crate::task::current_task_id();
+        crate::serial::write_str("  task=");
+        crate::serial::write_dec(tid);
+        crate::serial::write_str(" kstack=0x");
+        crate::serial::write_hex(crate::task::task_kernel_stack_by_id(tid));
+        crate::serial::write_str("\n");
         // Dump the interrupted kernel stack for a backtrace
         let base = frame.stack_pointer.as_u64();
         crate::serial::write_str("  stack[");

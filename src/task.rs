@@ -127,7 +127,7 @@ pub struct Vma {
     pub flags: u64,
 }
 
-pub const MAX_VMAS: usize = 4096;
+pub const MAX_VMAS: usize = 64;
 
 #[derive(Copy, Clone)]
 pub struct Task {
@@ -249,6 +249,11 @@ static mut PREEMPT_SCRATCH: [u64; 3] = [0; 3];
 
 pub fn current_task_id() -> u64 {
     CURRENT_TASK.load(Ordering::SeqCst)
+}
+
+pub fn task_kernel_stack_by_id(id: u64) -> u64 {
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].kernel_stack }
 }
 
 fn task_idx(id: u64) -> usize {
@@ -1676,7 +1681,19 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                     }
                     free_stack(child_ks, KERNEL_STACK_PAGES);
                     if child_us != 0 {
-                        free_stack(child_us, USER_STACK_PAGES);
+                        // User stack pages were allocated individually (order 0)
+                        // in elf.rs, and after a COW fork they are shared read-only
+                        // with the parent. Free only pages this task still owns
+                        // (writable), so we never touch the parent's stack.
+                        let alloc = unsafe { &mut *crate::memory::allocator() };
+                        for page_off in 0..USER_STACK_PAGES as u64 {
+                            let vaddr = crate::paging::USER_STACK_TOP - (page_off + 1) * 4096;
+                            if let Some((phys, pte)) = crate::paging::resolve_phys_flags(child.pml4, vaddr) {
+                                if pte & crate::paging::PTE_WRITABLE != 0 {
+                                    alloc.free(phys & !0xFFF, 0);
+                                }
+                            }
+                        }
                     }
                     TASKS[i] = Task::empty();
                     return child_id as i64;
@@ -2176,6 +2193,9 @@ fn sys_munmap(_addr: u64, _len: usize) -> i64 {
 // fork() can hand the child a correct starting context instead of reusing the
 // parent's stale regs from its last context switch.
 #[no_mangle]
+pub static mut SYSCALL_CALLEE_REGS: [u64; 6] = [0; 6];
+
+#[no_mangle]
 pub static mut SYSCALL_USER_RIP: u64 = 0;
 #[no_mangle]
 pub static mut SYSCALL_USER_RSP: u64 = 0;
@@ -2195,6 +2215,13 @@ fn sys_fork() -> i64 {
         // Ensure slot is free
         if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
             return -ENOMEM;
+        }
+
+        // Clone parent's fd table so the child inherits stdin/stdout/stderr
+        let parent_fds = crate::vfs::get_fd_table();
+        if let Some(pfds) = parent_fds {
+            let cfds = crate::vfs::fd_table_for(child_tid);
+            unsafe { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
         }
 
         let parent_idx = task_idx(id);
@@ -2223,6 +2250,14 @@ fn sys_fork() -> i64 {
         child_regs.rflags = SYSCALL_USER_RFLAGS;
         child_regs.fs_base = SYSCALL_USER_FS_BASE;
         child_regs.rax = 0; // Child gets 0 from fork
+        // parent.regs holds stale callee-saved regs (last context switch);
+        // use the live values captured by syscall_entry instead.
+        child_regs.rbx = SYSCALL_CALLEE_REGS[0];
+        child_regs.rbp = SYSCALL_CALLEE_REGS[1];
+        child_regs.r12 = SYSCALL_CALLEE_REGS[2];
+        child_regs.r13 = SYSCALL_CALLEE_REGS[3];
+        child_regs.r14 = SYSCALL_CALLEE_REGS[4];
+        child_regs.r15 = SYSCALL_CALLEE_REGS[5];
 
         let child = &mut TASKS[child_idx];
         *child = Task {
@@ -2630,7 +2665,9 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 TASKS[idx].user_stack = info.stack_top;
                 TASKS[idx].brk_start = info.brk_base;
                 TASKS[idx].brk_end = info.brk_base;
-                TASKS[idx].vmas = [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS];
+                for v in TASKS[idx].vmas.iter_mut() {
+                    *v = Vma { start: 0, end: 0, flags: 0 };
+                }
 
                 alloc.free(old_pml4, 0);
 
@@ -3370,11 +3407,11 @@ fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
     0
 }
 
-fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
-    if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
-    if name.is_empty() { return -ENOENT; }
-    match crate::vfs::find_inode(name) {
+ fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
+     if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
+     let name = unsafe { cstr_from_ptr(pathname) };
+     if name.is_empty() { return -ENOENT; }
+     match crate::vfs::resolve_or_register(name) {
         Some(flat_idx) => {
             let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
             if vn_id != 0 {

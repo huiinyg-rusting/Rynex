@@ -7,12 +7,8 @@
 .extern SYSCALL_USER_RSP
 .extern SYSCALL_USER_RFLAGS
 .extern SYSCALL_USER_FS_BASE
-
-.section .bss
-.align 16
-syscall_stack:
-    .space 131072        # 128 KB (was 16 KB; syscall_handler zeroes ~96 KB)
-syscall_stack_top:
+.extern CURRENT_SYSCALL_STACK_TOP
+.extern SYSCALL_CALLEE_REGS
 
 .text
 
@@ -20,14 +16,13 @@ syscall_entry:
     swapgs
     cli                       // No timer preemption inside a syscall: the
                               // kernel->kernel preempt resume for user tasks
-                              // caught mid-syscall on the shared syscall_stack
-                              // is unreliable and can resume with a corrupted
-                              // stack pointer, jumping into data pages.
+                              // caught mid-syscall is unreliable and can
+                              // resume with a corrupted stack pointer.
     push r10              // Save arg4 (R10) on user stack
     push r8               // Save arg5 (R8) on user stack
     push r9               // Save arg6 (R9) on user stack
     mov r10, rsp          // r10 = user RSP (pointing to 3 saved args)
-    lea rsp, [rip + syscall_stack_top]
+    mov rsp, [rip + CURRENT_SYSCALL_STACK_TOP]   // per-task kernel stack
     
     push rbx
     push rbp
@@ -39,6 +34,17 @@ syscall_entry:
     push r11              // Save return RFLAGS
     push rdx              // Save arg3 (rdx is clobbered by the fork-context
                           // capture below: it is used as scratch and by rdmsr)
+
+    // Save callee-saved regs for fork() (rbx,rbp,r12-r15). syscall_entry runs
+    // in user context so TASKS[].regs is stale; the child must resume with the
+    // parent's live callee-saved registers.
+    lea rdx, [rip + SYSCALL_CALLEE_REGS]
+    mov [rdx + 0x00], rbx
+    mov [rdx + 0x08], rbp
+    mov [rdx + 0x10], r12
+    mov [rdx + 0x18], r13
+    mov [rdx + 0x20], r14
+    mov [rdx + 0x28], r15
 
     // Capture the exact user-mode resume context for fork():
     // return RIP=rcx, return RFLAGS=r11, post-syscall RSP=r10+24, TLS FS base.
@@ -74,7 +80,7 @@ syscall_entry:
     mov rsi, rdi          // rsi = arg1
     mov rdi, rax          // rdi = syscall_num
     mov r9, r8            // r9  = arg5
-    mov r8, r11           // r8  = arg4
+    mov r8,  r11           // r8  = arg4
     
     call syscall_handler
     
