@@ -488,10 +488,22 @@ pub fn init_scheduler() {
 }
 
 pub fn schedule() {
+    schedule_inner(false);
+}
+
+/// Like `schedule()` but switches even while inside a syscall. Used by
+/// waitpid()/exit_task() which must hand the CPU to a child that is only
+/// schedulable from the syscall context. Safe because the whole switch runs
+/// with interrupts disabled (cli); the new task resumes with its own RFLAGS.
+pub fn force_schedule() {
+    schedule_inner(true);
+}
+
+fn schedule_inner(force: bool) {
     unsafe { core::arch::asm!("cli", options(nostack, nomem, preserves_flags)); }
 
     // Don't context switch if we're in a syscall (interrupts enabled for I/O wait)
-    if in_syscall() {
+    if !force && in_syscall() {
         unsafe { core::arch::asm!("sti", options(nostack, nomem, preserves_flags)); }
         return;
     }
@@ -604,6 +616,21 @@ pub fn yield_now() {
     schedule();
 }
 
+pub fn yield_now_force() {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return; }
+
+    unsafe {
+        let idx = task_idx(id);
+        if TASKS[idx].state == TaskState::Running {
+            TASKS[idx].state = TaskState::Ready;
+            TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
+        }
+    }
+
+    force_schedule();
+}
+
 pub fn exit_task(code: i32) {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return; }
@@ -627,7 +654,8 @@ pub fn exit_task(code: i32) {
         }
     }
 
-    schedule();
+    // Force switch so the parent (typically blocked in waitpid) can reap us.
+    force_schedule();
 }
 
 // ── Context switch assembly ──────────────────────────────────────
@@ -903,6 +931,16 @@ pub extern "C" fn timer_schedule() -> u64 {
         return 0;
     }
 
+    // Inside a syscall (blocking I/O wait with IF=1): do NOT build a preempt
+    // frame. The shared syscall_stack + PREEMPT_SCRATCH/trampoline path cannot
+    // safely suspend a syscall mid-call (each timer tick would clobber the
+    // global scratch). Instead return 0 so the handler restores directly from
+    // the CPU-pushed interrupt frame (iretq), letting the syscall continue
+    // unperturbed.
+    if in_syscall() {
+        return 0;
+    }
+
     unsafe {
         let idx = task_idx(current);
 
@@ -1160,23 +1198,7 @@ pub extern "C" fn syscall_handler(
         let filename_str = core::str::from_utf8(filename_bytes).unwrap_or("");
         if filename_str.contains("busybox") {
             SHELL_TASK_ID.store(id, Ordering::SeqCst);
-            crate::serial::write_str("[SHELL] Task ");
-            crate::serial::write_dec(id);
-            crate::serial::write_str(" is now busybox shell\n");
         }
-    }
-    
-    // Trace ALL syscalls from shell task
-    if id == SHELL_TASK_ID.load(Ordering::SeqCst) {
-        crate::serial::write_str("[SHELL_SC] num=");
-        crate::serial::write_dec(syscall_num);
-        crate::serial::write_str(" arg1=");
-        crate::serial::write_hex(arg1);
-        crate::serial::write_str(" arg2=");
-        crate::serial::write_hex(arg2);
-        crate::serial::write_str(" arg3=");
-        crate::serial::write_hex(arg3);
-        crate::serial::write_str("\n");
     }
     let result = match syscall_num {
         SYS_read => sys_read(arg1 as u32, arg2 as *mut u8, arg3 as usize),
@@ -1572,43 +1594,43 @@ fn futex_unlock_pi(uaddr: *const u32) -> i64 {
 
 // ── Error constants ──────────────────────────────────────────────
 
-pub const EPERM: i64 = -1;
-pub const ENOENT: i64 = -2;
-pub const ESRCH: i64 = -3;
-pub const EINTR: i64 = -4;
-pub const EIO: i64 = -5;
-pub const ENXIO: i64 = -6;
-pub const E2BIG: i64 = -7;
-pub const ENOEXEC: i64 = -8;
-pub const EBADF: i64 = -9;
-pub const ECHILD: i64 = -10;
-pub const EAGAIN: i64 = -11;
-pub const ENOMEM: i64 = -12;
-pub const EACCES: i64 = -13;
-pub const EFAULT: i64 = -14;
-pub const ENOTBLK: i64 = -15;
-pub const EBUSY: i64 = -16;
-pub const EEXIST: i64 = -17;
-pub const EXDEV: i64 = -18;
-pub const ENODEV: i64 = -19;
-pub const ENOTDIR: i64 = -20;
-pub const EISDIR: i64 = -21;
-pub const EINVAL: i64 = -22;
-pub const ENFILE: i64 = -23;
-pub const EMFILE: i64 = -24;
-pub const ENOTTY: i64 = -25;
-pub const ETXTBSY: i64 = -26;
-pub const EFBIG: i64 = -27;
-pub const ENOSPC: i64 = -28;
-pub const ESPIPE: i64 = -29;
-pub const EROFS: i64 = -30;
-pub const EMLINK: i64 = -31;
-pub const EPIPE: i64 = -32;
-pub const EDOM: i64 = -33;
-pub const ERANGE: i64 = -34;
-pub const ENAMETOOLONG: i64 = -36;
-pub const ENOSYS: i64 = -38;
-pub const ENOTEMPTY: i64 = -39;
+pub const EPERM: i64 = 1;
+pub const ENOENT: i64 = 2;
+pub const ESRCH: i64 = 3;
+pub const EINTR: i64 = 4;
+pub const EIO: i64 = 5;
+pub const ENXIO: i64 = 6;
+pub const E2BIG: i64 = 7;
+pub const ENOEXEC: i64 = 8;
+pub const EBADF: i64 = 9;
+pub const ECHILD: i64 = 10;
+pub const EAGAIN: i64 = 11;
+pub const ENOMEM: i64 = 12;
+pub const EACCES: i64 = 13;
+pub const EFAULT: i64 = 14;
+pub const ENOTBLK: i64 = 15;
+pub const EBUSY: i64 = 16;
+pub const EEXIST: i64 = 17;
+pub const EXDEV: i64 = 18;
+pub const ENODEV: i64 = 19;
+pub const ENOTDIR: i64 = 20;
+pub const EISDIR: i64 = 21;
+pub const EINVAL: i64 = 22;
+pub const ENFILE: i64 = 23;
+pub const EMFILE: i64 = 24;
+pub const ENOTTY: i64 = 25;
+pub const ETXTBSY: i64 = 26;
+pub const EFBIG: i64 = 27;
+pub const ENOSPC: i64 = 28;
+pub const ESPIPE: i64 = 29;
+pub const EROFS: i64 = 30;
+pub const EMLINK: i64 = 31;
+pub const EPIPE: i64 = 32;
+pub const EDOM: i64 = 33;
+pub const ERANGE: i64 = 34;
+pub const ENAMETOOLONG: i64 = 36;
+pub const ENOSYS: i64 = 38;
+pub const ENOTEMPTY: i64 = 39;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -1655,19 +1677,16 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                 return 0;
             }
 
-            // No zombie yet — yield and retry
-            yield_now();
+            // No zombie yet — yield and retry. Use the force variant so the
+            // child (created by fork, only schedulable outside a syscall)
+            // actually gets the CPU; otherwise we busy-loop forever.
+            yield_now_force();
         }
     }
 }
 
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if buf.is_null() || count == 0 { return 0; }
-    crate::serial::write_str("[SYS_READ] fd=");
-    crate::serial::write_dec(fd as u64);
-    crate::serial::write_str(" count=");
-    crate::serial::write_dec(count as u64);
-    crate::serial::write_str("\n");
     let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
         Some(f) => f,
         None => return -EBADF,
@@ -2125,6 +2144,20 @@ fn sys_munmap(_addr: u64, _len: usize) -> i64 {
 
 // ── Fork ──────────────────────────────────────────────────────────
 
+// The syscall entry point runs on a shared syscall stack and never writes the
+// user context into TASKS[].regs. These globals capture the exact user-mode
+// resume point (return RIP/RSP/RFLAGS + TLS FS base) of the current syscall so
+// fork() can hand the child a correct starting context instead of reusing the
+// parent's stale regs from its last context switch.
+#[no_mangle]
+pub static mut SYSCALL_USER_RIP: u64 = 0;
+#[no_mangle]
+pub static mut SYSCALL_USER_RSP: u64 = 0;
+#[no_mangle]
+pub static mut SYSCALL_USER_RFLAGS: u64 = 0;
+#[no_mangle]
+pub static mut SYSCALL_USER_FS_BASE: u64 = 0;
+
 fn sys_fork() -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
@@ -2156,6 +2189,13 @@ fn sys_fork() -> i64 {
 
         // Set up child task: copy register state but set rax=0 (return value)
         let mut child_regs = parent.regs;
+        // Resume the child at the fork-return point with the user context the
+        // syscall entry captured (parent.regs only holds the PC from its last
+        // context switch, not this syscall's return address).
+        child_regs.rip = SYSCALL_USER_RIP;
+        child_regs.rsp = SYSCALL_USER_RSP;
+        child_regs.rflags = SYSCALL_USER_RFLAGS;
+        child_regs.fs_base = SYSCALL_USER_FS_BASE;
         child_regs.rax = 0; // Child gets 0 from fork
 
         let child = &mut TASKS[child_idx];
@@ -2202,7 +2242,9 @@ fn sys_fork() -> i64 {
 // ── Execve ────────────────────────────────────────────────────────
 
 fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
-    crate::serial::write_str("sys_execve called\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        crate::serial::write_str("sys_execve called\n");
+    }
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
@@ -3017,7 +3059,11 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
                 }
                 return 0;
             }
-            TCSETS | TCSETSW | TCSETSF | TIOCSPGRP | TIOCGPGRP => return 0,
+            // TCSETS/TCSETSW/TCSETSF fall through to the VFS so shells
+            // (busybox ash) can actually change termios, e.g. disable ECHO
+            // while doing their own line editing. Without this, the kernel
+            // keeps echoing input on the VGA console, duplicating the prompt.
+            TIOCSPGRP | TIOCGPGRP => return 0,
             _ => {}
         }
     }
@@ -3028,16 +3074,19 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
         None => return -EBADF,
     };
 
-    crate::serial::write_str("[SYS_IOCTL] fd=");
-    crate::serial::write_dec(fd as u64);
-    crate::serial::write_str(" request=0x");
-    crate::serial::write_hex(request);
-    crate::serial::write_str("\n");
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        crate::serial::write_str("[SYS_IOCTL] fd=");
+        crate::serial::write_dec(fd as u64);
+        crate::serial::write_str(" request=0x");
+        crate::serial::write_hex(request);
+        crate::serial::write_str("\n");
+    }
 
     // Use VFS ioctl
+    let vnode_id = unsafe { crate::vfs::INODES[inode_fd.inode_idx].vnode_id };
     let mut msg = crate::vfs_core::VfsMessage::new();
     msg.op = crate::vfs_core::VfsOp::Ioctl;
-    msg.extra1 = inode_fd.inode_idx as u64;
+    msg.extra1 = vnode_id as u64;
     msg.offset = request;
     msg.data = arg3 as *mut u8;
     msg.data_len = 0;
@@ -3300,7 +3349,7 @@ fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
     if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
-    match crate::vfs::resolve_or_register(name) {
+    match crate::vfs::find_inode(name) {
         Some(flat_idx) => {
             let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
             if vn_id != 0 {
@@ -3387,12 +3436,6 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
         return -EFAULT;
     }
     
-    crate::serial::write_str("[SYS_POLL] nfds=");
-    crate::serial::write_dec(nfds);
-    crate::serial::write_str(" timeout=");
-    crate::serial::write_dec(timeout as u64);
-    crate::serial::write_str("\n");
-    
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
     const POLLERR: i16 = 0x0008;
@@ -3408,12 +3451,6 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
         
         let fd = unsafe { core::ptr::read_volatile(fd_ptr) };
         let events = unsafe { core::ptr::read_volatile(events_ptr) };
-        
-        crate::serial::write_str("[SYS_POLL] fd=");
-        crate::serial::write_dec(fd as u64);
-        crate::serial::write_str(" events=");
-        crate::serial::write_hex(events as u64);
-        crate::serial::write_str("\n");
         
         let mut revents = 0i16;
         
@@ -3447,10 +3484,6 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
         }
     }
     
-    crate::serial::write_str("[SYS_POLL] ready_count=");
-    crate::serial::write_dec(ready_count as u64);
-    crate::serial::write_str("\n");
-    
     ready_count
 }
 
@@ -3474,14 +3507,10 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
             len = core::ptr::read_volatile((iov + i as u64 * 16 + 8) as *const usize);
         }
         if base == 0 || len == 0 { continue; }
-        let slice = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
-        for &c in slice {
-            if c == 0 { break; }
-            serial::write_char(c as char);
-        }
-        total += len as i64;
+        let r = sys_write(fd, base as *const u8, len);
+        if r < 0 { return r; }
+        total += r;
     }
-    if total > 0 { serial::write_str("\n"); }
     total
 }
 

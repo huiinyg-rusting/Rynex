@@ -51,8 +51,11 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     }
     vga::clear();
 
+    vga::set_color(0x0C, 0x00);
     vga::write_str("Niobix v0.1.0\n");
+    vga::set_color(0x0A, 0x00);
     vga::write_str("Booting...\n");
+    vga::set_color(0x0F, 0x00);
 
     gdt::init();
     vga::write_str("GDT: OK\n");

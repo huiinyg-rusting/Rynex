@@ -219,28 +219,15 @@ pub fn inode_size(idx: usize) -> Option<usize> {
 }
 
 pub fn inode_read(idx: usize, pos: usize, buf: &mut [u8]) -> Option<usize> {
-    crate::serial::write_str("[VFS_READ] idx=");
-    crate::serial::write_dec(idx as u64);
-    crate::serial::write_str(" pos=");
-    crate::serial::write_dec(pos as u64);
-    crate::serial::write_str("\n");
     unsafe {
         if idx >= MAX_INODES || !INODES[idx].used {
-            crate::serial::write_str("[VFS_READ] invalid idx\n");
             return None;
         }
         let inode = &INODES[idx];
-        crate::serial::write_str("[VFS_READ] vnode_id=");
-        crate::serial::write_dec(inode.vnode_id as u64);
-        crate::serial::write_str(" data_ptr=");
-        crate::serial::write_hex(inode.data_ptr as u64);
-        crate::serial::write_str("\n");
         if inode.data_ptr.is_null() && inode.vnode_id == 0 {
-            crate::serial::write_str("[VFS_READ] null ptr & no vnode\n");
             return None;
         }
         if inode.data_ptr.is_null() {
-            crate::serial::write_str("[VFS_READ] calling vfs_core::read\n");
             match crate::vfs_core::read(inode.vnode_id, pos as u64, buf) {
                 Ok(n) => return Some(n),
                 Err(_) => return None,

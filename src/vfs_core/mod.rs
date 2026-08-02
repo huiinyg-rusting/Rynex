@@ -763,14 +763,7 @@ pub fn close(vnode_id: u16) {
 }
 
 pub fn read(vnode_id: u16, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
-    crate::serial::write_str("[VFS_CORE_READ] vnode_id=");
-    crate::serial::write_dec(vnode_id as u64);
-    crate::serial::write_str("\n");
     let vnode = vnode_get(vnode_id).ok_or("bad vnode")?;
-    crate::serial::write_str("[VFS_CORE_READ] vnode ptr=");
-    crate::serial::write_hex(vnode as *const _ as u64);
-    crate::serial::write_str("\n");
-    crate::serial::write_str("[VFS_CORE_READ] calling ops.read\n");
     vnode.ops.read(vnode.ino, offset, buf)
 }
 
