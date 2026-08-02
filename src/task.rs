@@ -1294,6 +1294,17 @@ pub extern "C" fn syscall_handler(
         },
     };
     in_syscall_exit();
+    // Trace every syscall into the klog ring buffer (FAC_SYSCALL, DEBUG).
+    // Only mirrored to serial when console level >= DEBUG, so the crash tail
+    // shows the exact syscall sequence that led to a fault.
+    crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SYSCALL);
+    crate::klog::s("sc=");
+    crate::klog::dec(syscall_num);
+    crate::klog::s(" a1=0x");
+    crate::klog::hex(arg1);
+    crate::klog::s(" -> 0x");
+    crate::klog::hex(result as u64);
+    crate::klog::end();
     result
 }
 
@@ -2243,7 +2254,7 @@ fn sys_fork() -> i64 {
 
 fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
-        crate::serial::write_str("sys_execve called\n");
+        crate::klog::log(crate::klog::LOG_INFO, crate::klog::FAC_EXEC, "sys_execve called");
     }
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
@@ -2360,9 +2371,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         Err(e) => {
                             alloc.free(buffer_phys, elford);
                             alloc.free(interp_phys, interp_ord);
-                            serial::write_str("SYS_EXECVE: interp load failed: ");
-                            serial::write_str(e);
-                            serial::write_str("\n");
+                        crate::klog::log(crate::klog::LOG_ERR, crate::klog::FAC_EXEC, "interp load failed");
                             return -ENOEXEC;
                         }
                     }
@@ -2462,13 +2471,14 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         let cr3: u64;
                         unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags)); }
                         let phys_addr = PageTableManager::resolve_phys(cr3, sp).unwrap_or(0);
-                        crate::serial::write_str("  random_dataD: cr3=0x");
-                        crate::serial::write_hex(cr3);
-                        crate::serial::write_str(" sp=0x");
-                        crate::serial::write_hex(sp);
-                        crate::serial::write_str(" phys=0x");
-                        crate::serial::write_hex(phys_addr);
-                        crate::serial::write_str("\n");
+                        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_EXEC);
+                        crate::klog::s("random_dataD: cr3=0x");
+                        crate::klog::hex(cr3);
+                        crate::klog::s(" sp=0x");
+                        crate::klog::hex(sp);
+                        crate::klog::s(" phys=0x");
+                        crate::klog::hex(phys_addr);
+                        crate::klog::end();
                     }
                     wv(sp as *mut u64, 0x1111222233334444u64);
                     wv((sp + 8) as *mut u64, 0x5555666677778888u64);
