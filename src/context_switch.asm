@@ -37,6 +37,8 @@ syscall_entry:
     push r15
     push rcx              // Save return RIP
     push r11              // Save return RFLAGS
+    push rdx              // Save arg3 (rdx is clobbered by the fork-context
+                          // capture below: it is used as scratch and by rdmsr)
 
     // Capture the exact user-mode resume context for fork():
     // return RIP=rcx, return RFLAGS=r11, post-syscall RSP=r10+24, TLS FS base.
@@ -58,6 +60,7 @@ syscall_entry:
     lea rdx, [rip + SYSCALL_USER_FS_BASE]
     mov [rdx], rax
     mov rax, r12            // restore syscall_num
+    pop rdx                 // restore arg3
 
     mov r11, [r10 + 16]   // r11 = arg4
     mov r8,  [r10 + 8]    // r8  = arg5
