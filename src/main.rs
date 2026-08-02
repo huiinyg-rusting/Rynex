@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod vga;
 mod serial;
+mod klog;
 mod gdt;
 mod idt;
 mod interrupts;
@@ -46,6 +47,9 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     MULTIBOOT_INFO.store(_info as u64, Ordering::SeqCst);
 
     serial::init();
+    // Boot with a permissive console threshold so the full boot trace is on
+    // the serial log; tighten it later once boot is stable.
+    klog::set_console_level(klog::LOG_INFO);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("Niobix v0.1.0\n");
     }
@@ -220,6 +224,8 @@ fn panic(info: &PanicInfo) -> ! {
         serial::write_str(":");
         serial::write_dec(loc.line() as u64);
     }
+    serial::write_str("\n");
+    klog::dump();
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
     }

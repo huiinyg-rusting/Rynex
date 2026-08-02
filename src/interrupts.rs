@@ -721,6 +721,7 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
 
     exit_user_task(&frame, "Page Fault", &[("addr", cr2), ("pf_code", code.bits())]);
     crate::vga::write_str("EXC: Page Fault\n");
+    crate::klog::dump();
     halt();
 }
 
@@ -749,6 +750,7 @@ pub extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u6
     crate::serial::write_str(" tss.rsp0=0x");
     crate::serial::write_hex(rsp0);
     crate::serial::write_str("\n");
+    crate::klog::dump();
     halt();
 }
 
