@@ -493,6 +493,36 @@ pub fn get_pte_in(pml4: u64, virt: u64) -> Option<&'static mut u64> {
     Some(unsafe { &mut (*pt_mut).0[vpn[3]] })
 }
 
+/// Resolve a virtual address to its (physical, flags) pair, transparently
+/// handling 2M huge pages. Returns None if not present.
+pub fn resolve_phys_flags(pml4: u64, virt: u64) -> Option<(u64, u64)> {
+    let vpn = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+    unsafe {
+        let pml4e = (*(pml4 as *const PageTable)).0[vpn[0]];
+        if pml4e & PTE_PRESENT == 0 { return None; }
+        let pdpt = (pml4e & PTE_ADDR_MASK) as *const PageTable;
+        let pdpte = (*pdpt).0[vpn[1]];
+        if pdpte & PTE_PRESENT == 0 { return None; }
+        let pd = (pdpte & PTE_ADDR_MASK) as *const PageTable;
+        let pde = (*pd).0[vpn[2]];
+        if pde & PTE_PRESENT == 0 { return None; }
+        if pde & PTE_HUGE != 0 {
+            let phys = (pde & PTE_ADDR_MASK) | (virt & (PAGE_SIZE_2M - 1));
+            return Some((phys, pde));
+        }
+        let pt = (pde & PTE_ADDR_MASK) as *const PageTable;
+        let pte = (*pt).0[vpn[3]];
+        if pte & PTE_PRESENT == 0 { return None; }
+        let phys = (pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE_4K - 1));
+        Some((phys, pte))
+    }
+}
+
 pub fn get_pte(virt: u64) -> Option<&'static mut u64> {
     let kernel_pml4 = KERNEL_PML4.load(Ordering::SeqCst);
     get_pte_in(kernel_pml4, virt)

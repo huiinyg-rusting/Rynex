@@ -1346,6 +1346,9 @@ fn sys_exit(status: i32) -> i64 {
 
 fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
     if buf.is_null() || count == 0 { return 0; }
+    if !user_range_valid(buf as u64, count, false) {
+        return -EFAULT;
+    }
     let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
         Some(f) => f,
         None => return -EBADF,
@@ -1698,6 +1701,18 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 
 fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
     if buf.is_null() || count == 0 { return 0; }
+    if !user_range_valid(buf as u64, count, true) {
+        crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SYSCALL);
+        crate::klog::s("read fd=");
+        crate::klog::dec(fd as u64);
+        crate::klog::s(" buf=0x");
+        crate::klog::hex(buf as u64);
+        crate::klog::s(" count=");
+        crate::klog::dec(count as u64);
+        crate::klog::s(" -> EFAULT");
+        crate::klog::end();
+        return -EFAULT;
+    }
     let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
         Some(f) => f,
         None => return -EBADF,
@@ -3441,6 +3456,49 @@ pub fn pt_mgr() -> &'static mut PageTableManager {
     crate::paging::pt_mgr()
 }
 
+/// Validate that the user range [addr, addr+len) is fully mapped and
+/// accessible for the given access type, demand-paging any pages that live
+/// in a VMA but aren't present yet. The kernel dereferences user buffers
+/// directly (sys_write/sys_read), so we must never touch a page that would
+/// fault: an unmapped range here would otherwise raise a kernel-mode PF that
+/// page_fault_resolve refuses to service (cpl==0).
+pub fn user_range_valid(addr: u64, len: usize, want_write: bool) -> bool {
+    if len == 0 { return true; }
+    let end = match addr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    if !crate::paging::is_user_addr(addr) || !crate::paging::is_user_addr(end - 1) {
+        return false;
+    }
+    let pml4 = current_task_pml4();
+    if pml4 == 0 { return false; }
+    let mut page = addr & !0xFFF;
+    while page < end {
+        if crate::paging::PageTableManager::resolve_phys(pml4, page).is_none() {
+            // Not present: try demand paging first, then reject if still absent.
+            if !handle_demand_page(pml4, page) {
+                return false;
+            }
+            if crate::paging::PageTableManager::resolve_phys(pml4, page).is_none() {
+                return false;
+            }
+        }
+        // Check user + writable flags (handles 2M huge pages via the PDE).
+        match crate::paging::resolve_phys_flags(pml4, page) {
+            Some((_, flags)) => {
+                if flags & crate::paging::PTE_USER == 0
+                    || (want_write && flags & crate::paging::PTE_WRITABLE == 0) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+        page += 0x1000;
+    }
+    true
+}
+
 fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
     if fds == 0 || nfds == 0 {
         return -EFAULT;
@@ -3518,7 +3576,21 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
         }
         if base == 0 || len == 0 { continue; }
         let r = sys_write(fd, base as *const u8, len);
-        if r < 0 { return r; }
+        if r < 0 {
+            crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SYSCALL);
+            crate::klog::s("writev fd=");
+            crate::klog::dec(fd as u64);
+            crate::klog::s(" iov[");
+            crate::klog::dec(i as u64);
+            crate::klog::s("] base=0x");
+            crate::klog::hex(base);
+            crate::klog::s(" len=");
+            crate::klog::dec(len as u64);
+            crate::klog::s(" err=");
+            crate::klog::dec((-r) as u64);
+            crate::klog::end();
+            return r;
+        }
         total += r;
     }
     total
