@@ -783,10 +783,24 @@ pub fn stat(vnode_id: u16) -> Result<Stat, &'static str> {
 }
 
 pub fn create(path: &[u8], mode: FileMode) -> Result<u64, &'static str> {
+    mkdir_p(parent_path(path))?;
     let parent = parent_path(path);
     let name = file_name(path);
     let (pino, ops) = path_resolve(parent)?;
     ops.create(pino, name, mode)
+}
+
+/// Recursively create all missing parent directories of `path`.
+pub fn mkdir_p(path: &[u8]) -> Result<(), &'static str> {
+    if path.is_empty() || path == b"/" {
+        return Ok(());
+    }
+    if path_resolve(path).is_ok() {
+        return Ok(()); // already exists
+    }
+    mkdir_p(parent_path(path))?;
+    mkdir(path, types::S_IRUSR | types::S_IWUSR | types::S_IXUSR | types::S_IRGRP | types::S_IXGRP | types::S_IROTH)
+        .map(|_| ())
 }
 
 pub fn mkdir(path: &[u8], mode: FileMode) -> Result<u64, &'static str> {

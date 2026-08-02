@@ -278,6 +278,11 @@ pub fn get_fd_table() -> Option<&'static mut [FileDesc; MAX_FDS_PER_TASK]> {
     unsafe { Some(&mut FD_TABLES[idx]) }
 }
 
+pub fn fd_table_for(task_id: u64) -> &'static mut [FileDesc; MAX_FDS_PER_TASK] {
+    let idx = (task_id % super::task::MAX_TASKS as u64) as usize;
+    unsafe { &mut FD_TABLES[idx] }
+}
+
 pub fn alloc_fd(inode_idx: usize, flags: i32) -> Option<usize> {
     let table = get_fd_table()?;
     for i in 0..MAX_FDS_PER_TASK {

@@ -52,8 +52,17 @@ static mut TSS: TaskStateSegment = TaskStateSegment {
     io_map_base: 0,
 };
 
+/// Top of the *current* task's kernel stack. syscall_entry (context_switch.asm)
+/// loads RSP from here so each task runs its syscalls on its OWN kernel stack.
+/// A shared syscall stack is unsafe: a task suspended mid-syscall (e.g. blocked
+/// in waitpid) would have its saved return frame clobbered by another task's
+/// deeper syscalls (e.g. execve's 4KB argv_buf) running on the same stack.
+#[no_mangle]
+pub static mut CURRENT_SYSCALL_STACK_TOP: u64 = 0;
+
 pub fn set_tss_rsp0(rsp0: u64) {
     unsafe { TSS.rsp[0] = rsp0; }
+    unsafe { CURRENT_SYSCALL_STACK_TOP = rsp0; }
 }
 
 pub fn get_tss_rsp0() -> u64 {
