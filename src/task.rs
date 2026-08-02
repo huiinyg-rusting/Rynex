@@ -256,6 +256,12 @@ pub fn task_kernel_stack_by_id(id: u64) -> u64 {
     unsafe { TASKS[task_idx(id)].kernel_stack }
 }
 
+pub fn current_task_regs_rip() -> u64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].regs.rip }
+}
+
 fn task_idx(id: u64) -> usize {
     (id % MAX_TASKS as u64) as usize
 }
