@@ -700,6 +700,8 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
         crate::serial::write_dec(tid);
         crate::serial::write_str(" kstack=0x");
         crate::serial::write_hex(crate::task::task_kernel_stack_by_id(tid));
+        crate::serial::write_str(" regs.rip=0x");
+        crate::serial::write_hex(crate::task::current_task_regs_rip());
         crate::serial::write_str("\n");
         // Dump the interrupted kernel stack for a backtrace
         let base = frame.stack_pointer.as_u64();
