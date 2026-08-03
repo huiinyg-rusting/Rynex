@@ -243,7 +243,8 @@ static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
 static mut RUNQUEUE: RunQueue = RunQueue::new();
 static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
-
+// Task slot of the init task, passed across the boot-time stack switch.
+static mut BOOT_INIT_SLOT: usize = 0;
 // Debug: count context switches
 static SWITCH_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -380,15 +381,24 @@ fn requeue_current() {
 
 // ── Stack management ─────────────────────────────────────────────
 
+fn order_for_pages(pages: usize) -> usize {
+    let mut order = 0usize;
+    while (1usize << order) < pages && order < 10 {
+        order += 1;
+    }
+    order
+}
+
 fn alloc_stack(pages: usize) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    alloc.alloc(pages + 1).map(|p| p + pages as u64 * PAGE_SIZE)
+    let order = order_for_pages(pages + 1);
+    alloc.alloc(order).map(|p| p + pages as u64 * PAGE_SIZE)
 }
 
 fn free_stack(base: u64, pages: usize) {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let addr = base - pages as u64 * PAGE_SIZE;
-    alloc.free(addr, pages + 1);
+    alloc.free(addr, order_for_pages(pages + 1));
 }
 
 // ── Task creation ────────────────────────────────────────────────
@@ -1084,8 +1094,10 @@ pub extern "C" fn timer_schedule() -> u64 {
     crate::pic::send_eoi(0);
     // Poll UART for serial input and feed into keyboard buffer.
     while let Some(c) = crate::serial::read_byte_nonblocking() {
-        // Filter: only accept printable ASCII and common control chars
-        if c >= 0x20 && c <= 0x7E || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F {
+        // Filter: only accept printable ASCII and common control chars.
+        // ESC (0x1B) is accepted so terminal line-editing (arrow keys, etc.)
+        // receives the full ESC [ A sequences instead of losing the ESC byte.
+        if c >= 0x20 && c <= 0x7E || c == 0x1B || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F {
             crate::keyboard::push_char(c);
         }
     }
@@ -2434,7 +2446,47 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
     0
 }
 
-fn sys_munmap(_addr: u64, _len: usize) -> i64 {
+fn sys_munmap(addr: u64, len: usize) -> i64 {
+    if len == 0 { return -EINVAL; }
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    let start = addr & !(PAGE_SIZE_4K - 1);
+    let end = start + ((len as u64 + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1));
+
+    unsafe {
+        let idx = task_idx(id);
+        let pml4 = TASKS[idx].pml4;
+
+        // Free any present user pages in the range and clear their PTEs.
+        let alloc = &mut *crate::memory::allocator();
+        let mut page = start;
+        while page < end {
+            if let Some(pte) = crate::paging::get_pte_in(pml4, page) {
+                if *pte & crate::paging::PTE_PRESENT != 0 && *pte & crate::paging::PTE_USER != 0 {
+                    alloc.free(*pte & crate::paging::PTE_ADDR_MASK, 0);
+                    *pte = 0;
+                    core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+                }
+            }
+            page += PAGE_SIZE_4K;
+        }
+
+        // Drop VMAs that fall entirely within the unmapped range; shrink ones
+        // that only overlap at the edges.
+        for vma in TASKS[idx].vmas.iter_mut() {
+            if vma.start == 0 && vma.end == 0 { continue; }
+            if start <= vma.start && end >= vma.end {
+                *vma = Vma { start: 0, end: 0, flags: 0 };
+            } else if start <= vma.start && end > vma.start && end < vma.end {
+                vma.start = end;
+            } else if end >= vma.end && start > vma.start && start < vma.end {
+                vma.end = start;
+            } else if start > vma.start && end < vma.end {
+                vma.end = start;
+            }
+        }
+    }
     0
 }
 
@@ -2588,6 +2640,23 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
         }
     };
 
+    // Follow a symlink target (busybox applet links: /bin/<applet> -> /bin/busybox).
+    // argv[0] is preserved so busybox dispatches on the applet name.
+    let inode_idx = if let Some(vn_id) = crate::vfs::inode_vnode_id(inode_idx) {
+        match crate::vfs_core::readlink(vn_id) {
+            Ok(target) => match crate::vfs::find_inode(target) {
+                Some(idx) => idx,
+                None => {
+                    serial::write_str("SYS_EXECVE: symlink target not found\n");
+                    return -ENOENT;
+                }
+            },
+            Err(_) => inode_idx,
+        }
+    } else {
+        inode_idx
+    };
+
     // Read ELF data from the inode
     let elf_size = match crate::vfs::inode_size(inode_idx) {
         Some(sz) => sz,
@@ -2679,6 +2748,8 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                             return -ENOEXEC;
                         }
                     }
+                    // Interpreter ELF is fully copied into its mapped pages; release the staging buffer
+                    alloc.free(interp_phys, interp_ord);
                 }
 
                 // Determine entry point and final stack layout
@@ -2930,6 +3001,9 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 if old_pml4 != 0 && old_pml4 != info.pml4 {
                     crate::paging::free_address_space(old_pml4, false);
                 }
+                // The staging buffer (whole ELF image) is no longer needed; its contents
+                // were copied into freshly mapped pages by load_elf/load_elf_at.
+                alloc.free(buffer_phys, elford);
 
 
                 // Naked trampoline: loads GP regs from Registers and iretqs
@@ -3401,15 +3475,6 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
         None => return -EBADF,
     };
 
-    if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SYSCALL);
-        crate::klog::s("[SYS_IOCTL] fd=");
-        crate::klog::dec(fd as u64);
-        crate::klog::s(" request=0x");
-        crate::klog::hex(request);
-        crate::klog::end();
-    }
-
     // Use VFS ioctl
     let vnode_id = unsafe { crate::vfs::INODES[inode_fd.inode_idx].vnode_id };
     let mut msg = crate::vfs_core::VfsMessage::new();
@@ -3462,7 +3527,7 @@ static mut CWD_BUF: [u8; 256] = [0; 256];
 static mut CWD_LEN: usize = 0;
 static CWD_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-fn get_cwd_bytes() -> &'static [u8] {
+pub fn get_cwd_bytes() -> &'static [u8] {
     unsafe {
         if !CWD_INIT.load(core::sync::atomic::Ordering::Relaxed) {
             CWD_BUF[0] = b'/';
@@ -3505,11 +3570,15 @@ fn sys_chdir(path: *const u8) -> i64 {
     if path.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(path) };
     if name.is_empty() { return -ENOENT; }
-    match crate::vfs_core::resolve_ino(name) {
+    let mut norm = [0u8; 512];
+    let norm_len = crate::vfs::normalize_path(name, &mut norm).unwrap_or(0);
+    if norm_len == 0 { return -ENOENT; }
+    let norm_name = &norm[..norm_len];
+    match crate::vfs_core::resolve_ino(norm_name) {
         Ok(_) => {
             unsafe {
-                let l = core::cmp::min(name.len(), 255);
-                CWD_BUF[..l].copy_from_slice(&name[..l]);
+                let l = core::cmp::min(norm_name.len(), 255);
+                CWD_BUF[..l].copy_from_slice(&norm_name[..l]);
                 CWD_LEN = l;
             }
             0
@@ -3673,6 +3742,37 @@ fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
     0
 }
 
+/// Follow symlinks per POSIX stat() semantics (stat follows links, lstat does not).
+/// Returns the final non-symlink vnode id, or the input if unresolvable.
+fn follow_symlinks(mut vn_id: u16) -> u16 {
+    for _ in 0..8 {
+        let mode = match crate::vfs_core::stat(vn_id) {
+            Ok(s) => s.mode,
+            Err(_) => return vn_id,
+        };
+        if mode & crate::vfs_core::types::S_IFMT != crate::vfs_core::types::S_IFLNK {
+            return vn_id;
+        }
+        let target = match crate::vfs_core::readlink(vn_id) {
+            Ok(t) => t,
+            Err(_) => return vn_id,
+        };
+        let mut buf = [0u8; 256];
+        let n = target.len().min(255);
+        buf[..n].copy_from_slice(&target[..n]);
+        let flat = match crate::vfs::find_inode(&buf[..n]) {
+            Some(i) => i,
+            None => return vn_id,
+        };
+        let new_vn = unsafe { crate::vfs::INODES[flat].vnode_id };
+        if new_vn == 0 || new_vn == vn_id {
+            return vn_id;
+        }
+        vn_id = new_vn;
+    }
+    vn_id
+}
+
  fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
      if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
      let name = unsafe { cstr_from_ptr(pathname) };
@@ -3681,7 +3781,7 @@ fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
         Some(flat_idx) => {
             let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
             if vn_id != 0 {
-                fill_stat_from_vnode(vn_id, statbuf)
+                fill_stat_from_vnode(follow_symlinks(vn_id), statbuf)
             } else {
                 fill_stat_from_vnode(0, statbuf) // fallback
             }
@@ -3923,6 +4023,37 @@ fn sys_getrandom(buf: *mut u8, len: usize, _flags: u32) -> i64 {
 
 // ── Test / Demo ──────────────────────────────────────────────────
 
+/// Create /bin/<applet> symlinks -> /bin/busybox so PATH lookup can find
+/// the compiled-in applets (busybox has no FEATURE_SH_STANDALONE here).
+fn create_applet_links() {
+    const APPLETS: &[&[u8]] = &[
+        b"ash", b"sh", b"ls", b"cat", b"clear", b"pwd", b"date", b"echo",
+        b"printf", b"true", b"false", b"test", b"sleep", b"head", b"tail",
+        b"wc", b"basename", b"dirname", b"env", b"printenv", b"id", b"whoami",
+        b"uname", b"hostname", b"ps", b"kill", b"df", b"du", b"free", b"dmesg",
+        b"dd", b"cp", b"mv", b"rm", b"mkdir", b"rmdir", b"ln", b"touch",
+        b"chmod", b"md5sum", b"sha1sum", b"hexdump", b"tee", b"which", b"grep",
+        b"sed", b"awk", b"find", b"stat", b"uptime",
+    ];
+    let mut path_buf = [0u8; 64];
+    for a in APPLETS {
+        let mut p = 0usize;
+        for &c in b"/bin/" {
+            path_buf[p] = c;
+            p += 1;
+        }
+        for &c in *a {
+            if p < path_buf.len() - 1 {
+                path_buf[p] = c;
+                p += 1;
+            }
+        }
+        if crate::vfs::find_inode(&path_buf[..p]).is_none() {
+            let _ = crate::vfs::create_symlink(&path_buf[..p], b"/bin/busybox");
+        }
+    }
+}
+
 pub fn test() {
     unsafe { core::arch::asm!("cli"); }
 
@@ -4012,19 +4143,13 @@ pub fn test() {
                         }
                     }
                     1 => {
-                        crate::vfs::create_file(b"/bin/hello", mod_data);
-                    }
-                    2 => {
                         crate::vfs::create_file(b"/bin/shell", mod_data);
                     }
-                    3 => {
+                    2 => {
                         crate::vfs::create_external_file(b"/lib/libc.so", modules[i].start as *mut u8, mod_data.len());
                         crate::vfs::create_external_file(b"/lib/ld-musl-x86_64.so.1", modules[i].start as *mut u8, mod_data.len());
                     }
-                    4 => {
-                        crate::vfs::create_file(b"/bin/hello_dynamic", mod_data);
-                    }
-                    5 => {
+                    3 => {
                         crate::vfs::create_file(b"/bin/busybox", mod_data);
                     }
                     _ => {}
@@ -4032,6 +4157,8 @@ pub fn test() {
             }
         }
     }
+
+    create_applet_links();
 
     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
@@ -4045,21 +4172,29 @@ pub fn test() {
     CURRENT_TASK.store(0, Ordering::SeqCst);
     unsafe { CURRENT_TASK_ID = 0; TASKS_PTR = TASKS.as_mut_ptr(); }
 
-    unsafe {
-        core::arch::asm!("mov rsp, {}", in(reg) task0.kernel_stack);
+    // Dequeue init task so it's not in the runqueue twice.
+    // Everything that needs the boot-stack local `init_tid` is done BEFORE the
+    // stack switch below: once we `mov rsp` onto task0's kernel stack, reading
+    // stack locals from the old boot stack is garbage.
+    remove_from_runqueue(init_tid);
+    let init_slot = task_idx(init_tid);
+    {
+        let new_task = unsafe { &mut TASKS[init_slot] };
+        new_task.state = TaskState::Running;
     }
+    CURRENT_TASK.store(init_tid, Ordering::SeqCst);
+    unsafe { CURRENT_TASK_ID = init_tid; }
+    unsafe { BOOT_INIT_SLOT = init_slot; }
 
     serial::write_str("TASK: switching to task ");
     serial::write_dec(init_tid);
     serial::write_str("...\n");
 
-    // Dequeue init task so it's not in the runqueue twice
-    remove_from_runqueue(init_tid);
+    unsafe {
+        core::arch::asm!("mov rsp, {}", in(reg) task0.kernel_stack);
+    }
 
-    let new_task = unsafe { &mut TASKS[task_idx(init_tid)] };
-    new_task.state = TaskState::Running;
-    CURRENT_TASK.store(init_tid, Ordering::SeqCst);
-    unsafe { CURRENT_TASK_ID = init_tid; }
+    let new_task = unsafe { &mut TASKS[unsafe { BOOT_INIT_SLOT }] };
 
     unsafe { crate::gdt::set_tss_rsp0(new_task.kernel_stack); }
     pt_mgr().switch_to(new_task.pml4);

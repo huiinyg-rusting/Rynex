@@ -80,9 +80,101 @@ pub fn init() {
 }
 }
 
+/// Canonicalize `input` against the current task's working directory into `out`.
+/// Handles absolute and relative paths, `.` and `..` segments, and duplicate
+/// slashes. Returns the length of the canonical absolute path, or None on
+/// overflow.
+pub fn normalize_path(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    if input.is_empty() {
+        return Some(0);
+    }
+    let cwd = crate::task::get_cwd_bytes();
+    let cap = out.len();
+    let mut len = 0usize;
+    let absolute = input[0] == b'/';
+    if !absolute {
+        for &c in cwd {
+            if len >= cap { return None; }
+            out[len] = c;
+            len += 1;
+        }
+        if len == 0 || out[len - 1] != b'/' {
+            if len >= cap { return None; }
+            out[len] = b'/';
+            len += 1;
+        }
+    } else {
+        if len >= cap { return None; }
+        out[len] = b'/';
+        len += 1;
+    }
+    let rest = if absolute { &input[1..] } else { input };
+    for &c in rest {
+        if len >= cap { return None; }
+        out[len] = c;
+        len += 1;
+    }
+
+    let src = out.as_ptr();
+    let mut seg_start = [0usize; 64];
+    let mut seg_end = [0usize; 64];
+    let mut nseg = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        if unsafe { *src.add(i) } == b'/' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < len && unsafe { *src.add(i) } != b'/' {
+            i += 1;
+        }
+        let sl = i - start;
+        if sl == 1 && unsafe { *src.add(start) } == b'.' {
+            continue;
+        }
+        if sl == 2 && unsafe { *src.add(start) } == b'.' && unsafe { *src.add(start + 1) } == b'.' {
+            if nseg > 0 {
+                nseg -= 1;
+            }
+            continue;
+        }
+        if nseg >= 64 {
+            return None;
+        }
+        seg_start[nseg] = start;
+        seg_end[nseg] = i;
+        nseg += 1;
+    }
+
+    let dst = out.as_mut_ptr();
+    let mut o = 0usize;
+    if nseg == 0 {
+        if o >= cap { return None; }
+        unsafe { *dst.add(o) = b'/'; }
+        o += 1;
+        return Some(o);
+    }
+    for k in 0..nseg {
+        if o >= cap { return None; }
+        unsafe { *dst.add(o) = b'/'; }
+        o += 1;
+        let sl = seg_end[k] - seg_start[k];
+        if o + sl > cap { return None; }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.add(seg_start[k]), dst.add(o), sl);
+        }
+        o += sl;
+    }
+    Some(o)
+}
+
 pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
-    find_inode(name).or_else(|| {
-        let flat_idx = alloc_flat_inode(name, 0)?;
+    let mut buf = [0u8; 512];
+    let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
+    let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
+    find_inode(norm).or_else(|| {
+        let flat_idx = alloc_flat_inode(norm, 0)?;
         // If this inode already has a vnode_id (e.g., char device), use it
         let vn_id = unsafe {
             if INODES[flat_idx].vnode_id != 0 {
@@ -93,7 +185,7 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
                     | crate::vfs_core::types::S_IWUSR
                     | crate::vfs_core::types::S_IRGRP
                     | crate::vfs_core::types::S_IROTH;
-                let ino = crate::vfs_core::resolve_ino(name).ok()?;
+                let ino = crate::vfs_core::resolve_ino(norm).ok()?;
                 crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS)?
             }
         };
@@ -102,14 +194,24 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
     })
 }
 
+/// Create a symlink `path -> target` in the real VFS and register a flat
+/// inode bound to it so execve/stat/getdents can find it by name.
+pub fn create_symlink(path: &[u8], target: &[u8]) -> Option<usize> {
+    crate::vfs_core::symlink(path, target).ok()?;
+    resolve_or_register(path)
+}
+
 pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
     let flat_idx = alloc_flat_inode(name, data.len())?;
 
     let mode = crate::vfs_core::types::S_IFREG
         | crate::vfs_core::types::S_IRUSR
         | crate::vfs_core::types::S_IWUSR
+        | crate::vfs_core::types::S_IXUSR
         | crate::vfs_core::types::S_IRGRP
-        | crate::vfs_core::types::S_IROTH;
+        | crate::vfs_core::types::S_IXGRP
+        | crate::vfs_core::types::S_IROTH
+        | crate::vfs_core::types::S_IXOTH;
 
     match crate::vfs_core::create(name, mode) {
         Ok(ino) => {
@@ -192,21 +294,33 @@ pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<u
 }
 
 pub fn find_inode(name: &[u8]) -> Option<usize> {
+    let mut buf = [0u8; 512];
+    let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
+    let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used { continue; }
             let mut matches = true;
             let mut j = 0;
-            while j < name.len() && j < 31 {
-                if INODES[i].name[j] != name[j] { matches = false; break; }
+            while j < norm.len() && j < 31 {
+                if INODES[i].name[j] != norm[j] { matches = false; break; }
                 j += 1;
             }
-            if matches && (j == name.len() || name.len() == 0) && (j >= INODES[i].name.len() || INODES[i].name[j] == 0) {
+            if matches && (j == norm.len() || norm.len() == 0) && (j >= INODES[i].name.len() || INODES[i].name[j] == 0) {
                 return Some(i);
             }
         }
     }
     None
+}
+
+pub fn inode_vnode_id(idx: usize) -> Option<u16> {
+    unsafe {
+        if idx >= MAX_INODES || !INODES[idx].used {
+            return None;
+        }
+        Some(INODES[idx].vnode_id)
+    }
 }
 
 pub fn inode_size(idx: usize) -> Option<usize> {
