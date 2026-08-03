@@ -38,3 +38,12 @@ SECTIONS
 
     _kernel_end = ALIGN(4K);
 }
+
+/* Ensure the first PT_LOAD covers the multiboot header at 1M */
+PHDRS
+{
+    text PT_LOAD FLAGS(5);  /* R E - covers .multiboot2 + .text.entry + .text */
+    rodata PT_LOAD FLAGS(4); /* R */
+    data PT_LOAD FLAGS(6);   /* R W */
+    bss PT_LOAD FLAGS(6);    /* R W */
+}

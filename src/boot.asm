@@ -14,8 +14,8 @@ multiboot_header:
     .long -(MAGIC + ARCH + HDR_LEN)
     /* End tag */
     .balign 8
-    .word 0
-    .word 0
+    .long 0
+    .long 0
     .long 8
 header_end:
 
