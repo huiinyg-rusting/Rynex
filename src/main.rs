@@ -53,12 +53,12 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     // the level is DEBUG. Set to LOG_DEBUG here (and reflash) to see them live.
     klog::set_console_level(klog::LOG_INFO);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
-        serial::write_str("Niobix v0.1.0\n");
+        serial::write_str("Rynex kernel v0.0.1 Alpha\n");
     }
     vga::clear();
 
     vga::set_color(0x0C, 0x00);
-    vga::write_str("Niobix v0.1.0\n");
+    vga::write_str("Rynex kernel v0.0.1 Alpha\n");
     vga::set_color(0x0A, 0x00);
     vga::write_str("Booting...\n");
     vga::set_color(0x0F, 0x00);
