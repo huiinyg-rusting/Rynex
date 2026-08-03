@@ -95,6 +95,14 @@ pub fn push_char(c: u8) {
     crate::task::futex_wake(addr as *const u32, 1);
 }
 
+/// Push a multi-byte escape sequence (e.g. arrow keys) into the input buffer,
+/// byte by byte, so consumers see the full ANSI sequence.
+fn push_seq(bytes: &[u8]) {
+    for &c in bytes {
+        push_char(c);
+    }
+}
+
 pub fn pop_char() -> Option<u8> {
     unsafe {
         if RING_HEAD == RING_TAIL {
@@ -149,19 +157,121 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     }
 }
 
+// ── Modifier / state tracking ────────────────────────────────────
+// The 8042 (in translation mode = scancode set 1) emits a single make byte
+// on press and a byte with bit 7 set on release. Extended keys (arrows,
+// keypad) are prefixed with 0xE0. We keep state across interrupts here.
+static mut SHIFT: bool = false;
+static mut CAPSLOCK: bool = false;
+static mut CTRL: bool = false;
+static mut EXTENDED: bool = false;
+
+const E0_UP: u16 = 0x48;
+const E0_DOWN: u16 = 0x50;
+const E0_LEFT: u16 = 0x4B;
+const E0_RIGHT: u16 = 0x4D;
+const E0_HOME: u16 = 0x47;
+const E0_END: u16 = 0x4F;
+const E0_PGUP: u16 = 0x49;
+const E0_PGDN: u16 = 0x51;
+
+fn key_char(sc: u16) -> u8 {
+    let idx = sc as usize;
+    if idx >= 128 { return 0; }
+    let shifted = unsafe { SHIFT };
+    let base = if shifted {
+        SCANCODE_SHIFT_MAP[idx]
+    } else {
+        SCANCODE_MAP[idx]
+    };
+    // Apply Caps Lock: toggle case on letter keys (does not affect digits/symbols).
+    let caps = unsafe { CAPSLOCK };
+    if caps {
+        return base.to_ascii_uppercase();
+    }
+    base
+}
+
+/// Handle an extended (0xE0-prefixed) scancode. Modifier pills (Extended Ctrl/Alt)
+/// and arrow/navigation keys mapped to ANSI escape sequences.
+fn handle_extended(sc: u8) {
+    let idx = sc as u16;
+    let released = sc & 0x80 != 0;
+    let make = idx & 0x7F;
+    if released {
+        return;
+    }
+    match make {
+        E0_UP => push_seq(b"\x1b[A"),
+        E0_DOWN => push_seq(b"\x1b[B"),
+        E0_RIGHT => push_seq(b"\x1b[C"),
+        E0_LEFT => push_seq(b"\x1b[D"),
+        E0_HOME => push_seq(b"\x1b[H"),
+        E0_END => push_seq(b"\x1b[F"),
+        E0_PGUP => push_seq(b"\x1b[5~"),
+        E0_PGDN => push_seq(b"\x1b[6~"),
+        _ => {}
+    }
+}
+
 #[no_mangle]
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structures::idt::InterruptStackFrame) {
     let status = inb(KEYBOARD_STATUS);
     if status & 1 != 0 {
-        let scancode = inb(KEYBOARD_DATA);
-        if scancode & 0x80 == 0 {
-            // Key press (not release)
-            let idx = scancode as usize;
-            if idx < 128 {
-                let c = SCANCODE_MAP[idx];
-                if c != 0 {
-                    push_char(c);
+        let sc = inb(KEYBOARD_DATA);
+        let released = sc & 0x80 != 0;
+        let make = sc & 0x7F;
+
+        // Track the 0xE0 prefix (extended key) first.
+        if sc == 0xE0 {
+            unsafe { EXTENDED = true; }
+            crate::pic::send_eoi(1);
+            return;
+        }
+
+        if unsafe { EXTENDED } {
+            unsafe { EXTENDED = false; }
+            handle_extended(sc);
+            crate::pic::send_eoi(1);
+            return;
+        }
+
+        // Update modifier state on both press and release.
+        match make {
+            0x2A | 0x36 => unsafe { SHIFT = !released; }, // Left/Right Shift
+            0x1D => unsafe { CTRL = !released; },          // Ctrl
+            0x38 => { /* Alt — no layout impact here */ }
+            _ => {}
+        }
+
+        if released {
+            crate::pic::send_eoi(1);
+            return;
+        }
+
+        // Caps Lock: toggle on press and consume.
+        if make == 0x3A {
+            unsafe { CAPSLOCK = !CAPSLOCK; }
+            crate::pic::send_eoi(1);
+            return;
+        }
+
+        if make < 128 {
+            // Ctrl+letter → control character (e.g. Ctrl+C = 0x03). The TTY
+            // uses ISIG to turn ^C into SIGINT; raw control codes still get
+            // passed through so non-canonical readers can see them.
+            let ctrl = unsafe { CTRL };
+            if ctrl {
+                let ch = key_char(make as u16);
+                if ch.is_ascii_alphabetic() {
+                    push_char(ch & 0x1F);
+                    crate::pic::send_eoi(1);
+                    return;
                 }
+            }
+            let c = key_char(make as u16);
+            if c != 0 {
+                push_char(c);
             }
         }
     }

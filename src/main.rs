@@ -27,6 +27,7 @@ mod vfs_core;
 mod vfs;
 mod keyboard;
 mod tty;
+mod services;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -203,6 +204,12 @@ memory::init(_info);
     vfs_core::ramfs::init();
     vfs_core::init();
     let _root_vnode = vfs_core::mount_root();
+
+    // Register kernel services as named IPC ports. Clients connect to these by
+    // name; in this phase the services remain in-kernel (see services.rs).
+    services::register(b"vfs", services::vfs_handler);
+    services::register(b"console", services::console_handler);
+    services::register(b"kbd", services::kbd_handler);
 
     task::init_scheduler();
     task::test();

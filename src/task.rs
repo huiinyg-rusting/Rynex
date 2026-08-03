@@ -11,6 +11,48 @@ pub static mut CURRENT_TASK_ID: u64 = 0;
 #[no_mangle]
 pub static mut TASKS_PTR: *mut Task = core::ptr::null_mut();
 
+pub const PRIORITY_LEVELS: usize = 40;
+pub const PRIORITY_HIGHEST: u8 = 0;
+pub const PRIORITY_LOWEST: u8 = 39;
+pub const PRIORITY_DEFAULT_NICE: i32 = 0;
+pub const PRIORITY_DEFAULT: u8 = 20;
+
+// ── Signals ──────────────────────────────────────────────────────
+pub const SIGNAL_COUNT: usize = 32;
+pub const SIG_DFL: usize = 0;          // fake handler value -> default action
+pub const SIG_IGN: usize = 1;          // fake handler value -> ignored
+pub const SA_RESTORER: u64 = 0x04000000;
+
+pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
+pub const SIGILL: i32 = 4;
+pub const SIGTRAP: i32 = 5;
+pub const SIGABRT: i32 = 6;
+pub const SIGBUS: i32 = 7;
+pub const SIGFPE: i32 = 8;
+pub const SIGKILL: i32 = 9;
+pub const SIGSEGV: i32 = 11;
+pub const SIGPIPE: i32 = 13;
+pub const SIGALRM: i32 = 14;
+pub const SIGTERM: i32 = 15;
+pub const SIGCONT: i32 = 18;
+pub const SIGCHLD: i32 = 17;
+pub const SIGSTOP: i32 = 19;
+pub const SIGTSTP: i32 = 20;
+
+// A per-task signal action, stored in the Linux rt_sigaction layout field
+// subset the kernel needs: handler pointer + flags + mask + restorer.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SignalAction {
+    pub handler: u64,
+    pub mask: u64,
+    pub flags: u64,
+    pub restorer: u64,
+}
+impl SignalAction {
+    pub const fn empty() -> Self { SignalAction { handler: SIG_DFL as u64, mask: 0, flags: 0, restorer: 0 } }
+}
 pub const MAX_TASKS: usize = 64;
 pub const KERNEL_STACK_PAGES: usize = 8;
 pub const USER_STACK_PAGES: usize = 8;
@@ -45,12 +87,6 @@ pub const USER_CODE_SELECTOR: u64 = 0x20;
 pub const USER_DATA_SELECTOR: u64 = 0x18;
 
 // Priority: internal 0..39 maps to Linux nice -20..19
-pub const PRIORITY_LEVELS: usize = 40;
-pub const PRIORITY_HIGHEST: u8 = 0;
-pub const PRIORITY_LOWEST: u8 = 39;
-pub const PRIORITY_DEFAULT_NICE: i32 = 0;
-pub const PRIORITY_DEFAULT: u8 = 20;
-
 pub const fn nice_to_prio(nice: i32) -> u8 {
     (nice + 20) as u8
 }
@@ -156,6 +192,14 @@ pub struct Task {
     pub blocked_on: u64,
     pub pi_boosted: bool,
 
+    // Process identity marks. Default (boot/init) is uid 0 (root); user-space
+    // owns the semantics. Kernel never does password logic — these are pure
+    // identity marks for the process to read via getuid/getgid.
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+
     pub runqueue_next: Option<u64>,
 
     pub ipc_partner: u64,
@@ -167,6 +211,16 @@ pub struct Task {
     // brk / heap
     pub brk_start: u64,
     pub brk_end: u64,
+
+    // ── Signal state ─────────────────────────────────────────────
+    // Terminating default-action signals are honoured so Ctrl+C (SIGINT),
+    // SIGTERM, SIGKILL etc. actually kill a process / process group.
+    // Per-task handler table (Linux rt_sigaction ABI).
+    pub sig_handlers: [SignalAction; SIGNAL_COUNT],
+    // Signals currently blocked (rt_sigprocmask). Bit i == signal i.
+    pub sig_blocked: u64,
+    // Signals pending delivery to the process.
+    pub sig_pending: u64,
 
     // VMAs for mmap/demand paging
     pub vmas: [Vma; MAX_VMAS],
@@ -204,15 +258,22 @@ impl Task {
             parent: None,
             children_head: None,
             sibling_next: None,
-            blocked_on: 0,
-            pi_boosted: false,
-            runqueue_next: None,
-            ipc_partner: 0,
+blocked_on: 0,
+                pi_boosted: false,
+                runqueue_next: None,
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+                ipc_partner: 0,
             ipc_phys: 0,
             ipc_vaddr: 0,
             exit_code: 0,
             brk_start: 0,
             brk_end: 0,
+            sig_handlers: [SignalAction::empty(); SIGNAL_COUNT],
+            sig_blocked: 0,
+            sig_pending: 0,
             vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
             wakeup_tick: 0,
             addr_space_private: false,
@@ -1426,6 +1487,11 @@ pub const SYS_rynex_spawn: u64 = 2006;
 pub const SYS_rynex_getppid: u64 = 2007;
 pub const SYS_rynex_sleep: u64 = 2008;
 pub const SYS_rynex_yield: u64 = 2009;
+pub const SYS_rynex_ipc_create: u64 = 2010;
+pub const SYS_rynex_ipc_connect: u64 = 2011;
+pub const SYS_rynex_ipc_send: u64 = 2012;
+pub const SYS_rynex_ipc_recv: u64 = 2013;
+pub const SYS_rynex_ipc_close: u64 = 2014;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -1481,10 +1547,10 @@ pub extern "C" fn syscall_handler(
         SYS_getcwd => sys_getcwd(arg1 as *mut u8, arg2 as usize),
         SYS_chdir => sys_chdir(arg1 as *const u8),
         SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
-        SYS_getuid => 0,
-        SYS_getgid => 0,
-        SYS_geteuid => 0,
-        SYS_getegid => 0,
+        SYS_getuid => sys_getuid(),
+        SYS_getgid => sys_getgid(),
+        SYS_geteuid => sys_geteuid(),
+        SYS_getegid => sys_getegid(),
         SYS_getdents64 => sys_getdents64(arg1 as u32, arg2 as *mut u8, arg3 as usize),
         SYS_mkdir => sys_mkdir(arg1 as *const u8, arg2 as u32),
         SYS_rmdir => sys_rmdir(arg1 as *const u8),
@@ -1509,10 +1575,10 @@ pub extern "C" fn syscall_handler(
         SYS_exit_group => sys_exit(arg1 as i32),
         SYS_set_robust_list => 0,
         SYS_getrandom => sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32),
-        SYS_rt_sigaction => 0,
-        SYS_rt_sigprocmask => 0,
-        SYS_rt_sigreturn => 0,
-        SYS_sigaltstack => 0,
+        SYS_rt_sigaction => sys_rt_sigaction(arg1 as i32, arg2 as u64, arg3 as u64),
+        SYS_rt_sigprocmask => sys_rt_sigprocmask(arg1 as i32, arg2 as u64, arg3 as u64),
+        SYS_rt_sigreturn => sys_rt_sigreturn(),
+        SYS_sigaltstack => sys_sigaltstack(arg1 as u64, arg2 as u64),
         SYS_setpgid => sys_setpgid(arg1 as i32, arg2 as i32),
         SYS_getppid => sys_getppid(),
         SYS_getpgid => sys_getpgid(arg1 as i32),
@@ -1531,6 +1597,11 @@ pub extern "C" fn syscall_handler(
         SYS_rynex_getppid => sys_getppid(),
         SYS_rynex_sleep => sys_sleep(arg1 as u64),
         SYS_rynex_yield => sys_rynex_yield(),
+        SYS_rynex_ipc_create => crate::ipc::ipc_create(arg1 as *const u8, arg2 as usize),
+        SYS_rynex_ipc_connect => crate::ipc::ipc_connect(arg1 as *const u8, arg2 as usize),
+        SYS_rynex_ipc_send => crate::ipc::ipc_send(arg1 as u64, arg2 as *const u8, arg3 as usize, arg4 as u32),
+        SYS_rynex_ipc_recv => crate::ipc::ipc_recv(arg1 as u64, arg2 as *mut u8, arg3 as usize),
+        SYS_rynex_ipc_close => crate::ipc::ipc_close(arg1 as u64),
         SYS_reboot => sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
         _ => {
             // Print first unknown syscall
@@ -1739,6 +1810,22 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
     woken
 }
 
+/// Block the current task on a futex address, resuming only after
+/// `futex_wake` (or a spurious timer wake). Returns true if we were woken.
+/// Intended for the IPC mailbox send/recv loops.
+pub fn block_on_futex(uaddr: *const u32) -> bool {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return false; }
+    remove_from_runqueue(id);
+    unsafe {
+        let idx = task_idx(id);
+        TASKS[idx].blocked_on = uaddr as u64;
+        TASKS[idx].state = TaskState::Blocked;
+    }
+    force_schedule();
+    true
+}
+
 fn futex_lock_pi(uaddr: *const u32) -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
@@ -1861,8 +1948,7 @@ fn futex_unlock_pi(uaddr: *const u32) -> i64 {
 // ── Error constants ──────────────────────────────────────────────
 
 pub const EPERM: i64 = 1;
-pub const ENOENT: i64 = 2;
-pub const ESRCH: i64 = 3;
+pub const ENOENT: i64 = 2;pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
 pub const ENXIO: i64 = 6;
@@ -1897,6 +1983,8 @@ pub const ERANGE: i64 = 34;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
+pub const EMSGSIZE: i64 = 90;
+pub const EADDRNOTAVAIL: i64 = 99;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -2583,12 +2671,19 @@ fn sys_fork() -> i64 {
             blocked_on: 0,
             pi_boosted: false,
             runqueue_next: None,
+            uid: parent.uid,
+            gid: parent.gid,
+            euid: parent.euid,
+            egid: parent.egid,
             ipc_partner: 0,
             ipc_phys: 0,
             ipc_vaddr: 0,
             exit_code: 0,
             brk_start: parent.brk_start,
             brk_end: parent.brk_end,
+            sig_handlers: parent.sig_handlers,
+            sig_blocked: parent.sig_blocked,
+            sig_pending: 0,
             vmas: parent.vmas,
             wakeup_tick: 0,
             addr_space_private: false,
@@ -3067,6 +3162,30 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
 
 // ── Get PID / PPID ───────────────────────────────────────────────
 
+fn sys_getuid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].uid as i64 }
+}
+
+fn sys_getgid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].gid as i64 }
+}
+
+fn sys_geteuid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].euid as i64 }
+}
+
+fn sys_getegid() -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].egid as i64 }
+}
+
 fn sys_getpid() -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     id as i64
@@ -3353,23 +3472,46 @@ fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
     0
 }
 
-// ── Process groups (stubs) ──────────────────────────────────────────
-
-fn sys_setpgid(_pid: i32, _pgid: i32) -> i64 { 0 }
-fn sys_getpgid(_pid: i32) -> i64 {
-    let id = current_task_id();
+// ── Process groups ──────────────────────────────────────────────
+// The kernel keeps a lightweight process-group id on each task. Shells use
+// TIOCSPGRP (via TTY) to mark the foreground group; kill(-pgid) routes to it.
+fn sys_setpgid(pid: i32, pgid: i32) -> i64 {
+    let cur = current_task_id();
+    if cur == 0 { return -EINVAL; }
+    let target = if pid == 0 { cur as i32 } else { pid };
+    let group = if pgid == 0 { target } else { pgid };
+    // Only allow setting own pgid for now; treating PID itself as PGID keeps
+    // semantics simple and consistent with getpgrp/getpgid below.
+    if target != cur as i32 && target != 0 { return -EPERM; }
+    unsafe {
+        let idx = task_idx(target as u64);
+        if TASKS[idx].id == 0 { return -ESRCH; }
+        TASKS[idx].tgid = group as u64;
+    }
+    0
+}
+fn sys_getpgid(pid: i32) -> i64 {
+    let id = if pid == 0 { current_task_id() } else { pid as u64 };
     if id == 0 { return -EINVAL; }
-    unsafe { TASKS[task_idx(id)].id as i64 } // return own PID as PGID
+    unsafe {
+        let idx = task_idx(id);
+        if TASKS[idx].id == 0 { return -ESRCH; }
+        TASKS[idx].tgid as i64
+    }
 }
 fn sys_getpgrp() -> i64 {
     let id = current_task_id();
     if id == 0 { return -EINVAL; }
-    unsafe { TASKS[task_idx(id)].id as i64 }
+    unsafe { TASKS[task_idx(id)].tgid as i64 }
 }
 fn sys_setsid() -> i64 {
     let id = current_task_id();
     if id == 0 { return -EINVAL; }
-    unsafe { TASKS[task_idx(id)].id as i64 }
+    unsafe {
+        let idx = task_idx(id);
+        TASKS[idx].tgid = id;
+    }
+    id as i64
 }
 
 // ── Wait4 ──────────────────────────────────────────────────────────
@@ -3380,33 +3522,252 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
     sys_waitpid(pid, status_ptr, wnohang)
 }
 
-// ── Kill ───────────────────────────────────────────────────────────
+// ── Kill / signal delivery ────────────────────────────────────────
+
+/// Deliver `sig` to a single task slot. Returns 0 ok / -ESRCH.
+fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
+    unsafe {
+        let t = &mut TASKS[idx];
+        if t.id == 0 || t.state == TaskState::Empty { return -ESRCH; }
+        if sig <= 0 || sig as usize >= SIGNAL_COUNT { return -EINVAL; }
+        let sigi = sig as usize;
+
+        // SIGKILL / SIGSTOP cannot be caught or blocked.
+        if sig == SIGKILL || sig == SIGSTOP {
+            kill_task_zombie(idx, 128 + sig);
+            return 0;
+        }
+
+        // If the target has a real (non-DFL/non-IGN) handler and the signal is
+        // not blocked, mark it pending so a future phase can run the handler.
+        let act = t.sig_handlers[sigi];
+        let ignored = act.handler == SIG_IGN as u64;
+        let blocked = (t.sig_blocked >> sigi) & 1 != 0;
+
+        if ignored {
+            return 0;
+        }
+        if act.handler != SIG_DFL as u64 && !blocked {
+            t.sig_pending |= 1u64 << sigi;
+            return 0;
+        }
+        // Default action: for the terminating set, kill the process.
+        let terminates = sig == SIGINT || sig == SIGQUIT || sig == SIGILL
+            || sig == SIGABRT || sig == SIGSEGV || sig == SIGTERM
+            || sig == SIGPIPE || sig == SIGFPE || sig == SIGBUS
+            || sig == SIGTRAP || sig == SIGALRM;
+        if terminates {
+            kill_task_zombie(idx, 128 + sig);
+        }
+        // SIGCONT etc. are no-ops here.
+        0
+    }
+}
+
+/// Mark a task (by slot) as a zombie, remove it from the runqueue, and wake its
+/// parent. Unlike `exit_task`, this does not require the target to be running,
+/// so it is safe to call from another task's syscall (kill(2)).
+fn kill_task_zombie(idx: usize, code: i32) {
+    unsafe {
+        let t = &mut TASKS[idx];
+        t.exit_code = code;
+        t.state = TaskState::Zombie;
+        if t.id != 0 {
+            remove_from_runqueue(t.id);
+        }
+        if let Some(p) = t.parent {
+            let pidx = task_idx(p);
+            if TASKS[pidx].state == TaskState::Blocked
+                && (TASKS[pidx].blocked_on == t.id || TASKS[pidx].blocked_on == u64::MAX)
+            {
+                TASKS[pidx].state = TaskState::Ready;
+                TASKS[pidx].blocked_on = 0;
+                enqueue_task(p, TASKS[pidx].prio);
+            }
+        }
+    }
+}
+
+/// Deliver a signal to the current foreground process group (used by TTY ISIG
+/// handling for Ctrl+C → SIGINT). Exposed so the TTY driver can request it.
+pub fn signal_foreground_group(sig: i32) {
+    let current = current_task_id();
+    if current == 0 { return; }
+    unsafe {
+        let cur_pg = TASKS[task_idx(current)].tgid;
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id == 0 { continue; }
+            if TASKS[i].tgid == cur_pg || cur_pg == 0 {
+                sig_deliver_to_task(i, sig);
+            }
+        }
+    }
+}
 
 fn sys_kill(pid: i64, sig: i32) -> i64 {
     if sig == 0 { return 0; }
-    handle_default_signal(pid, sig);
-    0
+    // pid == 0  -> current process group
+    // pid < 0   -> kill process group (-pid)
+    // pid == -1 -> every process
+    // pid > 0   -> single process
+    let current = current_task_id();
+    let mut hits = 0i64;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id == 0 { continue; }
+            let id = TASKS[i].id as i64;
+            let pg = TASKS[i].tgid as i64;
+            let match_all = pid == -1
+                || (pid == 0 && pg == current as i64)
+                || (pid < -1 && pg == -pid)
+                || (pid > 0 && id == pid);
+            if match_all {
+                if sig_deliver_to_task(i, sig) == 0 {
+                    hits += 1;
+                }
+            }
+        }
+    }
+    // Permit sending to oneself/one's group; return 0 if we targeted anything.
+    if hits > 0 { 0 } else { -ESRCH }
 }
 fn sys_tkill(tid: i64, sig: i32) -> i64 {
     if sig == 0 { return 0; }
-    handle_default_signal(tid, sig);
-    0
+    if tid <= 0 { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(tid as u64);
+        if TASKS[idx].id == 0 { return -ESRCH; }
+        sig_deliver_to_task(idx, sig)
+    }
 }
 
 fn handle_default_signal(target: i64, sig: i32) {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
-    if id == 0 { return; }
-    if target == 0 || target == id as i64 || target == -1 || target == -(id as i64) {
-        match sig {
-            2 | 3 | 6 | 9 | 15 => {
-                serial::write_str("SYS:KILL signal ");
-                serial::write_dec(sig as u64);
-                serial::write_str(" -> exit\n");
-                exit_task(128 + sig);
+    // Legacy single-target path kept for internal callers; delegates to above.
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id == 0 { continue; }
+            let id = TASKS[i].id as i64;
+            if target == id || target == -(id) {
+                sig_deliver_to_task(i, sig);
             }
-            _ => {}
         }
     }
+}
+
+// ── rt_sigaction / rt_sigprocmask / rt_sigreturn / sigaltstack ──
+// Linux x86_64 ABI:
+//   struct rt_sigaction { handler(8) mask(8) flags(4) restorer(8) ... }
+//   kernel_sigaction = { handler:u64, flags:u64, restorer:u64, mask:u64 }
+// rt_sigreturn restores a `struct sigcontext` saved on the user stack by the
+// kernel when the handler was entered. We keep it ABI-shaped so future full
+// handler delivery can reuse it; today we store state and honour default
+// actions, matching the bug log's "kill default action" requirement.
+
+// linux kernel's internal sigaction layout for rt_sigaction syscall:
+#[repr(C)]
+struct KSigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+fn sys_rt_sigaction(sig: i32, act: u64, oldact: u64) -> i64 {
+    if sig <= 0 || sig as usize >= SIGNAL_COUNT {
+        return -EINVAL;
+    }
+    if sig == SIGKILL || sig == SIGSTOP {
+        return -EINVAL;
+    }
+    let sigi = sig as usize;
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    let idx = task_idx(id);
+
+    unsafe {
+        // Write old action out first (Linux writes oldact even if act fails).
+        if oldact != 0 {
+            let old = TASKS[idx].sig_handlers[sigi];
+            let ka = KSigAction {
+                handler: old.handler,
+                flags: old.flags,
+                restorer: old.restorer,
+                mask: old.mask,
+            };
+            core::ptr::write_volatile(oldact as *mut KSigAction, ka);
+        }
+        if act != 0 {
+            if !user_range_valid(act, core::mem::size_of::<KSigAction>(), false) {
+                return -EFAULT;
+            }
+            let ka = core::ptr::read_volatile(act as *const KSigAction);
+            TASKS[idx].sig_handlers[sigi] = SignalAction {
+                handler: ka.handler,
+                mask: ka.mask,
+                flags: ka.flags,
+                restorer: ka.restorer,
+            };
+        }
+    }
+    0
+}
+
+fn sys_rt_sigprocmask(how: i32, set: u64, oldset: u64) -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    let idx = task_idx(id);
+    unsafe {
+        if oldset != 0 {
+            let old = TASKS[idx].sig_blocked;
+            core::ptr::write_volatile(oldset as *mut u64, old);
+        }
+        if set != 0 {
+            let mask = core::ptr::read_volatile(set as *const u64);
+            let blockable = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+            match how {
+                0 => TASKS[idx].sig_blocked |= blockable,        // SIG_BLOCK
+                1 => TASKS[idx].sig_blocked &= !blockable,       // SIG_UNBLOCK
+                2 => TASKS[idx].sig_blocked = blockable,         // SIG_SETMASK
+                _ => return -EINVAL,
+            }
+        }
+    }
+    0
+}
+
+fn sys_rt_sigreturn() -> i64 {
+    // With handler delivery, this would pop the sigcontext the kernel wrote.
+    // Until handlers run, the only legal arrival here is a bogus call.
+    // Return -ENOSYS so libc treats it as unsupported rather than crashing.
+    -ENOSYS
+}
+
+fn sys_sigaltstack(ss: u64, old_ss: u64) -> i64 {
+    // Store/query altstack base+size. We do not switch stacks yet, but the
+    // state must round-trip for libc startup which probes it.
+    // stack_t layout: { ss_sp:u64, ss_flags:u32, _pad:u32, ss_size:u64 }
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    let idx = task_idx(id);
+    unsafe {
+        // Keep a simple static altstack mirror for the kernel task state.
+        static mut ALTSTACK_SP: u64 = 0;
+        static mut ALTSTACK_FLAGS: u32 = 0;
+        static mut ALTSTACK_SIZE: u64 = 0;
+        if old_ss != 0 {
+            core::ptr::write_volatile(old_ss as *mut u64, ALTSTACK_SP);
+            core::ptr::write_volatile((old_ss + 8) as *mut u32, ALTSTACK_FLAGS);
+            core::ptr::write_volatile((old_ss + 16) as *mut u64, ALTSTACK_SIZE);
+        }
+        if ss != 0 {
+            let sp = core::ptr::read_volatile(ss as *const u64);
+            let size = core::ptr::read_volatile((ss + 16) as *const u64);
+            ALTSTACK_SP = sp;
+            ALTSTACK_SIZE = size;
+            ALTSTACK_FLAGS = 0;
+        }
+    }
+    0
 }
 
 // ── Uname ──────────────────────────────────────────────────────────
@@ -4102,13 +4463,10 @@ pub fn test() {
         serial::write_str("VFS: created '/dev/null'\n");
     }
 
-    // Create minimal /etc/passwd for busybox ash
-    if crate::vfs::find_inode(b"/etc/passwd").is_none() {
-        let _ = crate::vfs_core::mkdir(b"/etc", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
-        let passwd_content = b"root:x:0:0:root:/root:/bin/ash\n";
-        crate::vfs::create_file(b"/etc/passwd", passwd_content);
-        serial::write_str("VFS: created '/etc/passwd'\n");
-    }
+    // NOTE: /etc/passwd is NOT created here. Password/account handling is
+    // user-space policy; the kernel never touches it (see README "Policy").
+    // The user-space init/shell is responsible for provisioning /etc/passwd
+    // through ordinary VFS operations when it starts.
 
     // Load user ELF modules from multiboot2
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
