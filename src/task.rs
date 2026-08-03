@@ -21,7 +21,8 @@ pub const TIMER_IRQ_VECTOR: u8 = IRQ_BASE + 0;
 pub const USER_TLS_VADDR: u64 = 0x0000_7FFF_FFFF_A000;
 
 // 设为 true 显示调试信息，false 隐藏
-static DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
+#[allow(dead_code)] // kept as a module-local fast enable; runtime debug is via klog level (Ctrl-L).
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Track if current CPU is in a syscall (to prevent context switches during syscalls)
 static IN_SYSCALL: AtomicBool = AtomicBool::new(false);
@@ -1081,7 +1082,7 @@ static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 
 pub extern "C" fn timer_schedule() -> u64 {
     crate::pic::send_eoi(0);
-    // Poll UART for serial input and feed into keyboard buffer
+    // Poll UART for serial input and feed into keyboard buffer.
     while let Some(c) = crate::serial::read_byte_nonblocking() {
         // Filter: only accept printable ASCII and common control chars
         if c >= 0x20 && c <= 0x7E || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F {
