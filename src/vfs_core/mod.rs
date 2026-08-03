@@ -817,6 +817,13 @@ pub fn remove(path: &[u8]) -> Result<(), &'static str> {
     ops.remove(pino, name)
 }
 
+pub fn symlink(path: &[u8], target: &[u8]) -> Result<u64, &'static str> {
+    let parent = parent_path(path);
+    let name = file_name(path);
+    let (pino, ops) = path_resolve(parent)?;
+    ops.symlink(pino, name, target)
+}
+
 pub fn rmdir(path: &[u8]) -> Result<(), &'static str> {
     let parent = parent_path(path);
     let name = file_name(path);

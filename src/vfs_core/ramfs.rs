@@ -334,7 +334,7 @@ impl VnodeOps for RamFs {
         let ino = alloc_inode().ok_or("ramfs: no inodes")?;
         let child_ptr = get_ino(ino).ok_or("bad child")?;
         let child = unsafe { &mut *child_ptr };
-        child.mode = S_IFLNK | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+        child.mode = S_IFLNK | 0o777;
         child.symlink_len = target.len().min(MAX_SYMLINK_LEN);
         child.symlink_target[..child.symlink_len].copy_from_slice(&target[..child.symlink_len]);
 
