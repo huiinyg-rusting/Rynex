@@ -2,6 +2,7 @@ pub mod types;
 pub mod xattr;
 pub mod ext3;
 pub mod ramfs;
+pub mod procfs;
 
 use crate::spinlock::Mutex;
 use crate::serial;
@@ -375,6 +376,15 @@ pub fn mount_root() -> Result<u16, &'static str> {
 
 pub fn mount_ext3(_device_read: fn(u64) -> Option<*mut u8>, _device_write: fn(u64, &[u8]) -> bool, _mount_mp: &[u8]) -> Result<u16, &'static str> {
     Err("ext3 not yet implemented as VnodeOps")
+}
+
+/// Mount a filesystem at the given absolute path. `ops` is the VnodeOps and
+/// `root_ino` its root inode. Returns the vnode id for the mount root.
+pub fn mount(mp: &[u8], fs_id: FsId, root_ino: u64, ops: &'static dyn VnodeOps) -> Result<u16, &'static str> {
+    let mut mt = MOUNT_TABLE.lock();
+    let mount_id = mt.alloc(mp, fs_id, root_ino, ops).ok_or("mount table full")?;
+    let vnode_id = VNODE_TABLE.lock().alloc(root_ino, fs_id, mount_id as u64, ops).ok_or("vnode table full")?;
+    Ok(vnode_id)
 }
 
 pub fn path_to_vnode(path: &[u8]) -> Result<u16, &'static str> {
