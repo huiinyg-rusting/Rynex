@@ -49,7 +49,7 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     serial::init();
     // Boot with a permissive console threshold so the full boot trace is on
     // the serial log; tighten it later once boot is stable.
-    klog::set_console_level(klog::LOG_DEBUG);
+    klog::set_console_level(klog::LOG_INFO);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("Niobix v0.1.0\n");
     }
