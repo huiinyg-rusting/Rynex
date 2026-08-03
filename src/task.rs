@@ -170,6 +170,11 @@ pub struct Task {
 
     // For sleep syscall
     pub wakeup_tick: u64,
+
+    // True if the address space is private (post-exec, fresh pml4) so every
+    // user page belongs to this task. False for a COW-forked child that never
+    // exec'd, where read-only pages are shared with the parent.
+    pub addr_space_private: bool,
 }
 
 impl Task {
@@ -207,6 +212,7 @@ impl Task {
             brk_end: 0,
             vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
             wakeup_tick: 0,
+            addr_space_private: false,
         }
     }
 }
@@ -589,6 +595,24 @@ fn schedule_inner(force: bool) {
         let old_ptr = &mut TASKS[old_idx].regs as *mut Registers;
         let new_ptr = &TASKS[new_idx].regs as *const Registers;
 
+        // Probe: log kernel-mode resume targets (cs.RPL==0) so the first bad
+        // regs.rsp/regs.rip can be identified.
+        if (TASKS[new_idx].regs.cs & 3) == 0 {
+            crate::serial::write_str("[RSM:S] cur=");
+            crate::serial::write_dec(old);
+            crate::serial::write_str(" next=");
+            crate::serial::write_dec(next_id);
+            crate::serial::write_str(" rip=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rip);
+            crate::serial::write_str(" rsp=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rsp);
+            crate::serial::write_str(" cs=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.cs);
+            crate::serial::write_str(" rbp=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rbp);
+            crate::serial::write_str("\n");
+        }
+
         // Restore FS base for the new task
         let fs_base = TASKS[new_idx].regs.fs_base;
         core::arch::asm!(
@@ -721,7 +745,11 @@ pub unsafe extern "C" fn context_switch(old: *mut Registers, new: *const Registe
         "mov r15, [rsi + 0x78]",
         "push qword ptr [rsi + 0x80]",
         "mov rsi, [rsi + 0x20]",
-        "sti",
+        // No sti: resume with IF=0. Interrupts re-enable on return to user mode
+        // (sysretq/iretq restore RFLAGS). Keeping IF=0 through kernel code
+        // prevents timer preemption inside kernel windows (syscall body/tail,
+        // schedule_inner), which used to build a synthetic preempt frame whose
+        // fixed stack location + global scratch could corrupt the resume RIP.
         "ret",
         // Kernel→user: build iretq frame on kernel stack
         "1: push qword ptr [rsi + 0x98]",     // SS
@@ -899,6 +927,130 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.rflags = *frame.add(2);
             regs.rsp    = frame as u64 + 24;
             regs.ss     = KERNEL_DATA_SELECTOR;
+
+            // Diagnostics: flag kernel-mode RIPs that fall outside .text
+            // (0x106000..0x11452f). A kernel task should never be "running"
+            // from .data/.rodata — this indicates the interrupted stream was
+            // already corrupt (ret/jump landed in data).
+            let rip = regs.rip;
+            let in_text = rip >= 0x106000 && rip < 0x11452f;
+            if !in_text && crate::klog::get_console_level() >= crate::klog::LOG_INFO {
+                crate::serial::write_str("[BADKERNELRIP] task=");
+                crate::serial::write_dec(current);
+                crate::serial::write_str(" kstack=0x");
+                crate::serial::write_hex(TASKS[idx].kernel_stack);
+                crate::serial::write_str(" rip=0x");
+                crate::serial::write_hex(rip);
+                crate::serial::write_str(" frame[0]=0x");
+                crate::serial::write_hex(*frame.add(0));
+                crate::serial::write_str("\n");
+                // Dump interrupted kernel stack (return addresses live here).
+                // For a kernel->kernel interrupt, regs.rsp = frame+24 is the
+                // interrupted RSP; the call chain sits below it.
+                let stk = frame as u64 + 24;
+                crate::serial::write_str("  rsp=0x");
+                crate::serial::write_hex(stk);
+                crate::serial::write_str("\n");
+                for j in (0..48u64).step_by(8) {
+                    crate::serial::write_str("  [");
+                    crate::serial::write_hex(j);
+                    crate::serial::write_str("]=0x");
+                    unsafe {
+                        crate::serial::write_hex(core::ptr::read_volatile((stk - 8 * j) as *const u64));
+                    }
+                    crate::serial::write_str("\n");
+                }
+                crate::serial::write_str("  +8=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 8) as *const u64) });
+                crate::serial::write_str(" +10=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x10) as *const u64) });
+                crate::serial::write_str(" +18=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x18) as *const u64) });
+                crate::serial::write_str(" +20=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x20) as *const u64) });
+                crate::serial::write_str("\n  +28=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x28) as *const u64) });
+                crate::serial::write_str(" +30=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x30) as *const u64) });
+                crate::serial::write_str(" +38=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x38) as *const u64) });
+                crate::serial::write_str(" +40=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x40) as *const u64) });
+                crate::serial::write_str("\n  +48=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x48) as *const u64) });
+                crate::serial::write_str(" +50=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x50) as *const u64) });
+                crate::serial::write_str(" +58=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x58) as *const u64) });
+                crate::serial::write_str(" +60=0x");
+                crate::serial::write_hex(unsafe { core::ptr::read_volatile((stk + 0x60) as *const u64) });
+                crate::serial::write_str("\n");
+                crate::serial::write_str("  scc_top=0x");
+                crate::serial::write_hex(unsafe { crate::gdt::CURRENT_SYSCALL_STACK_TOP });
+                crate::serial::write_str("\n");
+                crate::serial::write_str("  tasks:");
+                for ti in 0..MAX_TASKS {
+                    let t = &TASKS[ti];
+                    if t.id != 0 {
+                        crate::serial::write_str(" [");
+                        crate::serial::write_dec(t.id);
+                        crate::serial::write_str("]st=");
+                        crate::serial::write_dec(t.state as u64);
+                        crate::serial::write_str(" ks=0x");
+                        crate::serial::write_hex(t.kernel_stack);
+                        crate::serial::write_str(" rip=0x");
+                        crate::serial::write_hex(t.regs.rip);
+                        crate::serial::write_str(" rsp=0x");
+                        crate::serial::write_hex(t.regs.rsp);
+                    }
+                }
+                crate::serial::write_str("\n");
+                // Print saved resume state of this task (regs.rip/rsp) to see
+                // whether the stored context is itself corrupt.
+                crate::serial::write_str("  saved.rax=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rax);
+                crate::serial::write_str(" rbx=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rbx);
+                crate::serial::write_str(" rbp=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rbp);
+                crate::serial::write_str(" rsp=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rsp);
+                crate::serial::write_str("\n  saved.r8=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r8);
+                crate::serial::write_str(" r9=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r9);
+                crate::serial::write_str(" r10=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r10);
+                crate::serial::write_str(" r11=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r11);
+                crate::serial::write_str(" r12=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r12);
+                crate::serial::write_str(" r13=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r13);
+                crate::serial::write_str(" r14=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r14);
+                crate::serial::write_str(" r15=0x");
+                crate::serial::write_hex(TASKS[idx].regs.r15);
+                crate::serial::write_str("\n  saved.rip=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rip);
+                crate::serial::write_str(" cs=0x");
+                crate::serial::write_hex(TASKS[idx].regs.cs);
+                crate::serial::write_str(" rflags=0x");
+                crate::serial::write_hex(TASKS[idx].regs.rflags);
+                crate::serial::write_str(" ss=0x");
+                crate::serial::write_hex(TASKS[idx].regs.ss);
+                crate::serial::write_str("\n");
+                // PREEMPT_SCRATCH = [real_rax, real_rdx, real_rip] of the last
+                // build_kernel_preempt_frame call. If real_rip is corrupt, the
+                // preempt_trampoline's jmp landed the CPU here.
+                crate::serial::write_str("  scratch.rax=0x");
+                crate::serial::write_hex(PREEMPT_SCRATCH[0]);
+                crate::serial::write_str(" rdx=0x");
+                crate::serial::write_hex(PREEMPT_SCRATCH[1]);
+                crate::serial::write_str(" rip=0x");
+                crate::serial::write_hex(PREEMPT_SCRATCH[2]);
+                crate::serial::write_str("\n");
+            }
         }
     }
 }
@@ -960,12 +1112,16 @@ pub extern "C" fn timer_schedule() -> u64 {
             return 0;
         }
 
-        // User task interrupted in kernel mode (during a syscall): build a
-        // self-frame on the per-task kernel_stack. After iretq, RSP is restored
-        // to regs.rsp (the syscall_stack address saved by save_interrupt_context),
-        // so the interrupted call chain is preserved.
+        // Resume the current task: return 0 so the handler restores directly
+        // from the CPU-pushed interrupt frame (iretq). Building a synthetic
+        // frame here (kernel_stack-0xA0) + global PREEMPT_SCRATCH + trampoline
+        // is fragile: the fixed-address frame and global scratch can be
+        // clobbered by later kernel-stack activity or a second preempt,
+        // corrupting the resume RIP (observed jumps into .data/TASKS). A plain
+        // iretq preserves the interrupted kernel context exactly, and is what
+        // the kernel-task path below already does.
         if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
-            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return 0;
         }
 
         // Decrement time slice
@@ -973,14 +1129,14 @@ pub extern "C" fn timer_schedule() -> u64 {
             TASKS[idx].time_slice -= 1;
         }
 
-        // If task not running, don't reschedule — just build frame from saved regs
+        // If task not running, don't reschedule — resume it as-is
         if TASKS[idx].state != TaskState::Running {
-            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return 0;
         }
 
         // Time slice still positive → keep running current task
         if TASKS[idx].time_slice > 0 {
-            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return 0;
         }
 
         // Time slice expired — give a fresh time slice
@@ -991,13 +1147,13 @@ pub extern "C" fn timer_schedule() -> u64 {
             Some(id) => id,
             None => {
                 TASKS[idx].state = TaskState::Running;
-                return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+                return 0;
             }
         };
 
         if next_id == current {
             TASKS[idx].state = TaskState::Running;
-            return build_kernel_preempt_frame(TASKS[idx].kernel_stack, &raw const TASKS[idx]);
+            return 0;
         }
 
         // Switch to a different task — requeue current first
@@ -1010,6 +1166,21 @@ pub extern "C" fn timer_schedule() -> u64 {
         unsafe { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
         crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack);
+        if (TASKS[new_idx].regs.cs & 3) == 0 {
+            crate::serial::write_str("[RSM:T] cur=");
+            crate::serial::write_dec(current);
+            crate::serial::write_str(" next=");
+            crate::serial::write_dec(next_id);
+            crate::serial::write_str(" rip=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rip);
+            crate::serial::write_str(" rsp=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rsp);
+            crate::serial::write_str(" cs=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.cs);
+            crate::serial::write_str(" rbp=0x");
+            crate::serial::write_hex(TASKS[new_idx].regs.rbp);
+            crate::serial::write_str("\n");
+        }
         build_kernel_preempt_frame(TASKS[new_idx].kernel_stack, &raw const TASKS[new_idx])
     }
 }
@@ -1041,6 +1212,29 @@ fn build_frame_scratch(task_ptr: *const Task) -> u64 {
 fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
+        // Trace: log every kernel-mode (cs.RPL==0) preempt frame build whose
+        // RIP is outside .text (0x106000..0x11452f) — the first such build is
+        // the corruption. User-mode RIPs legitimately exceed .text, so only
+        // warn when the interrupted context is kernel code.
+        let rip = regs.rip;
+        let in_text = rip >= 0x106000 && rip < 0x11452f;
+        if (regs.cs & 3) == 0 && !in_text {
+            crate::serial::write_str("[BADPREEMPT] task=");
+            crate::serial::write_dec((*task_ptr).id);
+            crate::serial::write_str(" regs.rip=0x");
+            crate::serial::write_hex(rip);
+            crate::serial::write_str(" cs=0x");
+            crate::serial::write_hex(regs.cs);
+            crate::serial::write_str(" rbp=0x");
+            crate::serial::write_hex(regs.rbp);
+            crate::serial::write_str(" rsp=0x");
+            crate::serial::write_hex(regs.rsp);
+            crate::serial::write_str(" kstack=0x");
+            crate::serial::write_hex(kernel_stack);
+            crate::serial::write_str(" prev_scratch_rip=0x");
+            crate::serial::write_hex(PREEMPT_SCRATCH[2]);
+            crate::serial::write_str("\n");
+        }
         // Restore FS base for this task
         core::arch::asm!(
             "mov ecx, 0xC0000100",
@@ -1201,6 +1395,21 @@ pub extern "C" fn syscall_handler(
     arg1: u64, arg2: u64, arg3: u64,
     arg4: u64, arg5: u64, arg6: u64
 ) -> i64 {
+    crate::serial::write_str("SYS>");
+    crate::serial::write_dec(syscall_num);
+    crate::serial::write_str(" a1=0x");
+    crate::serial::write_hex(arg1);
+    crate::serial::write_str(" a2=0x");
+    crate::serial::write_hex(arg2);
+    crate::serial::write_str(" a3=0x");
+    crate::serial::write_hex(arg3);
+    crate::serial::write_str(" a4=0x");
+    crate::serial::write_hex(arg4);
+    crate::serial::write_str(" a5=0x");
+    crate::serial::write_hex(arg5);
+    crate::serial::write_str(" a6=0x");
+    crate::serial::write_hex(arg6);
+    crate::serial::write_str("\n");
     in_syscall_enter();
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if syscall_num == SYS_execve && arg2 != 0 {
@@ -1680,26 +1889,19 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                     let exit_code = child.exit_code;
                     let child_id = child.id;
                     let child_ks = child.kernel_stack;
-                    let child_us = child.user_stack;
+                    let child_pml4 = child.pml4;
+                    let addr_private = child.addr_space_private;
 
                     if !status_ptr.is_null() {
                         core::ptr::write_volatile(status_ptr, (exit_code & 0xFF) << 8);
                     }
                     free_stack(child_ks, KERNEL_STACK_PAGES);
-                    if child_us != 0 {
-                        // User stack pages were allocated individually (order 0)
-                        // in elf.rs, and after a COW fork they are shared read-only
-                        // with the parent. Free only pages this task still owns
-                        // (writable), so we never touch the parent's stack.
-                        let alloc = unsafe { &mut *crate::memory::allocator() };
-                        for page_off in 0..USER_STACK_PAGES as u64 {
-                            let vaddr = crate::paging::USER_STACK_TOP - (page_off + 1) * 4096;
-                            if let Some((phys, pte)) = crate::paging::resolve_phys_flags(child.pml4, vaddr) {
-                                if pte & crate::paging::PTE_WRITABLE != 0 {
-                                    alloc.free(phys & !0xFFF, 0);
-                                }
-                            }
-                        }
+                    if child_pml4 != 0 {
+                        // Free the entire user address space. After exec the pml4 is
+                        // fresh so every user page is owned by the child; a COW-forked
+                        // child that never exec'd only owns writable pages (read-only
+                        // pages are shared with the parent).
+                        crate::paging::free_address_space(child_pml4, addr_private);
                     }
                     TASKS[i] = Task::empty();
                     return child_id as i64;
@@ -2292,6 +2494,7 @@ fn sys_fork() -> i64 {
             brk_end: parent.brk_end,
             vmas: parent.vmas,
             wakeup_tick: 0,
+            addr_space_private: false,
         };
 
         enqueue_task(child_tid, child.prio);
@@ -2671,11 +2874,17 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 TASKS[idx].user_stack = info.stack_top;
                 TASKS[idx].brk_start = info.brk_base;
                 TASKS[idx].brk_end = info.brk_base;
+                TASKS[idx].addr_space_private = true;
                 for v in TASKS[idx].vmas.iter_mut() {
                     *v = Vma { start: 0, end: 0, flags: 0 };
                 }
 
-                alloc.free(old_pml4, 0);
+                // Free the previous user address space. After a fork the old pml4 is a
+                // deep-copied COW clone whose page tables are private to this task, but
+                // its read-only leaf pages are shared with the parent — so free_ro=false.
+                if old_pml4 != 0 && old_pml4 != info.pml4 {
+                    crate::paging::free_address_space(old_pml4, false);
+                }
 
 
                 // Naked trampoline: loads GP regs from Registers and iretqs
@@ -3085,15 +3294,20 @@ fn handle_default_signal(target: i64, sig: i32) {
 
 fn sys_uname(buf: *mut u8) -> i64 {
     if buf.is_null() { return -EFAULT; }
-    let utsname = [
-        b'N', b'i', b'o', b'b', b'i', b'x', 0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, // 65th byte
+    // Linux struct utsname: 5 fields, each 65 bytes
+    let fields: [&[u8]; 5] = [
+        b"Niobix",          // sysname
+        b"niobix",          // nodename
+        b"1.0.0",           // release
+        b"#1 Niobix",       // version
+        b"x86_64",          // machine
     ];
     unsafe {
-        core::ptr::copy_nonoverlapping(utsname.as_ptr(), buf, 65);
+        for (i, field) in fields.iter().enumerate() {
+            let slot = buf.add(i * 65);
+            core::ptr::write_bytes(slot, 0, 65);
+            core::ptr::copy_nonoverlapping(field.as_ptr(), slot, field.len());
+        }
     }
     0
 }

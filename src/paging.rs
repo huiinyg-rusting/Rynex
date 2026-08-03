@@ -592,6 +592,66 @@ pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str>
     Ok(())
 }
 
+// Free a task's user address space: all user page-table pages and, depending
+// on `free_ro`, the leaf pages. `free_ro` should be true for exec'd children
+// (fresh pml4 — every user page is owned by the child) and false for
+// COW-forked children that never exec'd (read-only pages are shared with the
+// parent). Kernel half (PML4 entries 256..512) and kernel-identity huge pages
+// are never touched.
+pub fn free_address_space(pml4: u64, free_ro: bool) {
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    unsafe {
+        let table = &*(pml4 as *const PageTable);
+        for pml4_idx in 0..256 {
+            let pml4e = table.0[pml4_idx];
+            if pml4e & PTE_PRESENT == 0 { continue; }
+            let pdpt = (pml4e & PTE_ADDR_MASK) as *mut PageTable;
+
+            let mut pdpt_user = false;
+            for pdpt_idx in 0..512 {
+                let pdpte = (*pdpt).0[pdpt_idx];
+                if pdpte & PTE_PRESENT == 0 { continue; }
+                if pdpte & PTE_HUGE != 0 { continue; } // 1G kernel identity
+                let pd = (pdpte & PTE_ADDR_MASK) as *mut PageTable;
+
+                let mut pd_user = false;
+                for pd_idx in 0..512 {
+                    let pde = (*pd).0[pd_idx];
+                    if pde & PTE_PRESENT == 0 { continue; }
+                    if pde & PTE_HUGE != 0 { continue; } // 2M kernel identity
+                    let pt = (pde & PTE_ADDR_MASK) as *mut PageTable;
+
+                    let mut pt_user = false;
+                    for pt_idx in 0..512 {
+                        let pte = (*pt).0[pt_idx];
+                        if pte & PTE_PRESENT == 0 { continue; }
+                        // Only user pages are owned by the task; kernel identity
+                        // sub-pages (non-USER) map physical memory and are shared.
+                        if pte & PTE_USER != 0 && (free_ro || (pte & PTE_WRITABLE != 0)) {
+                            alloc.free(pte & PTE_ADDR_MASK, 0);
+                        }
+                        if pte & PTE_USER != 0 {
+                            pt_user = true;
+                        }
+                    }
+                    if pt_user {
+                        alloc.free(pde & PTE_ADDR_MASK, 0); // PT page
+                        pd_user = true;
+                    }
+                }
+                if pd_user {
+                    alloc.free(pdpte & PTE_ADDR_MASK, 0); // PD page
+                    pdpt_user = true;
+                }
+            }
+            if pdpt_user {
+                alloc.free(pml4e & PTE_ADDR_MASK, 0); // PDPT page
+            }
+        }
+        alloc.free(pml4, 0); // PML4 itself
+    }
+}
+
 // Clone the current process's PML4 for fork.
 // Creates a new PML4 with private (deep-copied) user page tables.
 // User 4K pages are shared with COW (read-only in child, read-only in parent too).
