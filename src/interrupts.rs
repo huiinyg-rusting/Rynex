@@ -703,7 +703,8 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
         crate::serial::write_str(" regs.rip=0x");
         crate::serial::write_hex(crate::task::current_task_regs_rip());
         crate::serial::write_str("\n");
-        // Dump the interrupted kernel stack for a backtrace
+        // Dump the interrupted kernel stack for a backtrace (from the faulting
+        // rsp — may be garbage, so also dump the known-good region below).
         let base = frame.stack_pointer.as_u64();
         crate::serial::write_str("  stack[");
         for i in 0..32u64 {
@@ -714,6 +715,35 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
             crate::serial::write_str(" ");
         }
         crate::serial::write_str("\n");
+        // Dump the syscall-entry frame (the 11 callee-saved regs + CPU retaddr
+        // that syscall_return pops + sysretq) and the call chain below the
+        // saved resume rsp. These live at the top of the task's kernel stack;
+        // a timer preempt frame written at kstack-0xA0 overlaps this region.
+        let kstack = crate::task::task_kernel_stack_by_id(tid);
+        crate::serial::write_str("  kframe[kstack-0x60..kstack]:");
+        for i in 0..12u64 {
+            let p = (kstack - 0x60 + i * 8) as *const u64;
+            let v = unsafe { core::ptr::read_volatile(p) };
+            if i % 4 == 0 { crate::serial::write_str("\n   "); }
+            crate::serial::write_hex(v);
+            crate::serial::write_str(" ");
+        }
+        crate::serial::write_str("\n");
+        let rsp = crate::task::current_task_regs_rsp();
+        crate::serial::write_str("  kchain[regs.rsp..] rsp=0x");
+        crate::serial::write_hex(rsp);
+        crate::serial::write_str("\n");
+        let mut addr = rsp;
+        for _ in 0..40usize {
+            if addr >= kstack - 0x60 { break; }
+            let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            crate::serial::write_str("   0x");
+            crate::serial::write_hex(addr);
+            crate::serial::write_str(" 0x");
+            crate::serial::write_hex(v);
+            crate::serial::write_str("\n");
+            addr += 8;
+        }
     } else if (cs_val & 3) == 3 && cr2 == rip && (code.bits() & 0x14) == 0x14 {
         // User-mode instruction fetch fault (NX / execute of stack/data):
         // dump the user stack to trace the corrupted return-address chain.

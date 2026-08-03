@@ -268,6 +268,12 @@ pub fn current_task_regs_rip() -> u64 {
     unsafe { TASKS[task_idx(id)].regs.rip }
 }
 
+pub fn current_task_regs_rsp() -> u64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return 0; }
+    unsafe { TASKS[task_idx(id)].regs.rsp }
+}
+
 fn task_idx(id: u64) -> usize {
     (id % MAX_TASKS as u64) as usize
 }
@@ -1244,7 +1250,16 @@ fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
             out("ecx") _,
             options(nostack, preserves_flags)
         );
-        let base = (kernel_stack as *mut u64).sub(20);
+        // Build the resume frame into the dedicated per-CPU scratch buffer, NOT
+        // at the target task's kernel_stack-0xA0. The target's kernel stack top
+        // holds a LIVE syscall-entry frame (the 11 callee-saved regs + CPU
+        // return addr that syscall_return pops + sysretq); writing the preempt
+        // frame there overlaps and clobbers it, so a task suspended mid-syscall
+        // resumes to garbage and the next sysretq jumps into .data. The timer
+        // handler's resume path only pops this frame then does
+        // `mov rsp, regs.rsp`, so the frame's physical location is irrelevant
+        // and scratch (used atomically per-interrupt, IF=0) is safe.
+        let base = &raw mut TIMER_FRAME_SCRATCH as *mut u64;
         write_frame(base, regs);
         if (regs.cs & 3) == 0 {
             PREEMPT_SCRATCH[0] = regs.rax;
