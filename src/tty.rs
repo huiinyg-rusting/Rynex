@@ -81,7 +81,10 @@ impl TtyDevice {
                 c_oflag: 0,
                 c_cflag: 0,
                 c_lflag: ICANON | ECHO | ECHOE | ISIG,
-                c_cc: [0; 32],
+                // Default control chars, Linux compatible:
+                //   VINTR(0)=^C, VQUIT(1)=^\ , VERASE(2)=DEL, VKILL(3)=^U,
+                //   VEOF(4)=^D, VSTART(8)=^Q, VSTOP(9)=^S, VSUSP(10)=^Z.
+                c_cc: [0x03, 0x1c, 0x7f, 0x15, 0x04, 0, 0, 0, 0x11, 0x13, 0x1a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             }),
             winsize: Mutex::new(Winsize {
                 ws_row: VGA_HEIGHT as u16,
@@ -96,11 +99,23 @@ impl TtyDevice {
     fn push_input(&self, c: u8) {
         let echo: bool;
         let canonical: bool;
+        let isig: bool;
+        let vintr: u8;
         {
             let input = self.input_buf.lock();
             let termios = self.termios.lock();
             echo = termios.c_lflag & ECHO != 0 && input.echo;
             canonical = termios.c_lflag & ICANON != 0;
+            isig = termios.c_lflag & ISIG != 0;
+            vintr = termios.c_cc[0]; // VINTR = ^C (0x03)
+        }
+
+        // ISIG special characters. Ctrl+C must never enter the input buffer;
+        // it is turned into SIGINT to the foreground process group instead.
+        if isig && vintr != 0 && c == vintr {
+            crate::serial::write_str("^C\n");
+            crate::task::signal_foreground_group(crate::task::SIGINT);
+            return;
         }
 
         let mut input = self.input_buf.lock();
