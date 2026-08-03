@@ -22,6 +22,50 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
+// ── COW reference counting ────────────────────────────────────────
+// Each 4K user leaf shared between a parent and its fork children gets a
+// refcount. A COW fault on a page with refcount > 0 copies the page (the
+// faulting task drops one reference and owns a fresh private copy). A COW
+// fault on a page with refcount == 0 just flips the PTE writable — the
+// other owner(s) are gone, so copying would orphan the old physical page
+// (leak). free_address_space drops one reference per shared leaf instead of
+// freeing it; private leaves (refcount 0) are freed outright.
+const MAX_REFC_PAGES: usize = 1 << 18; // up to 1 GiB of physical pages
+static mut PAGE_REFC: [u8; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
+
+fn refc_idx(phys: u64) -> usize {
+    (phys >> 12) as usize
+}
+
+fn refc_get(phys: u64) -> u8 {
+    let i = refc_idx(phys);
+    if i < MAX_REFC_PAGES {
+        unsafe { PAGE_REFC[i] }
+    } else {
+        0
+    }
+}
+
+fn refc_inc(phys: u64) {
+    let i = refc_idx(phys);
+    if i < MAX_REFC_PAGES {
+        unsafe {
+            PAGE_REFC[i] = PAGE_REFC[i].saturating_add(1);
+        }
+    }
+}
+
+fn refc_dec(phys: u64) {
+    let i = refc_idx(phys);
+    if i < MAX_REFC_PAGES {
+        unsafe {
+            if PAGE_REFC[i] > 0 {
+                PAGE_REFC[i] -= 1;
+            }
+        }
+    }
+}
+
 #[repr(C, align(4096))]
 pub struct PageTable(pub [u64; 512]);
 
@@ -627,10 +671,29 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                         if pte & PTE_PRESENT == 0 { continue; }
                         // Only user pages are owned by the task; kernel identity
                         // sub-pages (non-USER) map physical memory and are shared.
-                        if pte & PTE_USER != 0 && (free_ro || (pte & PTE_WRITABLE != 0)) {
-                            alloc.free(pte & PTE_ADDR_MASK, 0);
-                        }
                         if pte & PTE_USER != 0 {
+                            let phys = pte & PTE_ADDR_MASK;
+                            if pte & PTE_WRITABLE != 0 || free_ro {
+                                // Release this reference: if the page is still
+                                // shared with another task, drop our refcount;
+                                // otherwise free it outright.
+                                if refc_get(phys) > 0 {
+                                    refc_dec(phys);
+                                } else {
+                                    alloc.free(phys, 0);
+                                }
+                            } else if refc_get(phys) > 0 {
+                                // Read-only leaf in a fork clone being torn down
+                                // (exec): the parent still owns it. Drop the
+                                // child's reference without freeing the page.
+                                refc_dec(phys);
+                            } else {
+                                // Read-only leaf with no remaining COW refs: the
+                                // other owner already copied it away (e.g. the
+                                // parent un-COW'd its copy), so this page is
+                                // orphaned. Free it.
+                                alloc.free(phys, 0);
+                            }
                             pt_user = true;
                         }
                     }
@@ -729,6 +792,9 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
                     let cow_flags = pte & !(PTE_ADDR_MASK | PTE_WRITABLE);
                     new_pt.0[pt_idx] = (pte & PTE_ADDR_MASK) | cow_flags;
 
+                    // The shared physical page now has one more owner (the child).
+                    refc_inc(pte & PTE_ADDR_MASK);
+
                     // Parent: also remove writable for COW
                     let src_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
                     src_pt.0[pt_idx] = pte & !PTE_WRITABLE;
@@ -769,16 +835,54 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     let flags = *pte & !PTE_ADDR_MASK;
 
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    // Reserve old meta phys page so buddy never reuses it
+
+    // The mallocng meta page must always have a private physical page reserved
+    // (it may be aliased via the identity map and must never be handed out by
+    // the buddy again). The brk path already reserves the private page before
+    // mapping it, so a private meta page just becomes writable in place. A
+    // shared meta page (COW fork of the shell's heap) needs a fresh reserved
+    // copy for the faulting task.
     if virt == 0x500000 {
+        if refc_get(old_phys) == 0 {
+            *pte = old_phys | flags | PTE_WRITABLE;
+            unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }
+            return true;
+        }
+        refc_dec(old_phys);
         alloc.reserve(old_phys);
         if DEBUG_ENABLED.load(Ordering::Relaxed) {
             crate::serial::write_str("  COW: reserved old meta phys=0x");
             crate::serial::write_hex(old_phys);
             crate::serial::write_str("\n");
         }
+        let new_phys = match alloc.alloc(0) {
+            Some(p) => p,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(old_phys as *const u8, new_phys as *mut u8, 4096);
+        }
+        alloc.reserve(new_phys);
+        if DEBUG_ENABLED.load(Ordering::Relaxed) {
+            crate::serial::write_str("  COW: reserved meta phys=0x");
+            crate::serial::write_hex(new_phys);
+            crate::serial::write_str("\n");
+        }
+        *pte = new_phys | flags | PTE_WRITABLE;
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }
+        return true;
     }
 
+    // If no other task still references this page, it is private: make it
+    // writable in place. Copying here would orphan the old page (leak).
+    if refc_get(old_phys) == 0 {
+        *pte = old_phys | flags | PTE_WRITABLE;
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }
+        return true;
+    }
+
+    // Shared: copy the page and drop our reference to the shared original.
+    refc_dec(old_phys);
     let new_phys = match alloc.alloc(0) {
         Some(p) => p,
         None => return false,
@@ -791,16 +895,6 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
             new_phys as *mut u8,
             4096,
         );
-    }
-
-    // Reserve meta-area phys page so buddy never reuses it
-    if virt == 0x500000 {
-        alloc.reserve(new_phys);
-        if DEBUG_ENABLED.load(Ordering::Relaxed) {
-            crate::serial::write_str("  COW: reserved meta phys=0x");
-            crate::serial::write_hex(new_phys);
-            crate::serial::write_str("\n");
-        }
     }
 
     // Update PTE: new phys + writable

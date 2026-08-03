@@ -2,7 +2,7 @@ use core::ptr;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: usize = 10;
-const MAX_RESERVED: usize = 32;
+const MAX_RESERVED: usize = 2048;
 
 const MAGIC: u32 = 0xDEADBEEF;
 
@@ -235,6 +235,13 @@ impl BuddyAllocator {
     }
 
     pub fn reserve(&mut self, addr: u64) {
+        // Idempotent: the same page may be reserved multiple times (e.g. the
+        // mallocng meta page shared across fork COW copies).
+        for i in 0..self.reserved_count {
+            if self.reserved[i] == addr {
+                return;
+            }
+        }
         if self.reserved_count < MAX_RESERVED {
             self.reserved[self.reserved_count] = addr;
             self.reserved_count += 1;
