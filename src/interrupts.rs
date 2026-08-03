@@ -649,15 +649,16 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     }
     // Low-VA write trap: catch corrupt mallocng group writes into the VA 0x0 page
     if cr2 < 0x1000 && (code.bits() & 2) != 0 {
-        crate::serial::write_str("LOWWR: rip=0x");
-        crate::serial::write_hex(rip);
-        crate::serial::write_str(" rsp=0x");
-        crate::serial::write_hex(rsp);
-        crate::serial::write_str(" cr2=0x");
-        crate::serial::write_hex(cr2);
-        crate::serial::write_str(" code=0x");
-        crate::serial::write_hex(code.bits() as u64);
-        crate::serial::write_str("\n");
+        crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_PAGING);
+        crate::klog::s("LOWWR: rip=0x");
+        crate::klog::hex(rip);
+        crate::klog::s(" rsp=0x");
+        crate::klog::hex(rsp);
+        crate::klog::s(" cr2=0x");
+        crate::klog::hex(cr2);
+        crate::klog::s(" code=0x");
+        crate::klog::hex(code.bits() as u64);
+        crate::klog::s("\n");
         if let Some(mpp) = crate::paging::PageTableManager::resolve_phys(
             crate::task::current_task_pml4(),
             0x500000,
@@ -666,98 +667,100 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
                 let base = mpp + 0x18 + k * 0x28;
                 let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
                 let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
-                crate::serial::write_str("  m[");
-                crate::serial::write_dec(k);
-                crate::serial::write_str("] mem=0x");
-                crate::serial::write_hex(mem);
-                crate::serial::write_str(" sc=");
-                crate::serial::write_dec((packed >> 6) & 63);
-                crate::serial::write_str("\n");
+                crate::klog::s("  m[");
+                crate::klog::dec(k);
+                crate::klog::s("] mem=0x");
+                crate::klog::hex(mem);
+                crate::klog::s(" sc=");
+                crate::klog::dec((packed >> 6) & 63);
+                crate::klog::s("\n");
             }
         }
+        crate::klog::end();
     }
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         return;
     }
 
-    crate::serial::write_str("EXC: PF rip=0x");
-    crate::serial::write_hex(rip);
-    crate::serial::write_str(" cs=0x");
-    crate::serial::write_hex(cs_val);
-    crate::serial::write_str(" rsp=0x");
-    crate::serial::write_hex(rsp);
-    crate::serial::write_str(" intr_rsp=0x");
-    crate::serial::write_hex(frame.stack_pointer.as_u64());
-    crate::serial::write_str(" cr2=0x");
-    crate::serial::write_hex(cr2);
-    crate::serial::write_str(" code=0x");
-    crate::serial::write_hex(code.bits() as u64);
-    crate::serial::write_str("\n");
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("EXC: PAGE_FAULT rip=0x");
+    crate::klog::hex(rip);
+    crate::klog::s(" cs=0x");
+    crate::klog::hex(cs_val);
+    crate::klog::s(" rsp=0x");
+    crate::klog::hex(rsp);
+    crate::klog::s(" intr_rsp=0x");
+    crate::klog::hex(frame.stack_pointer.as_u64());
+    crate::klog::s(" cr2=0x");
+    crate::klog::hex(cr2);
+    crate::klog::s(" code=0x");
+    crate::klog::hex(code.bits() as u64);
+    crate::klog::s("\n");
     if cs_val == 8 {
         // Identify the task and its kernel stack before dumping
         let tid = crate::task::current_task_id();
-        crate::serial::write_str("  task=");
-        crate::serial::write_dec(tid);
-        crate::serial::write_str(" kstack=0x");
-        crate::serial::write_hex(crate::task::task_kernel_stack_by_id(tid));
-        crate::serial::write_str(" regs.rip=0x");
-        crate::serial::write_hex(crate::task::current_task_regs_rip());
-        crate::serial::write_str("\n");
+        crate::klog::s("  task=");
+        crate::klog::dec(tid);
+        crate::klog::s(" kstack=0x");
+        crate::klog::hex(crate::task::task_kernel_stack_by_id(tid));
+        crate::klog::s(" regs.rip=0x");
+        crate::klog::hex(crate::task::current_task_regs_rip());
+        crate::klog::s("\n");
         // Dump the interrupted kernel stack for a backtrace (from the faulting
         // rsp — may be garbage, so also dump the known-good region below).
         let base = frame.stack_pointer.as_u64();
-        crate::serial::write_str("  stack[");
+        crate::klog::s("  stack[");
         for i in 0..32u64 {
             let p = (base + i * 8) as *const u64;
             let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::serial::write_str("\n   "); }
-            crate::serial::write_hex(v);
-            crate::serial::write_str(" ");
+            if i % 4 == 0 { crate::klog::s("\n   "); }
+            crate::klog::hex(v);
+            crate::klog::s(" ");
         }
-        crate::serial::write_str("\n");
+        crate::klog::s("\n");
         // Dump the syscall-entry frame (the 11 callee-saved regs + CPU retaddr
         // that syscall_return pops + sysretq) and the call chain below the
-        // saved resume rsp. These live at the top of the task's kernel stack;
-        // a timer preempt frame written at kstack-0xA0 overlaps this region.
+        // saved resume rsp. These live at the top of the task's kernel stack.
         let kstack = crate::task::task_kernel_stack_by_id(tid);
-        crate::serial::write_str("  kframe[kstack-0x60..kstack]:");
+        crate::klog::s("  kframe[kstack-0x60..kstack]:");
         for i in 0..12u64 {
             let p = (kstack - 0x60 + i * 8) as *const u64;
             let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::serial::write_str("\n   "); }
-            crate::serial::write_hex(v);
-            crate::serial::write_str(" ");
+            if i % 4 == 0 { crate::klog::s("\n   "); }
+            crate::klog::hex(v);
+            crate::klog::s(" ");
         }
-        crate::serial::write_str("\n");
+        crate::klog::s("\n");
         let rsp = crate::task::current_task_regs_rsp();
-        crate::serial::write_str("  kchain[regs.rsp..] rsp=0x");
-        crate::serial::write_hex(rsp);
-        crate::serial::write_str("\n");
+        crate::klog::s("  kchain[regs.rsp..] rsp=0x");
+        crate::klog::hex(rsp);
+        crate::klog::s("\n");
         let mut addr = rsp;
         for _ in 0..40usize {
             if addr >= kstack - 0x60 { break; }
             let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
-            crate::serial::write_str("   0x");
-            crate::serial::write_hex(addr);
-            crate::serial::write_str(" 0x");
-            crate::serial::write_hex(v);
-            crate::serial::write_str("\n");
+            crate::klog::s("   0x");
+            crate::klog::hex(addr);
+            crate::klog::s(" 0x");
+            crate::klog::hex(v);
+            crate::klog::s("\n");
             addr += 8;
         }
     } else if (cs_val & 3) == 3 && cr2 == rip && (code.bits() & 0x14) == 0x14 {
         // User-mode instruction fetch fault (NX / execute of stack/data):
         // dump the user stack to trace the corrupted return-address chain.
         let base = frame.stack_pointer.as_u64();
-        crate::serial::write_str("  ustack[");
+        crate::klog::s("  ustack[");
         for i in 0..32u64 {
             let p = (base + i * 8) as *const u64;
             let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::serial::write_str("\n   "); }
-            crate::serial::write_hex(v);
-            crate::serial::write_str(" ");
+            if i % 4 == 0 { crate::klog::s("\n   "); }
+            crate::klog::hex(v);
+            crate::klog::s(" ");
         }
-        crate::serial::write_str("\n");
+        crate::klog::s("\n");
     }
+    crate::klog::end();
 
     exit_user_task(&frame, "Page Fault", &[("addr", cr2), ("pf_code", code.bits())]);
     crate::vga::write_str("EXC: Page Fault\n");
