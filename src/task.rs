@@ -1415,17 +1415,17 @@ pub const SYS_getpgrp: u64 = 111;
 pub const SYS_setsid: u64 = 112;
 pub const SYS_getrandom: u64 = 318;
 
-// Niobix-specific (high numbers, no Linux conflict)
-pub const SYS_niobix_get_ticks: u64 = 2000;
-pub const SYS_niobix_futex: u64 = 2001;
-pub const SYS_niobix_shm_setup: u64 = 2002;
-pub const SYS_niobix_shm_notify: u64 = 2003;
-pub const SYS_niobix_shm_wait: u64 = 2004;
-pub const SYS_niobix_shm_teardown: u64 = 2005;
-pub const SYS_niobix_spawn: u64 = 2006;
-pub const SYS_niobix_getppid: u64 = 2007;
-pub const SYS_niobix_sleep: u64 = 2008;
-pub const SYS_niobix_yield: u64 = 2009;
+// Rynex-specific (high numbers, no Linux conflict)
+pub const SYS_rynex_get_ticks: u64 = 2000;
+pub const SYS_rynex_futex: u64 = 2001;
+pub const SYS_rynex_shm_setup: u64 = 2002;
+pub const SYS_rynex_shm_notify: u64 = 2003;
+pub const SYS_rynex_shm_wait: u64 = 2004;
+pub const SYS_rynex_shm_teardown: u64 = 2005;
+pub const SYS_rynex_spawn: u64 = 2006;
+pub const SYS_rynex_getppid: u64 = 2007;
+pub const SYS_rynex_sleep: u64 = 2008;
+pub const SYS_rynex_yield: u64 = 2009;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -1518,19 +1518,19 @@ pub extern "C" fn syscall_handler(
         SYS_getpgid => sys_getpgid(arg1 as i32),
         SYS_getpgrp => sys_getpgrp(),
         SYS_setsid => sys_setsid(),
-        SYS_sched_yield => sys_niobix_yield(),
-        // Niobix-specific
-        SYS_niobix_get_ticks => sys_get_ticks(),
-        SYS_niobix_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
+        SYS_sched_yield => sys_rynex_yield(),
+        // Rynex-specific
+        SYS_rynex_get_ticks => sys_get_ticks(),
+        SYS_rynex_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
                                         arg4 as *const u32, arg5 as u32),
-        SYS_niobix_shm_setup => crate::ipc::shm_setup(arg1, arg2),
-        SYS_niobix_shm_notify => crate::ipc::shm_notify(arg1),
-        SYS_niobix_shm_wait => crate::ipc::shm_wait(arg1),
-        SYS_niobix_shm_teardown => crate::ipc::shm_teardown(arg1),
-        SYS_niobix_spawn => sys_spawn(arg1 as *const u8, arg2 as usize),
-        SYS_niobix_getppid => sys_getppid(),
-        SYS_niobix_sleep => sys_sleep(arg1 as u64),
-        SYS_niobix_yield => sys_niobix_yield(),
+        SYS_rynex_shm_setup => crate::ipc::shm_setup(arg1, arg2),
+        SYS_rynex_shm_notify => crate::ipc::shm_notify(arg1),
+        SYS_rynex_shm_wait => crate::ipc::shm_wait(arg1),
+        SYS_rynex_shm_teardown => crate::ipc::shm_teardown(arg1),
+        SYS_rynex_spawn => sys_spawn(arg1 as *const u8, arg2 as usize),
+        SYS_rynex_getppid => sys_getppid(),
+        SYS_rynex_sleep => sys_sleep(arg1 as u64),
+        SYS_rynex_yield => sys_rynex_yield(),
         SYS_reboot => sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
         _ => {
             // Print first unknown syscall
@@ -1634,7 +1634,7 @@ fn sys_get_ticks() -> i64 {
     unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64 }
 }
 
-fn sys_niobix_yield() -> i64 {
+fn sys_rynex_yield() -> i64 {
     yield_now();
     0
 }
@@ -3415,11 +3415,11 @@ fn sys_uname(buf: *mut u8) -> i64 {
     if buf.is_null() { return -EFAULT; }
     // Linux struct utsname: 5 fields, each 65 bytes
     let fields: [&[u8]; 5] = [
-        b"Niobix",          // sysname
-        b"niobix",          // nodename
-        b"1.0.0",           // release
-        b"#1 Niobix",       // version
-        b"x86_64",          // machine
+        b"Rynex",               // sysname
+        b"rynex",               // nodename
+        b"0.0.1",               // release
+        b"#1 Rynex kernel 0.0.1 Alpha", // version
+        b"x86_64",              // machine
     ];
     unsafe {
         for (i, field) in fields.iter().enumerate() {

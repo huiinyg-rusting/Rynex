@@ -21,17 +21,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
-name = "niobix-kernel"
-version = "0.1.0"
-dependencies = [
- "x86_64",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rynex-kernel"
+version = "0.0.1"
+dependencies = [
+ "x86_64",
+]
 
 [[package]]
 name = "volatile"
