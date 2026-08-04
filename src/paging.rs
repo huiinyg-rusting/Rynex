@@ -734,82 +734,56 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
         new_table.0[i] = kernel_pt.0[i];
     }
 
-    // Walk old PML4 user entries (0..256) to deep-copy page tables.
-    // PML4[255] may hold user stack (0x7FFFFFFFBxxx), so we must clone all user entries.
+    // Lazy sharing: share all user page table pages (PDPT/PD/PT) with the child.
+    // Only a new PML4 is allocated. All user PTEs are marked read-only (COW)
+    // in both parent and child. Physical page reference counts are incremented
+    // so cow_remap_in knows which pages are shared.
     for pml4_idx in 0..256 {
         let pml4e = old_table.0[pml4_idx];
         if pml4e & PTE_PRESENT == 0 { continue; }
 
-        let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
-        let old_pdpt = unsafe { &*(old_pdpt_phys as *const PageTable) };
+        // Share the PDPT with the child
+        new_table.0[pml4_idx] = pml4e;
 
-        // Deep-copy the PDPT
-        let new_pdpt_phys = alloc.alloc(0)?;
-        unsafe { core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, 4096); }
-        let new_pdpt = unsafe { &mut *(new_pdpt_phys as *mut PageTable) };
+        let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
+        let old_pdpt = unsafe { &mut *(old_pdpt_phys as *mut PageTable) };
 
         for pdpt_idx in 0..512 {
             let pdpte = old_pdpt.0[pdpt_idx];
             if pdpte & PTE_PRESENT == 0 { continue; }
 
             if pdpte & PTE_HUGE != 0 {
-                // 1G page (kernel identity) — keep writable, shallow copy
-                new_pdpt.0[pdpt_idx] = pdpte;
+                // 1G huge page — mark as COW in both parent and child
+                refc_inc(pdpte & PTE_ADDR_MASK);
+                old_pdpt.0[pdpt_idx] = pdpte & !PTE_WRITABLE;
                 continue;
             }
 
-            let old_pd_phys = pdpte & PTE_ADDR_MASK;
-            let old_pd = unsafe { &*(old_pd_phys as *const PageTable) };
-
-            // Deep-copy the PD
-            let new_pd_phys = alloc.alloc(0)?;
-            unsafe { core::ptr::write_bytes(new_pd_phys as *mut u8, 0, 4096); }
-            let new_pd = unsafe { &mut *(new_pd_phys as *mut PageTable) };
+            let old_pd = unsafe { &mut *((pdpte & PTE_ADDR_MASK) as *mut PageTable) };
 
             for pd_idx in 0..512 {
                 let pde = old_pd.0[pd_idx];
                 if pde & PTE_PRESENT == 0 { continue; }
 
                 if pde & PTE_HUGE != 0 {
-                    // 2M page (kernel identity) — keep writable, shallow copy
-                    new_pd.0[pd_idx] = pde;
+                    // 2M huge page — mark as COW in both parent and child
+                    refc_inc(pde & PTE_ADDR_MASK);
+                    old_pd.0[pd_idx] = pde & !PTE_WRITABLE;
                     continue;
                 }
 
-                // 4K page — deep-copy PT
-                let old_pt_phys = pde & PTE_ADDR_MASK;
-                let old_pt = unsafe { &*(old_pt_phys as *const PageTable) };
+                // 4K page — mark all user PTEs as read-only (COW)
+                let old_pt = unsafe { &mut *((pde & PTE_ADDR_MASK) as *mut PageTable) };
 
-                let new_pt_phys = alloc.alloc(0)?;
-                unsafe { core::ptr::write_bytes(new_pt_phys as *mut u8, 0, 4096); }
-                let new_pt = unsafe { &mut *(new_pt_phys as *mut PageTable) };
-
-                for pt_idx in 0..512 {
+                for pt_idx in 0..256 {
                     let pte = old_pt.0[pt_idx];
                     if pte & PTE_PRESENT == 0 { continue; }
-
-                    // COW: share physical page, child gets read-only
-                    let cow_flags = pte & !(PTE_ADDR_MASK | PTE_WRITABLE);
-                    new_pt.0[pt_idx] = (pte & PTE_ADDR_MASK) | cow_flags;
-
-                    // The shared physical page now has one more owner (the child).
                     refc_inc(pte & PTE_ADDR_MASK);
-
-                    // Parent: also remove writable for COW
-                    let src_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
-                    src_pt.0[pt_idx] = pte & !PTE_WRITABLE;
+                    if pte & PTE_WRITABLE == 0 { continue; }
+                    old_pt.0[pt_idx] = pte & !PTE_WRITABLE;
                 }
-
-                let pde_flags = pde & !PTE_ADDR_MASK;
-                new_pd.0[pd_idx] = new_pt_phys | pde_flags;
             }
-
-            let pdpt_flags = pdpte & !PTE_ADDR_MASK;
-            new_pdpt.0[pdpt_idx] = new_pd_phys | pdpt_flags;
         }
-
-        let pml4e_flags = pml4e & !PTE_ADDR_MASK;
-        new_table.0[pml4_idx] = new_pdpt_phys | pml4e_flags;
     }
 
     // Flush TLB for old PML4 since we modified its PTEs
