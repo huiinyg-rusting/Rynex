@@ -52,7 +52,7 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     // markers) are *always* captured in the klog ring buffer (queryable via
     // klog::dump() on a fault); they are mirrored to the serial port only when
     // the level is DEBUG. Set to LOG_DEBUG here (and reflash) to see them live.
-    klog::set_console_level(klog::LOG_INFO);
+    klog::set_console_level(klog::LOG_DEBUG);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("Rynex kernel v0.0.1 Alpha\n");
     }
