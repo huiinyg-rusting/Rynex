@@ -174,6 +174,10 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
     let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
     let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
     find_inode(norm).or_else(|| {
+        // Dynamic procfs PID files: /proc/<pid>/stat, /proc/<pid>/cmdline.
+        if let Some(idx) = maybe_bind_proc_pid(norm) {
+            return Some(idx);
+        }
         let flat_idx = alloc_flat_inode(norm, 0)?;
         // If this inode already has a vnode_id (e.g., char device), use it
         let vn_id = unsafe {
@@ -450,4 +454,56 @@ pub fn alloc_fd_for_task(task_id: u64, inode_idx: usize, flags: i32) -> Option<u
         }
     }
     None
+}
+
+/// Register a flat inode for `name` bound to an existing vnode_id without
+/// going through vfs_core::create (which read-only filesystems reject). The
+/// resulting inode has data_ptr == null and vnode_id set, so inode_read
+/// delegates into vfs_core::read -> the bound VnodeOps.
+pub fn bind_vnode_inode(name: &[u8], vnode_id: u16) -> Option<usize> {
+    let flat_idx = alloc_flat_inode(name, 0)?;
+    unsafe {
+        INODES[flat_idx].vnode_id = vnode_id;
+    }
+    Some(flat_idx)
+}
+
+/// If `name` is a dynamic /proc/<pid>/stat|cmdline path, bind it to a procfs
+/// vnode so the pid files work even when the process was spawned after boot.
+/// Returns the flat inode idx when handled, None otherwise.
+fn maybe_bind_proc_pid(name: &[u8]) -> Option<usize> {
+    let prefix = b"/proc/";
+    if !name.starts_with(prefix) { return None; }
+    let rest = &name[prefix.len()..];
+    let slash = rest.iter().position(|&c| c == b'/');
+    let (pid_str, file) = match slash {
+        Some(s) => rest.split_at(s),
+        None => (rest, &[][..]),
+    };
+    let file = if slash.is_some() { &file[1..] } else { file };
+    if pid_str.is_empty() || !pid_str.iter().all(|&c| c >= b'0' && c <= b'9') {
+        return None;
+    }
+    let mut pid = 0u64;
+    for &c in pid_str { pid = pid * 10 + (c - b'0') as u64; }
+    let ino = if file.is_empty() {
+        crate::vfs_core::procfs::pid_dir_ino(pid)
+    } else {
+        match file {
+            b"stat" => crate::vfs_core::procfs::pid_stat_ino(pid),
+            b"cmdline" => crate::vfs_core::procfs::pid_cmdline_ino(pid),
+            _ => return None,
+        }
+    };
+    let ops: &'static dyn crate::vfs_core::VnodeOps = &crate::vfs_core::procfs::PROCFS;
+    let fs_id = crate::vfs_core::types::alloc_fsid();
+    let vn_id = crate::vfs_core::vnode_alloc(ino, fs_id, 0, ops)?;
+    bind_vnode_inode(name, vn_id)
+}
+
+/// Force the vnode_id of an existing flat inode (by normalized path).
+pub fn rebind_inode_vnode(name: &[u8], vnode_id: u16) -> Option<usize> {
+    let idx = find_inode(name)?;
+    unsafe { INODES[idx].vnode_id = vnode_id; }
+    Some(idx)
 }

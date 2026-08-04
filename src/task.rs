@@ -81,6 +81,51 @@ pub fn in_syscall() -> bool {
     IN_SYSCALL.load(Ordering::SeqCst)
 }
 
+/// Snapshot of a task for /proc reporting.
+#[derive(Clone, Copy)]
+pub struct ProcEntry {
+    pub id: u64,
+    pub tgid: u64,
+    pub ppid: Option<u64>,
+    pub state: TaskState,
+    pub comm: [u8; 16],
+    pub pml4: u64,
+    pub user_stack: u64,
+}
+
+/// Return a snapshot of task slot `idx` for /proc/<pid> reporting.
+pub fn proc_entry(idx: usize) -> Option<ProcEntry> {
+    unsafe {
+        if idx >= MAX_TASKS { return None; }
+        let t = &TASKS[idx];
+        if t.id == 0 { return None; }
+        Some(ProcEntry {
+            id: t.id,
+            tgid: t.tgid,
+            ppid: t.parent,
+            state: t.state,
+            comm: t.comm,
+            pml4: t.pml4,
+            user_stack: t.user_stack,
+        })
+    }
+}
+
+/// Set the running task's short command name (for /proc/<pid>/stat). Truncates
+/// to 15 chars + NUL, Linux-compatible.
+pub fn set_current_comm(name: &[u8]) {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return; }
+    let idx = task_idx(id);
+    let len = core::cmp::min(name.len(), 15);
+    unsafe {
+        for i in 0..len {
+            TASKS[idx].comm[i] = name[i];
+        }
+        TASKS[idx].comm[len] = 0;
+    }
+}
+
 pub const KERNEL_CODE_SELECTOR: u64 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u64 = 0x10;
 pub const USER_CODE_SELECTOR: u64 = 0x20;
@@ -200,6 +245,10 @@ pub struct Task {
     pub euid: u32,
     pub egid: u32,
 
+    // Short command name (for /proc/<pid>/stat, ps). Set from the executable
+    // name on exec/spawn.
+    pub comm: [u8; 16],
+
     pub runqueue_next: Option<u64>,
 
     pub ipc_partner: u64,
@@ -274,6 +323,7 @@ blocked_on: 0,
             sig_handlers: [SignalAction::empty(); SIGNAL_COUNT],
             sig_blocked: 0,
             sig_pending: 0,
+            comm: [0; 16],
             vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
             wakeup_tick: 0,
             addr_space_private: false,
@@ -1448,6 +1498,7 @@ pub const SYS_rmdir: u64 = 84;
 pub const SYS_unlink: u64 = 87;
 pub const SYS_readlink: u64 = 89;
 pub const SYS_gettimeofday: u64 = 96;
+pub const SYS_sysinfo: u64 = 99;
 pub const SYS_getuid: u64 = 102;
 pub const SYS_getgid: u64 = 104;
 pub const SYS_geteuid: u64 = 107;
@@ -1516,6 +1567,13 @@ pub extern "C" fn syscall_handler(
         let filename_str = core::str::from_utf8(filename_bytes).unwrap_or("");
         if filename_str.contains("busybox") {
             SHELL_TASK_ID.store(id, Ordering::SeqCst);
+            crate::task::set_current_comm(b"busybox");
+        }
+        // Derive a short comm from the executable basename.
+        let slash = filename_str.rfind('/');
+        let base = match slash { Some(i) => &filename_str[i+1..], None => filename_str };
+        if !base.is_empty() && !base.contains("busybox") {
+            crate::task::set_current_comm(base.as_bytes());
         }
     }
     let result = match syscall_num {
@@ -1546,8 +1604,9 @@ pub extern "C" fn syscall_handler(
         SYS_fcntl => sys_fcntl(arg1 as u32, arg2 as i32, arg3 as u64),
         SYS_getcwd => sys_getcwd(arg1 as *mut u8, arg2 as usize),
         SYS_chdir => sys_chdir(arg1 as *const u8),
-        SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
-        SYS_getuid => sys_getuid(),
+SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
+         SYS_sysinfo => sys_sysinfo(arg1 as *mut u8),
+         SYS_getuid => sys_getuid(),
         SYS_getgid => sys_getgid(),
         SYS_geteuid => sys_geteuid(),
         SYS_getegid => sys_getegid(),
@@ -2684,6 +2743,7 @@ fn sys_fork() -> i64 {
             sig_handlers: parent.sig_handlers,
             sig_blocked: parent.sig_blocked,
             sig_pending: 0,
+            comm: parent.comm,
             vmas: parent.vmas,
             wakeup_tick: 0,
             addr_space_private: false,
@@ -4048,6 +4108,52 @@ fn sys_gettimeofday(tv: *mut u64, _tz: *mut u64) -> i64 {
 
 // ── Stat/Fstat/Lstat ───────────────────────────────────────────────
 
+// ── Sysinfo (Linux syscall 99) ─────────────────────────────────────
+// struct sysinfo (glibc layout, native 64-bit):
+//   long uptime; unsigned long loads[3]; unsigned long totalram;
+//   unsigned long freeram; unsigned long sharedram; unsigned long bufferram;
+//   unsigned long totalswap; unsigned long freeswap; unsigned short procs;
+//   unsigned short pad; unsigned long totalhigh; unsigned long freehigh;
+//   unsigned int mem_unit;
+fn sys_sysinfo(info: *mut u8) -> i64 {
+    if info.is_null() { return -EFAULT; }
+    let ticks = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+    let uptime = (ticks / 100) as u64; // 100 Hz PIT -> seconds
+    let mem_unit: u32 = 4096;
+    let totalram = 64u64; // 64 MB in units of mem_unit
+    let freeram = 32u64;
+    let mut procs: u16 = 0;
+    for id in 1..=crate::task::MAX_TASKS as u64 {
+        if let Some(t) = crate::task::task_by_id(id) {
+            if t.state != crate::task::TaskState::Empty
+                && t.state != crate::task::TaskState::Exited
+                && t.state != crate::task::TaskState::Zombie
+            {
+                procs += 1;
+            }
+        }
+    }
+    unsafe {
+        let p = info as *mut u64;
+        core::ptr::write_volatile(p, uptime);               // uptime       @0
+        core::ptr::write_volatile(p.add(1), 0);             // loads[0]     @8
+        core::ptr::write_volatile(p.add(2), 0);             // loads[1]     @16
+        core::ptr::write_volatile(p.add(3), 0);             // loads[2]     @24
+        core::ptr::write_volatile(p.add(4), totalram);      // totalram     @32
+        core::ptr::write_volatile(p.add(5), freeram);       // freeram      @40
+        core::ptr::write_volatile(p.add(6), 0);             // sharedram    @48
+        core::ptr::write_volatile(p.add(7), 0);             // bufferram    @56
+        core::ptr::write_volatile(p.add(8), 0);             // totalswap    @64
+        core::ptr::write_volatile(p.add(9), 0);             // freeswap     @72
+        core::ptr::write_volatile(info.add(80) as *mut u16, procs); // procs   @80
+        core::ptr::write_volatile(info.add(82) as *mut u16, 0);    // pad     @82
+        core::ptr::write_volatile(p.add(11), 0);            // totalhigh    @88
+        core::ptr::write_volatile(p.add(12), 0);            // freehigh     @96
+        core::ptr::write_volatile(info.add(104) as *mut u32, mem_unit); // mem_unit @104
+    }
+    0
+}
+
 #[repr(C)]
 struct LinuxStat {
     st_dev: u64,
@@ -4491,6 +4597,15 @@ pub fn test() {
                             Ok(elf_info) => {
                                 if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
                                     init_tid = tid;
+                                    // Name the init task before we switch away
+                                    // (set_current_comm operates on CURRENT_TASK).
+                                    unsafe {
+                                        let idx = task_idx(tid);
+                                        let name = b"init";
+                                        let len = core::cmp::min(name.len(), 15);
+                                        for i in 0..len { TASKS[idx].comm[i] = name[i]; }
+                                        TASKS[idx].comm[len] = 0;
+                                    }
                                 }
                             }
                             Err(e) => {

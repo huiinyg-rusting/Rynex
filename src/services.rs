@@ -230,6 +230,14 @@ pub fn kbd_handler(req: &[u8]) -> i64 {
     }
 }
 
+/// /proc service handler: lightweight answerer for /proc path queries so
+/// clients can read proc data over IPC without a full file descriptor.
+pub fn proc_handler(req: &[u8]) -> i64 {
+    if req.len() < 8 { return -crate::task::EINVAL; }
+    let op = read_u64(req, 0);
+    if op == 0 { 0 } else { -crate::task::EINVAL }
+}
+
 fn read_u64(buf: &[u8], off: usize) -> u64 {
     if off + 8 > buf.len() { return 0; }
     let mut v = [0u8; 8];
