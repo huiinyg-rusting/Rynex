@@ -26,25 +26,30 @@ pub const NAME_LEN: usize = 16;
 pub const MAX_REQUEST: usize = 4096;
 
 /// A kernel service: a named mailbox + a message handler.
+///
+/// The handler receives the request bytes and the reply token from the IPC
+/// header. It may answer a synchronous caller via `ipc::ipc_reply(reply_id, …)`;
+/// the returned i64 is additionally posted as a short reply when no payload
+/// reply was sent and the caller expects one.
 #[derive(Clone, Copy)]
 struct Service {
     name: [u8; NAME_LEN],
     name_len: usize,
     port_id: u64,
-    handle: fn(&[u8]) -> i64,
+    handle: fn(&[u8], u64) -> i64,
 }
 
 static mut SERVICES: [Service; MAX_SERVICES] = [Service {
     name: [0; NAME_LEN],
     name_len: 0,
     port_id: 0,
-    handle: |_| -1,
+    handle: |_, _| -1,
 }; MAX_SERVICES];
 static mut SERVICE_COUNT: usize = 0;
 
 /// Register a service under `name`. The service must have been created as an
 /// IPC port (via `ipc::ipc_create`) so clients can connect by name. Returns 0.
-pub fn register(name: &[u8], handle: fn(&[u8]) -> i64) -> i64 {
+pub fn register(name: &[u8], handle: fn(&[u8], u64) -> i64) -> i64 {
     if name.is_empty() || name.len() > NAME_LEN {
         return -crate::task::EINVAL;
     }
@@ -59,7 +64,7 @@ pub fn register(name: &[u8], handle: fn(&[u8]) -> i64) -> i64 {
     attach(name, port as u64, handle)
 }
 
-fn attach(name: &[u8], port_id: u64, handle: fn(&[u8]) -> i64) -> i64 {
+fn attach(name: &[u8], port_id: u64, handle: fn(&[u8], u64) -> i64) -> i64 {
     unsafe {
         for i in 0..MAX_SERVICES {
             if SERVICES[i].port_id == port_id {
@@ -101,12 +106,12 @@ pub fn lookup(name: &[u8]) -> Option<u64> {
 ///   [32..)   payload bytes
 ///
 /// The handler returns an i64 result.
-pub fn service_call(port_id: u64, request: &[u8]) -> i64 {
+pub fn service_call(port_id: u64, request: &[u8], reply_id: u64) -> i64 {
     // Find handler by port.
     unsafe {
         for i in 0..MAX_SERVICES {
             if SERVICES[i].port_id == port_id {
-                return (SERVICES[i].handle)(request);
+                return (SERVICES[i].handle)(request, reply_id);
             }
         }
     }
@@ -119,16 +124,27 @@ pub fn poll(port_id: u64) -> usize {
     let mut handled = 0;
     loop {
         let mut buf = [0u8; 512];
-        match ipc::ipc_peek(port_id, buf.as_mut_ptr(), buf.len()) {
-            0 => break,
-            n if n < 0 => break,
-            n => {
-                service_call(port_id, &buf[..n as usize]);
-                handled += 1;
-            }
-        }
+        let (n, reply_id) = ipc::ipc_peek_ex(port_id, buf.as_mut_ptr(), buf.len());
+        if n <= 0 { break; }
+        handle_with_reply(port_id, &buf[..n as usize], reply_id);
+        handled += 1;
     }
     handled
+}
+
+/// Dispatch a request and, if it came from `ipc_call`, post the handler's i64
+/// result back as the reply (handlers that answer with a payload may instead
+/// call `ipc::ipc_reply` themselves; a reply is only auto-sent when the token
+/// is still pending).
+fn handle_with_reply(port_id: u64, request: &[u8], reply_id: u64) -> i64 {
+    let result = service_call(port_id, request, reply_id);
+    if reply_id != 0 {
+        // Auto-answer synchronous callers with the returned status.
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&result.to_le_bytes());
+        crate::ipc::ipc_reply(reply_id, bytes.as_ptr(), 8);
+    }
+    result
 }
 
 /// Background service loop for a name. Blocks on the service port and handles
@@ -145,9 +161,9 @@ pub fn serve(name: &[u8]) -> ! {
     };
     loop {
         let mut buf = [0u8; MAX_REQUEST];
-        let n = ipc::ipc_recv(port, buf.as_mut_ptr(), MAX_REQUEST);
+        let (n, reply_id) = ipc::ipc_recv_ex(port, buf.as_mut_ptr(), MAX_REQUEST);
         if n < 0 { continue; }
-        service_call(port, &buf[..n as usize]);
+        handle_with_reply(port, &buf[..n as usize], reply_id);
     }
 }
 
@@ -161,7 +177,7 @@ pub fn serve(name: &[u8]) -> ! {
 ///   [16..24) offset / request
 ///   [24..32) data_len / mode
 ///   [32..)   path or payload
-pub fn vfs_handler(req: &[u8]) -> i64 {
+pub fn vfs_handler(req: &[u8], _reply_id: u64) -> i64 {
     use crate::vfs_core::VfsOp;
     if req.len() < 32 { return -crate::task::EINVAL; }
     let op = read_u64(req, 0);
@@ -195,7 +211,7 @@ pub fn vfs_handler(req: &[u8]) -> i64 {
 }
 
 /// Console / TTY service handler. Write payload bytes to the console.
-pub fn console_handler(req: &[u8]) -> i64 {
+pub fn console_handler(req: &[u8], _reply_id: u64) -> i64 {
     if req.len() < 32 { return -crate::task::EINVAL; }
     let op = read_u64(req, 0);
     let payload = &req[32..];
@@ -218,7 +234,7 @@ pub fn console_handler(req: &[u8]) -> i64 {
 }
 
 /// Keyboard service handler: return the next buffered character or 0 if none.
-pub fn kbd_handler(req: &[u8]) -> i64 {
+pub fn kbd_handler(req: &[u8], _reply_id: u64) -> i64 {
     if req.len() < 32 { return -crate::task::EINVAL; }
     let op = read_u64(req, 0);
     match op {
@@ -232,10 +248,65 @@ pub fn kbd_handler(req: &[u8]) -> i64 {
 
 /// /proc service handler: lightweight answerer for /proc path queries so
 /// clients can read proc data over IPC without a full file descriptor.
-pub fn proc_handler(req: &[u8]) -> i64 {
+pub fn proc_handler(req: &[u8], _reply_id: u64) -> i64 {
     if req.len() < 8 { return -crate::task::EINVAL; }
     let op = read_u64(req, 0);
     if op == 0 { 0 } else { -crate::task::EINVAL }
+}
+
+/// `ping` service: echoes the request payload back to the caller via the IPv6
+/// reply channel. Used to exercise synchronous request/reply IPC end-to-end
+/// between two kernel tasks.
+pub fn ping_handler(req: &[u8], reply_id: u64) -> i64 {
+    if reply_id == 0 {
+        // Fire-and-forget: nothing to answer.
+        return req.len() as i64;
+    }
+    crate::ipc::ipc_reply(reply_id, req.as_ptr(), req.len())
+}
+
+/// Kernel service task that serves the `ping` port (used as a scheduling/
+/// IPC self-test alongside a client task).
+pub fn ping_server_task() -> ! {
+    crate::serial::write_str("PINGSVR: entered\n");
+    crate::services::serve(b"ping")
+}
+
+/// Kernel task that performs an `ipc_call`/`ipc_reply` round-trip to the
+/// `ping` service and prints the result to the serial console. Serves as a
+/// smoke test that synchronous IPC works between separate kernel tasks.
+pub extern "C" fn ipc_roundtrip_selftest() -> ! {
+    crate::serial::write_str("SELFTEST: entered\n");
+    loop {
+        // Connect to the ping service and issue a synchronous call.
+        match crate::ipc::ipc_connect(b"ping".as_ptr(), 4) {
+            p if p >= 0 => {
+                let port = p as u64;
+                let req = b"ping-IPC";
+                let mut out = [0u8; 64];
+                let n = crate::ipc::ipc_call_internal(
+                    port, req.as_ptr(), req.len(), out.as_mut_ptr(), out.len(),
+                );
+                serial::write_str("SELFTEST: ipc_call -> ");
+                serial::write_dec(n as u64);
+                if n >= 0 {
+                    serial::write_str(" '");
+                    for i in 0..(core::cmp::min(n, out.len() as i64) as usize) {
+                        let c = out[i];
+                        if c == 0 { break; }
+                        serial::write_char(c as char);
+                    }
+                    serial::write_str("'\n");
+                }
+            }
+            _ => {
+                serial::write_str("SELFTEST: ping service not found\n");
+            }
+        }
+        // Slow the test loop so it doesn't spin on the console.
+        for _ in 0..100_000 { core::hint::spin_loop(); }
+        crate::task::yield_now();
+    }
 }
 
 fn read_u64(buf: &[u8], off: usize) -> u64 {

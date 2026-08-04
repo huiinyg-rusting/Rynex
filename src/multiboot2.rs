@@ -33,6 +33,9 @@ pub struct ModuleTag {
 pub struct ModuleInfo {
     pub start: u64,
     pub end: u64,
+    /// Basename of the module's cmdline (e.g. "/boot/wthit" -> "wthit").
+    /// NUL-terminated; empty if no cmdline was provided.
+    pub name: [u8; 64],
 }
 
 pub fn find_modules(info_addr: u32, out: &mut [ModuleInfo]) -> usize {
@@ -53,7 +56,31 @@ pub fn find_modules(info_addr: u32, out: &mut [ModuleInfo]) -> usize {
         if typ == TAG_MODULE && count < out.len() {
             let start = unsafe { core::ptr::read_unaligned(p.add(8) as *const u32) } as u64;
             let end = unsafe { core::ptr::read_unaligned(p.add(12) as *const u32) } as u64;
-            out[count] = ModuleInfo { start, end };
+            let mut name = [0u8; 64];
+            // cmdline string follows mod_end at offset 16 within the tag.
+            let cmd = unsafe { p.add(16) };
+            let mut ci = 0usize;
+            while ci < 63 {
+                let c = unsafe { core::ptr::read_volatile(cmd.add(ci)) };
+                if c == 0 { break; }
+                name[ci] = c;
+                ci += 1;
+            }
+            // Reduce to basename (strip everything up to the last '/').
+            let mut base_start = 0usize;
+            for (j, &c) in name.iter().enumerate() {
+                if c == 0 { break; }
+                if c == b'/' { base_start = j + 1; }
+            }
+            let mut n = 0usize;
+            for j in base_start..64 {
+                let c = name[j];
+                if c == 0 { break; }
+                name[n] = c;
+                n += 1;
+            }
+            for j in n..64 { name[j] = 0; }
+            out[count] = ModuleInfo { start, end, name };
             count += 1;
         }
         offset += size;
