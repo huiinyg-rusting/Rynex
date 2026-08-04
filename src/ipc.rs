@@ -29,9 +29,13 @@ pub const IPC_MSG_MAX: usize = 4096 - IPC_MSG_HEADER as usize;
 #[repr(C)]
 struct MsgHeader {
     src_pid: u64,
+    /// Reply token set by `ipc_call`; the service posts its reply to this
+    /// token via `ipc_reply`. 0 means fire-and-forget (no reply expected).
+    reply_id: u64,
     msg_type: u32,
     len: u32,
     _pad: u32,
+    _pad2: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +110,201 @@ fn port_id_by_name(name: &[u8]) -> Option<u64> {
         }
     }
     None
+}
+
+// ── Reply channels ────────────────────────────────────────────────
+// A synchronous request/reply call allocates a reply slot. The token is
+// embedded in the request header; the service answers via `ipc_reply`, which
+// writes into the slot's page and wakes the blocked caller.
+
+const MAX_REPLIES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct ReplySlot {
+    used: bool,
+    page: u64,
+    len: u32,
+    done: bool,
+    wake: u32,
+}
+
+impl ReplySlot {
+    const fn empty() -> Self {
+        ReplySlot { used: false, page: 0, len: 0, done: false, wake: 0 }
+    }
+}
+
+static mut REPLIES: [ReplySlot; MAX_REPLIES] = [ReplySlot::empty(); MAX_REPLIES];
+static mut NEXT_REPLY_ID: u64 = 1;
+
+fn reply_alloc() -> Option<u64> {
+    let page = alloc_page()?;
+    unsafe {
+        for i in 0..MAX_REPLIES {
+            if !REPLIES[i].used {
+                REPLIES[i].used = true;
+                REPLIES[i].page = page;
+                REPLIES[i].len = 0;
+                REPLIES[i].done = false;
+                REPLIES[i].wake = 0;
+                let id = NEXT_REPLY_ID;
+                NEXT_REPLY_ID += 1;
+                return Some(id);
+            }
+        }
+    }
+    free_page(page);
+    None
+}
+
+fn reply_get(id: u64) -> Option<&'static mut ReplySlot> {
+    unsafe {
+        for i in 0..MAX_REPLIES {
+            if REPLIES[i].used && i as u64 + 1 == id {
+                return Some(&mut REPLIES[i]);
+            }
+        }
+    }
+    None
+}
+
+fn reply_free(id: u64) {
+    if let Some(slot) = reply_get(id) {
+        if slot.page != 0 {
+            free_page(slot.page);
+            slot.page = 0;
+        }
+        slot.used = false;
+    }
+}
+
+/// Synchronous call: post `buf` to `port_id` and block until the service
+/// replies (via `ipc_reply`). The reply payload is copied into `out` (up to
+/// `out_len` bytes) and the length is returned; errors are negative errnos.
+///
+/// `buf`/`out` are validated as user-space pointers (default).
+pub fn ipc_call(port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len: usize) -> i64 {
+    ipc_call_impl(port_id, buf, len, out, out_len, false)
+}
+
+/// In-kernel variant: request/out buffers live in kernel space, so the
+/// user-range check is skipped. Used only by kernel tasks (services/clients).
+pub fn ipc_call_internal(
+    port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len: usize,
+) -> i64 {
+    ipc_call_impl(port_id, buf, len, out, out_len, true)
+}
+
+fn ipc_call_impl(
+    port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len: usize,
+    kernel_buf: bool,
+) -> i64 {
+    if len > IPC_MSG_MAX { return -crate::task::EMSGSIZE; }
+    let reply_id = match reply_alloc() {
+        Some(id) => id,
+        None => return -crate::task::ENOMEM,
+    };
+    let src = crate::task::current_task_id();
+
+    loop {
+        let (free_slot, msg_page) = {
+            let port = match port_by_id(port_id) {
+                Some(p) => p,
+                None => { reply_free(reply_id); return -crate::task::ESRCH; }
+            };
+            if port.count < PORT_SLOTS {
+                let page = match alloc_page() {
+                    Some(p) => p,
+                    None => { reply_free(reply_id); return -crate::task::ENOMEM; }
+                };
+                let hdr = unsafe { &mut *(page as *mut MsgHeader) };
+                hdr.src_pid = src;
+                hdr.reply_id = reply_id;
+                hdr.msg_type = 0;
+                hdr.len = len as u32;
+                if len > 0 {
+                    if !kernel_buf && !crate::task::user_range_valid(buf as u64, len, false) {
+                        free_page(page);
+                        reply_free(reply_id);
+                        return -crate::task::EFAULT;
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(buf, (page as *mut u8).add(IPC_MSG_HEADER as usize), len);
+                    }
+                }
+                let idx = (port.head + port.count) % PORT_SLOTS;
+                port.slots[idx] = page;
+                port.count += 1;
+                let wr = &raw const port.wake_recv as *const u32;
+                (true, wr)
+            } else {
+                let ws = &raw const port.wake_send as *const u32;
+                (false, ws)
+            }
+        };
+
+        if free_slot {
+            // Wake one blocked receiver, then wait for the reply.
+            unsafe { crate::task::futex_wake(msg_page as *const u32, 1); }
+            break;
+        }
+        if !crate::task::block_on_futex(msg_page as *const u32) {
+            reply_free(reply_id);
+            return -crate::task::EAGAIN;
+        }
+    }
+
+    // Wait for the reply on our slot. Poll `done` before each block so a reply
+    // that landed between the send and the block is not lost.
+    loop {
+        let (done, len, page) = match reply_get(reply_id) {
+            Some(s) => (s.done, s.len as usize, s.page),
+            None => { reply_free(reply_id); return -crate::task::ESRCH; }
+        };
+        if done {
+            let _ = (len, page);
+            break;
+        }
+        let slot_wake = match reply_get(reply_id) {
+            Some(s) => &raw const s.wake as *const u32,
+            None => { reply_free(reply_id); return -crate::task::ESRCH; }
+        };
+        crate::task::block_on_futex(slot_wake);
+    }
+    let (len, page) = match reply_get(reply_id) {
+        Some(s) => (s.len as usize, s.page),
+        None => (0, 0),
+    };
+    let rlen = core::cmp::min(len, out_len);
+    if rlen > 0 && !out.is_null() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(page as *const u8, out, rlen);
+        }
+    }
+    reply_free(reply_id);
+    len as i64
+}
+
+/// Answer a `ipc_call` from a service: copy `buf` into the reply slot and wake
+/// the blocked caller. Returns 0 on success, -ESRCH if the token is stale.
+pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
+    let page = match reply_get(reply_id) {
+        Some(s) => s.page,
+        None => return -crate::task::ESRCH,
+    };
+    let n = core::cmp::min(len, IPC_MSG_MAX);
+    if n > 0 && !buf.is_null() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf, page as *mut u8, n);
+        }
+    }
+    if let Some(slot) = reply_get(reply_id) {
+        slot.len = n as u32;
+        slot.done = true;
+        let wake = &raw const slot.wake as *const u32;
+        unsafe { crate::task::futex_wake(wake, 1); }
+    }
+    n as i64
 }
 
 fn wake_port_recv(port: &Port) {
@@ -268,6 +467,89 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
     }
     free_page(page);
     len as i64
+}
+
+/// Non-blocking receive that also returns the reply token.
+/// Returns (length, reply_id); length is 0 when the mailbox is empty.
+pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    let page = {
+        let port = match port_by_id(port_id) {
+            Some(p) => p,
+            None => return (-crate::task::ESRCH, 0),
+        };
+        if port.count == 0 { return (0, 0); }
+        let idx = port.head;
+        let pg = port.slots[idx];
+        port.head = (idx + 1) % PORT_SLOTS;
+        port.count -= 1;
+        let ws = &raw const port.wake_send as *const u32;
+        unsafe { crate::task::futex_wake(ws, 1); }
+        pg
+    };
+
+    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let len = hdr.len as usize;
+    let reply_id = hdr.reply_id;
+    let out_len = core::cmp::min(len, max_len);
+    if out_len > 0 && !buf.is_null() {
+        if !crate::task::user_range_valid(buf as u64, out_len, true) {
+            free_page(page);
+            return (-crate::task::EFAULT, 0);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping((page as *const u8).add(IPC_MSG_HEADER as usize), buf, out_len);
+        }
+    }
+    free_page(page);
+    (len as i64, reply_id)
+}
+
+/// Receive a message from a port, also returning the reply token from the
+/// message header (0 for fire-and-forget). Returns (length, reply_id).
+pub fn ipc_recv_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    let page = loop {
+        {
+            let port = match port_by_id(port_id) {
+                Some(p) => p,
+                None => return (-crate::task::ESRCH, 0),
+            };
+            if port.count > 0 {
+                let idx = port.head;
+                let pg = port.slots[idx];
+                port.head = (idx + 1) % PORT_SLOTS;
+                port.count -= 1;
+                let ws = &raw const port.wake_send as *const u32;
+                unsafe { crate::task::futex_wake(ws, 1); }
+                break pg;
+            }
+        }
+        let wr = {
+            let port = match port_by_id(port_id) {
+                Some(p) => p,
+                None => return (-crate::task::ESRCH, 0),
+            };
+            &raw const port.wake_recv as *const u32
+        };
+        if !crate::task::block_on_futex(wr) {
+            return (-crate::task::EAGAIN, 0);
+        }
+    };
+
+    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let len = hdr.len as usize;
+    let reply_id = hdr.reply_id;
+    let out_len = core::cmp::min(len, max_len);
+    if out_len > 0 && !buf.is_null() {
+        if !crate::task::user_range_valid(buf as u64, out_len, true) {
+            free_page(page);
+            return (-crate::task::EFAULT, 0);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping((page as *const u8).add(IPC_MSG_HEADER as usize), buf, out_len);
+        }
+    }
+    free_page(page);
+    (len as i64, reply_id)
 }
 
 /// Non-blocking receive: returns 0 if the mailbox is empty (rather than

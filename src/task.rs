@@ -1668,8 +1668,14 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
             if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
                 serial::write_str("SYS: unknown ");
                 serial::write_dec(syscall_num);
-                serial::write_str(" arg1=0x");
+                serial::write_str(" a1=0x");
                 serial::write_hex(arg1);
+                serial::write_str(" a2=0x");
+                serial::write_hex(arg2);
+                serial::write_str(" a3=0x");
+                serial::write_hex(arg3);
+                serial::write_str(" rip=0x");
+                serial::write_hex(unsafe { SYSCALL_USER_RIP });
                 serial::write_str("\n");
             }
             -ENOSYS
@@ -4578,7 +4584,7 @@ pub fn test() {
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     let mut init_tid = 0u64;
     if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0 }; 8];
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 8];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
         for i in 0..n {
             let mod_data = unsafe {
@@ -4625,7 +4631,30 @@ pub fn test() {
                     3 => {
                         crate::vfs::create_file(b"/bin/busybox", mod_data);
                     }
-                    _ => {}
+                    _ => {
+                        // Any additional module is registered under its own
+                        // name in /bin, taken from the GRUB cmdline basename.
+                        // This lets extra programs be added to the ISO without
+                        // changing the kernel: just drop a file in iso/boot/
+                        // and add a `module2` line to grub.cfg.
+                        let base = &modules[i].name;
+                        let mut len = 0usize;
+                        while len < base.len() && base[len] != 0 { len += 1; }
+                        if len > 0 {
+                            let mut path_buf = [0u8; 80];
+                            path_buf[..5].copy_from_slice(b"/bin/");
+                            let name_len = core::cmp::min(len, 80 - 5);
+                            path_buf[5..5 + name_len].copy_from_slice(&base[..name_len]);
+                            let path = &path_buf[..5 + name_len];
+                            crate::vfs::create_file(path, mod_data);
+                            crate::serial::write_str("MOD: registered '/bin/");
+                            for &c in &base[..core::cmp::min(len, 64)] {
+                                if c == 0 { break; }
+                                crate::serial::write_str(&core::str::from_utf8(&[c]).unwrap_or("?"));
+                            }
+                            crate::serial::write_str("'\n");
+                        }
+                    }
                 }
             }
         }

@@ -218,6 +218,14 @@ memory::init(_info);
     crate::services::register(b"proc", services::proc_handler);
 
     task::init_scheduler();
+
+    // Service-ification self-test: run a kernel service (ping) as its own task
+    // and a kernel client task that performs synchronous request/reply IPC.
+    // This exercises ipc_call/ipc_reply between separate kernel tasks.
+    services::register(b"ping", services::ping_handler);
+    let _ = task::create_kernel_task(services::ping_server_task as u64);
+    let _ = task::create_kernel_task(services::ipc_roundtrip_selftest as u64);
+
     task::test();
 
     vga::write_str("\nSystem halted.\n");
@@ -228,6 +236,11 @@ memory::init(_info);
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
     }
+}
+
+extern "C" fn kernel_probe() -> ! {
+    crate::serial::write_str("KPROBE: kernel task alive\n");
+    loop { crate::task::yield_now(); }
 }
 
 #[panic_handler]
