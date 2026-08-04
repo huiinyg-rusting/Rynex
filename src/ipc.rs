@@ -135,21 +135,20 @@ impl ReplySlot {
 }
 
 static mut REPLIES: [ReplySlot; MAX_REPLIES] = [ReplySlot::empty(); MAX_REPLIES];
-static mut NEXT_REPLY_ID: u64 = 1;
 
 fn reply_alloc() -> Option<u64> {
     let page = alloc_page()?;
     unsafe {
-        for i in 0..MAX_REPLIES {
+        // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
+        // expected), so a real synchronous reply token must never be 0.
+        for i in 1..MAX_REPLIES {
             if !REPLIES[i].used {
                 REPLIES[i].used = true;
                 REPLIES[i].page = page;
                 REPLIES[i].len = 0;
                 REPLIES[i].done = false;
                 REPLIES[i].wake = 0;
-                let id = NEXT_REPLY_ID;
-                NEXT_REPLY_ID += 1;
-                return Some(id);
+                return Some(i as u64);
             }
         }
     }
@@ -159,10 +158,8 @@ fn reply_alloc() -> Option<u64> {
 
 fn reply_get(id: u64) -> Option<&'static mut ReplySlot> {
     unsafe {
-        for i in 0..MAX_REPLIES {
-            if REPLIES[i].used && i as u64 + 1 == id {
-                return Some(&mut REPLIES[i]);
-            }
+        if id < MAX_REPLIES as u64 && REPLIES[id as usize].used {
+            return Some(&mut REPLIES[id as usize]);
         }
     }
     None
@@ -269,6 +266,11 @@ fn ipc_call_impl(
             Some(s) => &raw const s.wake as *const u32,
             None => { reply_free(reply_id); return -crate::task::ESRCH; }
         };
+        crate::serial::write_str("IPC: waiting reply rid=");
+        crate::serial::write_dec(reply_id);
+        crate::serial::write_str(" swake=0x");
+        crate::serial::write_hex(slot_wake as u64);
+        crate::serial::write_str("\n");
         crate::task::block_on_futex(slot_wake);
     }
     let (len, page) = match reply_get(reply_id) {
@@ -287,23 +289,28 @@ fn ipc_call_impl(
 
 /// Answer a `ipc_call` from a service: copy `buf` into the reply slot and wake
 /// the blocked caller. Returns 0 on success, -ESRCH if the token is stale.
+/// Idempotent: a second reply to an already-answered token is ignored so that
+/// handlers which answer directly and `handle_with_reply`'s auto-answer don't
+/// clobber each other.
 pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
-    let page = match reply_get(reply_id) {
-        Some(s) => s.page,
+    let slot = match reply_get(reply_id) {
+        Some(s) => s,
         None => return -crate::task::ESRCH,
     };
+    if slot.done {
+        return 0;
+    }
+    let page = slot.page;
     let n = core::cmp::min(len, IPC_MSG_MAX);
     if n > 0 && !buf.is_null() {
         unsafe {
             core::ptr::copy_nonoverlapping(buf, page as *mut u8, n);
         }
     }
-    if let Some(slot) = reply_get(reply_id) {
-        slot.len = n as u32;
-        slot.done = true;
-        let wake = &raw const slot.wake as *const u32;
-        unsafe { crate::task::futex_wake(wake, 1); }
-    }
+    slot.len = n as u32;
+    slot.done = true;
+    let wake = &raw const slot.wake as *const u32;
+    unsafe { crate::task::futex_wake(wake, 1); }
     n as i64
 }
 
@@ -471,7 +478,20 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
 
 /// Non-blocking receive that also returns the reply token.
 /// Returns (length, reply_id); length is 0 when the mailbox is empty.
+/// Non-blocking receive with reply token: dequeue a message if one is pending.
+/// `buf` is validated as a user-space pointer (default). Kernel tasks should
+/// use `ipc_peek_ex_internal` so their kernel-stack buffers are accepted.
 pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    ipc_peek_ex_impl(port_id, buf, max_len, false)
+}
+
+/// In-kernel variant of `ipc_peek_ex`: `buf` lives in kernel space, so the
+/// user-range check is skipped. Used by kernel service loops.
+pub fn ipc_peek_ex_internal(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    ipc_peek_ex_impl(port_id, buf, max_len, true)
+}
+
+fn ipc_peek_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool) -> (i64, u64) {
     let page = {
         let port = match port_by_id(port_id) {
             Some(p) => p,
@@ -492,7 +512,7 @@ pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
     let reply_id = hdr.reply_id;
     let out_len = core::cmp::min(len, max_len);
     if out_len > 0 && !buf.is_null() {
-        if !crate::task::user_range_valid(buf as u64, out_len, true) {
+        if !kernel_buf && !crate::task::user_range_valid(buf as u64, out_len, true) {
             free_page(page);
             return (-crate::task::EFAULT, 0);
         }
@@ -505,8 +525,20 @@ pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
 }
 
 /// Receive a message from a port, also returning the reply token from the
-/// message header (0 for fire-and-forget). Returns (length, reply_id).
+/// message header (0 for fire-and-forget). Returns (length, reply_id). `buf`
+/// is validated as a user-space pointer (default); kernel tasks should use
+/// `ipc_recv_ex_internal`.
 pub fn ipc_recv_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    ipc_recv_ex_impl(port_id, buf, max_len, false)
+}
+
+/// In-kernel variant of `ipc_recv_ex`: `buf` lives in kernel space, so the
+/// user-range check is skipped. Used by kernel service tasks.
+pub fn ipc_recv_ex_internal(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
+    ipc_recv_ex_impl(port_id, buf, max_len, true)
+}
+
+fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool) -> (i64, u64) {
     let page = loop {
         {
             let port = match port_by_id(port_id) {
@@ -540,7 +572,7 @@ pub fn ipc_recv_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
     let reply_id = hdr.reply_id;
     let out_len = core::cmp::min(len, max_len);
     if out_len > 0 && !buf.is_null() {
-        if !crate::task::user_range_valid(buf as u64, out_len, true) {
+        if !kernel_buf && !crate::task::user_range_valid(buf as u64, out_len, true) {
             free_page(page);
             return (-crate::task::EFAULT, 0);
         }

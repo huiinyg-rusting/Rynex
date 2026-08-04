@@ -354,6 +354,8 @@ static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
 static mut RUNQUEUE: RunQueue = RunQueue::new();
 static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+// Whether pid 1 has been handed out (to init). Guarded by NEXT_TID logic.
+static INIT_TASK_ASSIGNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // Task slot of the init task, passed across the boot-time stack switch.
 static mut BOOT_INIT_SLOT: usize = 0;
 // Debug: count context switches
@@ -519,8 +521,28 @@ pub fn create_kernel_task(entry: u64) -> Option<u64> {
 }
 
 pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
-    let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-    let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
+    crate::serial::write_str("TASK: create_kernel_task enter\n");
+    // pid 1 is reserved for init (busybox init checks getpid()==1 to decide
+    // whether to run as the single-instance init). Kernel tasks use pids from
+    // a low band (2,3,...) that never collides with init's pid 1; task_idx is
+    // id % 64, so pids must stay below 64 to avoid aliasing task slots.
+    let tid = loop {
+        let t = NEXT_TID.load(Ordering::SeqCst);
+        let bump = if t < 2 { 2 } else { t };
+        if NEXT_TID.compare_exchange(t, bump + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            crate::serial::write_str("TASK: kernel tid=");
+            crate::serial::write_dec(bump);
+            crate::serial::write_str("\n");
+            break bump;
+        }
+    };
+    let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
+        Some(s) => s,
+        None => {
+            crate::serial::write_str("TASK: alloc_stack FAILED for kernel task\n");
+            return None;
+        }
+    };
 
     let task = unsafe { &mut TASKS[task_idx(tid)] };
     task.id = tid;
@@ -560,7 +582,15 @@ pub fn create_user_task(entry: u64, pml4: u64, user_stack_top: u64) -> Option<u6
 }
 
 pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i32) -> Option<u64> {
-    let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
+    // The first user task (init) must be pid 1: busybox init checks
+    // getpid()==1 to decide whether to run as the single-instance init.
+    let tid = if !INIT_TASK_ASSIGNED.swap(true, Ordering::SeqCst) {
+        // First user task gets pid 1; ensure NEXT_TID reflects it.
+        NEXT_TID.store(2, Ordering::SeqCst);
+        1
+    } else {
+        NEXT_TID.fetch_add(1, Ordering::SeqCst)
+    };
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
     // Set up TLS/TCB page for musl (minimal — __init_tp fills the rest)
@@ -1865,6 +1895,13 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 && TASKS[i].blocked_on == uaddr as u64
                 && TASKS[i].id != 0
             {
+                crate::serial::write_str("WAKE idex=");
+                crate::serial::write_dec(i as u64);
+                crate::serial::write_str(" tid=");
+                crate::serial::write_dec(TASKS[i].id);
+                crate::serial::write_str(" u=0x");
+                crate::serial::write_hex(uaddr as u64);
+                crate::serial::write_str("\n");
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].blocked_on = 0;
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
@@ -1881,6 +1918,11 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
 pub fn block_on_futex(uaddr: *const u32) -> bool {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return false; }
+    crate::serial::write_str("BLOK t=");
+    crate::serial::write_dec(id);
+    crate::serial::write_str(" u=0x");
+    crate::serial::write_hex(uaddr as u64);
+    crate::serial::write_str("\n");
     remove_from_runqueue(id);
     unsafe {
         let idx = task_idx(id);

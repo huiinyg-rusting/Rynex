@@ -124,7 +124,7 @@ pub fn poll(port_id: u64) -> usize {
     let mut handled = 0;
     loop {
         let mut buf = [0u8; 512];
-        let (n, reply_id) = ipc::ipc_peek_ex(port_id, buf.as_mut_ptr(), buf.len());
+        let (n, reply_id) = ipc::ipc_peek_ex_internal(port_id, buf.as_mut_ptr(), buf.len());
         if n <= 0 { break; }
         handle_with_reply(port_id, &buf[..n as usize], reply_id);
         handled += 1;
@@ -150,6 +150,9 @@ fn handle_with_reply(port_id: u64, request: &[u8], reply_id: u64) -> i64 {
 /// Background service loop for a name. Blocks on the service port and handles
 /// each request as it arrives. Used for services that run as their own task.
 pub fn serve(name: &[u8]) -> ! {
+    crate::serial::write_str("SVC: serve entering '");
+    crate::serial::write_str(&alloc::format!("{}", core::str::from_utf8(name).unwrap_or("?")));
+    crate::serial::write_str("'\n");
     let port = match ipc::ipc_connect(name.as_ptr(), name.len()) {
         p if p >= 0 => p as u64,
         _ => {
@@ -161,7 +164,12 @@ pub fn serve(name: &[u8]) -> ! {
     };
     loop {
         let mut buf = [0u8; MAX_REQUEST];
-        let (n, reply_id) = ipc::ipc_recv_ex(port, buf.as_mut_ptr(), MAX_REQUEST);
+        let (n, reply_id) = ipc::ipc_recv_ex_internal(port, buf.as_mut_ptr(), MAX_REQUEST);
+        serial::write_str("SVC: recv n=");
+        serial::write_dec(n as u64);
+        serial::write_str(" rid=");
+        serial::write_dec(reply_id);
+        serial::write_str("\n");
         if n < 0 { continue; }
         handle_with_reply(port, &buf[..n as usize], reply_id);
     }
@@ -268,7 +276,6 @@ pub fn ping_handler(req: &[u8], reply_id: u64) -> i64 {
 /// Kernel service task that serves the `ping` port (used as a scheduling/
 /// IPC self-test alongside a client task).
 pub fn ping_server_task() -> ! {
-    crate::serial::write_str("PINGSVR: entered\n");
     crate::services::serve(b"ping")
 }
 
@@ -276,12 +283,16 @@ pub fn ping_server_task() -> ! {
 /// `ping` service and prints the result to the serial console. Serves as a
 /// smoke test that synchronous IPC works between separate kernel tasks.
 pub extern "C" fn ipc_roundtrip_selftest() -> ! {
-    crate::serial::write_str("SELFTEST: entered\n");
+    serial::write_str("SELFTEST: entered\n");
+    let mut rounds: u32 = 0;
     loop {
         // Connect to the ping service and issue a synchronous call.
         match crate::ipc::ipc_connect(b"ping".as_ptr(), 4) {
             p if p >= 0 => {
                 let port = p as u64;
+                serial::write_str("SELFTEST: conn ok port=");
+                serial::write_dec(port);
+                serial::write_str(" calling\n");
                 let req = b"ping-IPC";
                 let mut out = [0u8; 64];
                 let n = crate::ipc::ipc_call_internal(
@@ -302,6 +313,11 @@ pub extern "C" fn ipc_roundtrip_selftest() -> ! {
             _ => {
                 serial::write_str("SELFTEST: ping service not found\n");
             }
+        }
+        rounds += 1;
+        if rounds >= 3 {
+            serial::write_str("SELFTEST: done (3 rounds)\n");
+            loop { crate::task::yield_now(); }
         }
         // Slow the test loop so it doesn't spin on the console.
         for _ in 0..100_000 { core::hint::spin_loop(); }
