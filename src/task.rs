@@ -521,7 +521,6 @@ pub fn create_kernel_task(entry: u64) -> Option<u64> {
 }
 
 pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
-    crate::serial::write_str("TASK: create_kernel_task enter\n");
     // pid 1 is reserved for init (busybox init checks getpid()==1 to decide
     // whether to run as the single-instance init). Kernel tasks use pids from
     // a low band (2,3,...) that never collides with init's pid 1; task_idx is
@@ -530,19 +529,10 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
         let t = NEXT_TID.load(Ordering::SeqCst);
         let bump = if t < 2 { 2 } else { t };
         if NEXT_TID.compare_exchange(t, bump + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            crate::serial::write_str("TASK: kernel tid=");
-            crate::serial::write_dec(bump);
-            crate::serial::write_str("\n");
             break bump;
         }
     };
-    let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
-        Some(s) => s,
-        None => {
-            crate::serial::write_str("TASK: alloc_stack FAILED for kernel task\n");
-            return None;
-        }
-    };
+    let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
     let task = unsafe { &mut TASKS[task_idx(tid)] };
     task.id = tid;
@@ -1895,13 +1885,6 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 && TASKS[i].blocked_on == uaddr as u64
                 && TASKS[i].id != 0
             {
-                crate::serial::write_str("WAKE idex=");
-                crate::serial::write_dec(i as u64);
-                crate::serial::write_str(" tid=");
-                crate::serial::write_dec(TASKS[i].id);
-                crate::serial::write_str(" u=0x");
-                crate::serial::write_hex(uaddr as u64);
-                crate::serial::write_str("\n");
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].blocked_on = 0;
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
@@ -1918,11 +1901,6 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
 pub fn block_on_futex(uaddr: *const u32) -> bool {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return false; }
-    crate::serial::write_str("BLOK t=");
-    crate::serial::write_dec(id);
-    crate::serial::write_str(" u=0x");
-    crate::serial::write_hex(uaddr as u64);
-    crate::serial::write_str("\n");
     remove_from_runqueue(id);
     unsafe {
         let idx = task_idx(id);

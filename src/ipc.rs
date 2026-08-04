@@ -266,11 +266,6 @@ fn ipc_call_impl(
             Some(s) => &raw const s.wake as *const u32,
             None => { reply_free(reply_id); return -crate::task::ESRCH; }
         };
-        crate::serial::write_str("IPC: waiting reply rid=");
-        crate::serial::write_dec(reply_id);
-        crate::serial::write_str(" swake=0x");
-        crate::serial::write_hex(slot_wake as u64);
-        crate::serial::write_str("\n");
         crate::task::block_on_futex(slot_wake);
     }
     let (len, page) = match reply_get(reply_id) {

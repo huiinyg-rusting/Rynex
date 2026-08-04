@@ -55,15 +55,6 @@ pub fn init(info_addr: u32) {
     let kend = unsafe { &_kernel_end as *const _ as u64 };
     let ks = buddy::page_align_down(kstart);
     let ke = buddy::page_align_up(kend);
-    crate::serial::write_str("MEMDBG: base=0x");
-    crate::serial::write_hex(base);
-    crate::serial::write_str(" kstart=0x");
-    crate::serial::write_hex(ks);
-    crate::serial::write_str(" kend=0x");
-    crate::serial::write_hex(ke);
-    crate::serial::write_str(" region_end=0x");
-    crate::serial::write_hex(end);
-    crate::serial::write_str("\n");
 
     // Find modules first so we can exclude their pages from free regions
     let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 8];

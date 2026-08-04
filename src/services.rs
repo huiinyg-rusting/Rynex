@@ -150,9 +150,6 @@ fn handle_with_reply(port_id: u64, request: &[u8], reply_id: u64) -> i64 {
 /// Background service loop for a name. Blocks on the service port and handles
 /// each request as it arrives. Used for services that run as their own task.
 pub fn serve(name: &[u8]) -> ! {
-    crate::serial::write_str("SVC: serve entering '");
-    crate::serial::write_str(&alloc::format!("{}", core::str::from_utf8(name).unwrap_or("?")));
-    crate::serial::write_str("'\n");
     let port = match ipc::ipc_connect(name.as_ptr(), name.len()) {
         p if p >= 0 => p as u64,
         _ => {
@@ -283,7 +280,6 @@ pub fn ping_server_task() -> ! {
 /// `ping` service and prints the result to the serial console. Serves as a
 /// smoke test that synchronous IPC works between separate kernel tasks.
 pub extern "C" fn ipc_roundtrip_selftest() -> ! {
-    serial::write_str("SELFTEST: entered\n");
     let mut rounds: u32 = 0;
     loop {
         // Connect to the ping service and issue a synchronous call.
