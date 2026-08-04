@@ -211,6 +211,12 @@ memory::init(_info);
     services::register(b"console", services::console_handler);
     services::register(b"kbd", services::kbd_handler);
 
+    // Register /proc and mount it so busybox ps works. This runs while the
+    // kernel still has full control (before the scheduler hands off to init).
+    crate::vfs_core::procfs::init();
+    crate::vfs_core::procfs::mount_proc();
+    crate::services::register(b"proc", services::proc_handler);
+
     task::init_scheduler();
     task::test();
 
