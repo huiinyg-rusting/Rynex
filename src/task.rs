@@ -401,6 +401,10 @@ static mut TIMER_FRAME_SCRATCH: [u64; 20] = [0; 20];
 // Stores [real_rax, real_rdx, real_rip] for the task being resumed.
 static mut PREEMPT_SCRATCH: [u64; 3] = [0; 3];
 
+// Kernel .eh_frame_hdr address for AT_SYSINFO_EHDR (auxv 33).
+// Populated at runtime via build.rs exported symbol.
+pub static KERNEL_EH_FRAME_HDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn current_task_id() -> u64 {
     CURRENT_TASK.load(Ordering::SeqCst)
 }
@@ -622,19 +626,58 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     };
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
-    // Set up TLS/TCB page for musl (minimal — __init_tp fills the rest)
-    //   [tp+0x00] = self pointer (struct pthread *)
+    // Set up TLS/TCB page for musl. Initialize full TCB per musl's pthread struct.
     let tls_phys = unsafe { &mut *crate::memory::allocator() }.alloc(0)?;
-    unsafe {
-        core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096);
-        core::ptr::write((tls_phys + 0x00) as *mut u64, USER_TLS_VADDR as u64);
-    }
+    unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+
+    // Map the TLS page FIRST so we can write to virtual addresses
     let tls_flags = crate::paging::PTE_PRESENT
         | crate::paging::PTE_WRITABLE
         | crate::paging::PTE_USER
         | crate::paging::PTE_NO_EXECUTE;
     if PageTableManager::map_into(pml4, USER_TLS_VADDR, tls_phys, tls_flags).is_err() {
         return None;
+    }
+
+    let tls_base = USER_TLS_VADDR;
+    let tid = if !INIT_TASK_ASSIGNED.load(Ordering::SeqCst) { 1 } else { NEXT_TID.load(Ordering::SeqCst) };
+
+    unsafe {
+        // 0x00: DTV pointer (0 = initial thread)
+        core::ptr::write_volatile(tls_base as *mut u64, 0);
+
+        // 0x08: Self pointer (struct pthread *)
+        core::ptr::write_volatile((tls_base + 0x08) as *mut u64, tls_base);
+
+        // 0x10: Thread ID (tid) - 64-bit
+        core::ptr::write_volatile((tls_base + 0x10) as *mut u64, tid);
+
+        // 0x14: PID (tgid) - 32-bit
+        core::ptr::write_volatile((tls_base + 0x14) as *mut u32, tid as u32);
+
+        // 0x18: errno location (pointer to thread-local errno at offset 0x100)
+        let errno_loc = tls_base + 0x100;
+        core::ptr::write_volatile((tls_base + 0x18) as *mut u64, errno_loc);
+        core::ptr::write_volatile(errno_loc as *mut i32, 0);
+
+        // 0x20: Stack guard (canary)
+        let canary = crate::pit::TICKS.load(Ordering::Relaxed) ^ tid;
+        core::ptr::write_volatile((tls_base + 0x20) as *mut u64, canary);
+
+        // 0x28: Thread pointer (self) - for __get_tp()
+        core::ptr::write_volatile((tls_base + 0x28) as *mut u64, tls_base);
+
+        // 0x30: Cancel flag (0 = not cancelled)
+        core::ptr::write_volatile((tls_base + 0x30) as *mut u32, 0);
+
+        // 0x34: Cancel type (0 = deferred)
+        core::ptr::write_volatile((tls_base + 0x34) as *mut u32, 0);
+
+        // 0x38: Cancel state
+        core::ptr::write_volatile((tls_base + 0x38) as *mut u32, 0);
+
+        // Zero rest of TCB area
+        core::ptr::write_bytes((tls_base + 0x40) as *mut u8, 0, 4096 - 0x40);
     }
 
     let task = unsafe { &mut TASKS[task_idx(tid)] };
@@ -3109,6 +3152,15 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     aux!(4, info.phentsize as u64); // AT_PHENT
                     aux!(3, info.phdr_user);   // AT_PHDR
 
+                    // AT_TLS (27): TLS base address - critical for musl's dynamic linker
+                    aux!(27, USER_TLS_VADDR);
+
+                    // AT_SYSINFO_EHDR (33): .eh_frame_hdr for stack unwinding
+                    let eh_frame_hdr = crate::task::KERNEL_EH_FRAME_HDR.load(Ordering::Relaxed);
+                    if eh_frame_hdr != 0 {
+                        aux!(33, eh_frame_hdr);
+                    }
+
                     // 3. envp NULL
                     sp -= 8;
                     wv(sp as *mut u64, 0u64);
@@ -3171,6 +3223,15 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     aux!(4, info.phentsize as u64); // AT_PHENT
                     aux!(3, info.phdr_user);   // AT_PHDR
 
+                    // AT_TLS (27): TLS base address - critical for musl's dynamic linker
+                    aux!(27, USER_TLS_VADDR);
+
+                    // AT_SYSINFO_EHDR (33): .eh_frame_hdr for stack unwinding
+                    let eh_frame_hdr = crate::task::KERNEL_EH_FRAME_HDR.load(Ordering::Relaxed);
+                    if eh_frame_hdr != 0 {
+                        aux!(33, eh_frame_hdr);
+                    }
+
                     // 3. envp NULL
                     sp -= 8;
                     wv(sp as *mut u64, 0u64);
@@ -3188,18 +3249,20 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 }
 
                 TASKS[idx].regs = Registers::new_user(final_entry, sp);
-                // Allocate TLS page for musl.  __init_tp will fill self/tid/cancel;
-                // we just need a self-pointer so __get_tp() doesn't return 0.
+                // Allocate TLS page for musl. Initialize full TCB per musl's
+                // pthread struct so __get_tp() works and thread internals work.
                 if info.is_dynamic {
                     let tls_phys = match alloc.alloc(0) {
                         Some(p) => p,
                         None => { alloc.free(old_pml4, 0); alloc.free(buffer_phys, elford); return -ENOMEM; }
                     };
+                    // Zero the entire TLS page first
                     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
-                    unsafe {
-                        core::ptr::write_volatile(tls_phys as *mut u64, USER_TLS_VADDR);
-                    }
 
+                    let tls_base = USER_TLS_VADDR;
+                    let tid = id; // current task id is the new thread's tid
+
+                    // Map the TLS page FIRST so we can write to virtual addresses
                     let tls_flags = crate::paging::PTE_PRESENT
                         | crate::paging::PTE_WRITABLE
                         | crate::paging::PTE_USER
@@ -3209,6 +3272,50 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         alloc.free(buffer_phys, elford);
                         return -ENOMEM;
                     }
+
+                    let tls_base = USER_TLS_VADDR;
+                    let tid = id; // current task id is the new thread's tid
+
+                    unsafe {
+                        // 0x00: DTV pointer (0 = initial thread, no dynamic TLS modules yet)
+                        core::ptr::write_volatile(tls_base as *mut u64, 0);
+
+                        // 0x08: Self pointer (struct pthread *)
+                        core::ptr::write_volatile((tls_base + 0x08) as *mut u64, tls_base);
+
+                        // 0x10: Thread ID (tid) - 64-bit
+                        core::ptr::write_volatile((tls_base + 0x10) as *mut u64, tid);
+
+                        // 0x14: PID (tgid) - 32-bit
+                        core::ptr::write_volatile((tls_base + 0x14) as *mut u32, tid as u32);
+
+                        // 0x18: errno location (pointer to thread-local errno)
+                        // musl stores &errno here; we allocate it in TCB at offset 0x100
+                        let errno_loc = tls_base + 0x100;
+                        core::ptr::write_volatile((tls_base + 0x18) as *mut u64, errno_loc);
+                        // Initialize errno to 0
+                        core::ptr::write_volatile(errno_loc as *mut i32, 0);
+
+                        // 0x20: Stack guard (canary) - random per thread
+                        let canary = crate::pit::TICKS.load(Ordering::Relaxed) ^ tid;
+                        core::ptr::write_volatile((tls_base + 0x20) as *mut u64, canary);
+
+                        // 0x28: Thread pointer (self) - for __get_tp()
+                        core::ptr::write_volatile((tls_base + 0x28) as *mut u64, tls_base);
+
+                        // 0x30: Cancel flag (0 = not cancelled)
+                        core::ptr::write_volatile((tls_base + 0x30) as *mut u32, 0);
+
+                        // 0x34: Cancel type (0 = deferred)
+                        core::ptr::write_volatile((tls_base + 0x34) as *mut u32, 0);
+
+                        // 0x38: Cancel state
+                        core::ptr::write_volatile((tls_base + 0x38) as *mut u32, 0);
+
+                        // Zero rest of TCB area (musl expects zero-initialized beyond explicit fields)
+                        core::ptr::write_bytes((tls_base + 0x40) as *mut u8, 0, 4096 - 0x40);
+                    }
+
                     TASKS[idx].regs.fs_base = USER_TLS_VADDR;
                 }
                 TASKS[idx].pml4 = info.pml4;
@@ -3247,6 +3354,18 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         out("ecx") _,
                         options(nostack, preserves_flags)
                     );
+                    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_EXEC);
+                        crate::klog::s("EXEC: about to iretq to user mode rip=0x");
+                        crate::klog::hex(TASKS[idx].regs.rip);
+                        crate::klog::s(" rsp=0x");
+                        crate::klog::hex(TASKS[idx].regs.rsp);
+                        crate::klog::s(" cs=0x");
+                        crate::klog::hex(TASKS[idx].regs.cs);
+                        crate::klog::s(" fs_base=0x");
+                        crate::klog::hex(TASKS[idx].regs.fs_base);
+                        crate::klog::end();
+                    }
                     #[unsafe(naked)]
                     unsafe extern "C" fn iretq_trampoline(_regs: *const Registers) -> ! {
                         core::arch::naked_asm!(
@@ -4667,10 +4786,14 @@ pub fn test() {
                 match i {
                     0 => {
                         crate::vfs::create_file(b"/bin/init", mod_data);
+                        serial::write_str("TASK: about to call load_elf\n");
                         match crate::elf::load_elf(mod_data) {
                             Ok(elf_info) => {
                                 if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
                                     init_tid = tid;
+                                    serial::write_str("TASK: init created tid=");
+                                    serial::write_dec(init_tid);
+                                    serial::write_str("\n");
                                     // Name the init task before we switch away
                                     // (set_current_comm operates on CURRENT_TASK).
                                     unsafe {
@@ -4680,6 +4803,8 @@ pub fn test() {
                                         for i in 0..len { TASKS[idx].comm[i] = name[i]; }
                                         TASKS[idx].comm[len] = 0;
                                     }
+                                } else {
+                                    serial::write_str("TASK: create_user_task returned None!\n");
                                 }
                             }
                             Err(e) => {

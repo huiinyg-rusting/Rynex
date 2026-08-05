@@ -11,4 +11,11 @@ fn main() {
         println!("cargo:rustc-link-arg=-fuse-ld=bfd");
         println!("cargo:rustc-link-arg=-nostartfiles");
     }
+
+    // Export __eh_frame_hdr_start symbol for AT_SYSINFO_EHDR
+    println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_start=__eh_frame_hdr_start");
+    println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_end=__eh_frame_hdr_end");
+
+    // Tell cargo to rerun if linker.ld changes
+    println!("cargo:rerun-if-changed=linker.ld");
 }
