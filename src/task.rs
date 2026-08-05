@@ -362,15 +362,15 @@ static mut BOOT_INIT_SLOT: usize = 0;
 static SWITCH_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Pending kernel tasks to spawn after scheduler handoff
-static mut PENDING_KERNEL_TASKS: [u64; 8] = [0; 8];
+static mut PENDING_KERNEL_TASKS: [(u64, &'static [u8]); 8] = [(0, &[]); 8];
 static mut PENDING_KERNEL_TASK_COUNT: usize = 0;
 
 /// Register a kernel task to be spawned after the scheduler handoff to init.
 /// Returns true if registered successfully, false if the pending list is full.
-pub fn register_kernel_task(entry: u64) -> bool {
+pub fn register_kernel_task(entry: u64, comm: &'static [u8]) -> bool {
     unsafe {
         if PENDING_KERNEL_TASK_COUNT < PENDING_KERNEL_TASKS.len() {
-            PENDING_KERNEL_TASKS[PENDING_KERNEL_TASK_COUNT] = entry;
+            PENDING_KERNEL_TASKS[PENDING_KERNEL_TASK_COUNT] = (entry, comm);
             PENDING_KERNEL_TASK_COUNT += 1;
             true
         } else {
@@ -383,9 +383,9 @@ pub fn register_kernel_task(entry: u64) -> bool {
 fn spawn_pending_kernel_tasks() {
     unsafe {
         for i in 0..PENDING_KERNEL_TASK_COUNT {
-            let entry = PENDING_KERNEL_TASKS[i];
+            let (entry, comm) = PENDING_KERNEL_TASKS[i];
             if entry != 0 {
-                let _ = create_kernel_task(entry);
+                let _ = create_kernel_task_prio(entry, PRIORITY_DEFAULT_NICE, comm);
             }
         }
         PENDING_KERNEL_TASK_COUNT = 0;
@@ -548,10 +548,10 @@ fn free_stack(base: u64, pages: usize) {
 // ── Task creation ────────────────────────────────────────────────
 
 pub fn create_kernel_task(entry: u64) -> Option<u64> {
-    create_kernel_task_prio(entry, PRIORITY_DEFAULT_NICE)
+    create_kernel_task_prio(entry, PRIORITY_DEFAULT_NICE, b"kworker")
 }
 
-pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
+pub fn create_kernel_task_prio(entry: u64, nice: i32, comm: &[u8]) -> Option<u64> {
     // pid 1 is reserved for init (busybox init checks getpid()==1 to decide
     // whether to run as the single-instance init). Kernel tasks use pids from
     // a low band (2,3,...) that never collides with init's pid 1; task_idx is
@@ -579,7 +579,15 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32) -> Option<u64> {
     task.time_slice = initial_time_slice(task.prio);
     task.parent = None;
 
+    // Set comm name
+    let len = core::cmp::min(comm.len(), 15);
+    for i in 0..len { task.comm[i] = comm[i]; }
+    task.comm[len] = 0;
+
     enqueue_task(tid, task.prio);
+
+    // Bind /proc/<pid> entries for this task
+    crate::vfs_core::procfs::bind_task_procfs(tid);
 
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
@@ -665,6 +673,9 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     }
 
     enqueue_task(tid, task.prio);
+
+    // Bind /proc/<pid> entries for this task
+    crate::vfs_core::procfs::bind_task_procfs(tid);
 
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
@@ -4752,6 +4763,11 @@ pub fn test() {
     unsafe {
         core::arch::asm!("mov rsp, {}", in(reg) task0.kernel_stack);
     }
+
+    // Spawn pending kernel tasks after stack switch but before init context switch.
+    // This ensures they land in the runqueue after init is set to Running,
+    // so init gets CPU first and kernel tasks don't starve it.
+    spawn_pending_kernel_tasks();
 
     let new_task = unsafe { &mut TASKS[unsafe { BOOT_INIT_SLOT }] };
 
