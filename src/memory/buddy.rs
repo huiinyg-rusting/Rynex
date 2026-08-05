@@ -196,8 +196,11 @@ impl BuddyAllocator {
     }
 
     pub fn free(&mut self, addr: u64, order: usize) {
+        // If the page was reserved, unreserve it first so it can be properly freed.
+        // This handles the mallocng meta page which is reserved to prevent buddy
+        // from reusing it during its lifetime, but must be freed when the task exits.
         if self.is_reserved(addr) {
-            return;
+            self.unreserve(addr);
         }
         let pidx = self.page_index(addr);
         used_clear(pidx);
@@ -253,6 +256,36 @@ impl BuddyAllocator {
             self.reserved_count += 1;
             // Also ensure it's not in free lists
             self.mark_allocated(addr, PAGE_SIZE);
+        }
+    }
+
+    /// Remove a page from the reserved list so it can be freed or reallocated.
+    /// Returns true if the page was found and removed.
+    pub fn unreserve(&mut self, addr: u64) -> bool {
+        for i in 0..self.reserved_count {
+            if self.reserved[i] == addr {
+                // Remove by shifting remaining elements
+                for j in i..self.reserved_count - 1 {
+                    self.reserved[j] = self.reserved[j + 1];
+                }
+                self.reserved_count -= 1;
+                self.reserved[self.reserved_count] = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a page from the reserved list and free it.
+    /// Returns true if the page was reserved and has been freed.
+    pub fn free_reserved(&mut self, addr: u64, order: usize) -> bool {
+        if self.unreserve(addr) {
+            let pidx = self.page_index(addr);
+            used_clear(pidx);
+            self.free_one(addr, order as u8);
+            true
+        } else {
+            false
         }
     }
 
