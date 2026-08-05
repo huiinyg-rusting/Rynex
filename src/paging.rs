@@ -30,7 +30,7 @@ pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 // other owner(s) are gone, so copying would orphan the old physical page
 // (leak). free_address_space drops one reference per shared leaf instead of
 // freeing it; private leaves (refcount 0) are freed outright.
-const MAX_REFC_PAGES: usize = 1 << 18; // up to 1 GiB of physical pages
+const MAX_REFC_PAGES: usize = 1 << 21; // up to 8 GiB of physical pages
 static mut PAGE_REFC: [u8; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
 
 fn refc_idx(phys: u64) -> usize {
@@ -69,7 +69,47 @@ fn refc_dec(phys: u64) {
 #[repr(C, align(4096))]
 pub struct PageTable(pub [u64; 512]);
 
-impl PageTable {
+// With CR0.WP=1, a supervisor write to a read-only page faults. Resolve it by
+// making the covering identity-map entry writable IF it is a non-user page.
+// Returns true if handled (page made writable, faulting instruction retries).
+pub fn kernel_ro_write_resolve(cr2: u64) -> bool {
+    let pml4 = crate::task::current_task_pml4();
+    if pml4 == 0 {
+        return false;
+    }
+    let vpn = [
+        ((cr2 >> 39) & 0x1FF) as usize,
+        ((cr2 >> 30) & 0x1FF) as usize,
+        ((cr2 >> 21) & 0x1FF) as usize,
+        ((cr2 >> 12) & 0x1FF) as usize,
+    ];
+    unsafe {
+        let pml4t = &*(pml4 as *const PageTable);
+        if pml4t.0[vpn[0]] & PTE_PRESENT == 0 { return false; }
+        let pdpt = &*((pml4t.0[vpn[0]] & PTE_ADDR_MASK) as *const PageTable);
+        if pdpt.0[vpn[1]] & PTE_PRESENT == 0 { return false; }
+        if pdpt.0[vpn[1]] & PTE_HUGE != 0 {
+            if pdpt.0[vpn[1]] & PTE_USER != 0 { return false; }
+            let e = &mut *((pml4t.0[vpn[0]] & PTE_ADDR_MASK) as *mut PageTable);
+            e.0[vpn[1]] |= PTE_WRITABLE;
+            return true;
+        }
+        let pd = &*((pdpt.0[vpn[1]] & PTE_ADDR_MASK) as *const PageTable);
+        if pd.0[vpn[2]] & PTE_PRESENT == 0 { return false; }
+        if pd.0[vpn[2]] & PTE_HUGE != 0 {
+            if pd.0[vpn[2]] & PTE_USER != 0 { return false; }
+            let e = &mut *((pdpt.0[vpn[1]] & PTE_ADDR_MASK) as *mut PageTable);
+            e.0[vpn[2]] |= PTE_WRITABLE;
+            return true;
+        }
+        let pt = &*((pd.0[vpn[2]] & PTE_ADDR_MASK) as *const PageTable);
+        if pt.0[vpn[3]] & PTE_PRESENT == 0 { return false; }
+        if pt.0[vpn[3]] & PTE_USER != 0 { return false; }
+        let e = &mut *((pd.0[vpn[2]] & PTE_ADDR_MASK) as *mut PageTable);
+        e.0[vpn[3]] |= PTE_WRITABLE;
+        true
+    }
+}impl PageTable {
     fn get(&self, idx: usize) -> u64 {
         self.0[idx]
     }
@@ -698,17 +738,34 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                         }
                     }
                     if pt_user {
-                        alloc.free(pde & PTE_ADDR_MASK, 0); // PT page
+                        // PT page: if still shared (fork partner references it),
+                        // drop our reference; otherwise it is ours to free.
+                        let pt_phys = pde & PTE_ADDR_MASK;
+                        if refc_get(pt_phys) > 0 {
+                            refc_dec(pt_phys);
+                        } else {
+                            alloc.free(pt_phys, 0);
+                        }
                         pd_user = true;
                     }
                 }
                 if pd_user {
-                    alloc.free(pdpte & PTE_ADDR_MASK, 0); // PD page
+                    let pd_phys = pdpte & PTE_ADDR_MASK;
+                    if refc_get(pd_phys) > 0 {
+                        refc_dec(pd_phys);
+                    } else {
+                        alloc.free(pd_phys, 0);
+                    }
                     pdpt_user = true;
                 }
             }
             if pdpt_user {
-                alloc.free(pml4e & PTE_ADDR_MASK, 0); // PDPT page
+                let pdpt_phys = pml4e & PTE_ADDR_MASK;
+                if refc_get(pdpt_phys) > 0 {
+                    refc_dec(pdpt_phys);
+                } else {
+                    alloc.free(pdpt_phys, 0);
+                }
             }
         }
         alloc.free(pml4, 0); // PML4 itself
@@ -716,9 +773,10 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
 }
 
 // Clone the current process's PML4 for fork.
-// Creates a new PML4 with private (deep-copied) user page tables.
-// User 4K pages are shared with COW (read-only in child, read-only in parent too).
-// 2M/1G huge pages (kernel identity map) stay shared writable.
+// Lazy sharing: only a new PML4 is allocated; user page tables (PDPT/PD/PT)
+// are shared with the child and reference-counted. All user 4K PTEs are marked
+// read-only (COW) in both parent and child. 2M/1G huge pages (kernel identity
+// map) stay shared writable.
 pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let new_pml4 = alloc.alloc(0)?;
@@ -746,6 +804,8 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
         new_table.0[pml4_idx] = pml4e;
 
         let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
+        // Page-table page: both parent and child now reference it.
+        refc_inc(old_pdpt_phys);
         let old_pdpt = unsafe { &mut *(old_pdpt_phys as *mut PageTable) };
 
         for pdpt_idx in 0..512 {
@@ -753,31 +813,49 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
             if pdpte & PTE_PRESENT == 0 { continue; }
 
             if pdpte & PTE_HUGE != 0 {
-                // 1G huge page — mark as COW in both parent and child
-                refc_inc(pdpte & PTE_ADDR_MASK);
-                old_pdpt.0[pdpt_idx] = pdpte & !PTE_WRITABLE;
+                // 1G huge page — mark as COW in both parent and child.
+                // Kernel identity huge pages (USER=0) stay shared writable:
+                // marking them RO would trap every kernel write AND the PD/PT
+                // pages under them, deadlocking the PF handler.
+                if pdpte & PTE_USER != 0 {
+                    refc_inc(pdpte & PTE_ADDR_MASK);
+                    old_pdpt.0[pdpt_idx] = pdpte & !PTE_WRITABLE;
+                }
                 continue;
             }
 
-            let old_pd = unsafe { &mut *((pdpte & PTE_ADDR_MASK) as *mut PageTable) };
+            let old_pd_phys = pdpte & PTE_ADDR_MASK;
+            // Page-table page: shared between parent and child.
+            refc_inc(old_pd_phys);
+            let old_pd = unsafe { &mut *(old_pd_phys as *mut PageTable) };
 
             for pd_idx in 0..512 {
                 let pde = old_pd.0[pd_idx];
                 if pde & PTE_PRESENT == 0 { continue; }
 
                 if pde & PTE_HUGE != 0 {
-                    // 2M huge page — mark as COW in both parent and child
-                    refc_inc(pde & PTE_ADDR_MASK);
-                    old_pd.0[pd_idx] = pde & !PTE_WRITABLE;
+                    // 2M huge page — mark as COW in both parent and child.
+                    // Kernel identity huge pages (USER=0) stay shared writable.
+                    if pde & PTE_USER != 0 {
+                        refc_inc(pde & PTE_ADDR_MASK);
+                        old_pd.0[pd_idx] = pde & !PTE_WRITABLE;
+                    }
                     continue;
                 }
 
                 // 4K page — mark all user PTEs as read-only (COW)
-                let old_pt = unsafe { &mut *((pde & PTE_ADDR_MASK) as *mut PageTable) };
+                let old_pt_phys = pde & PTE_ADDR_MASK;
+                // Page-table page: shared between parent and child.
+                refc_inc(old_pt_phys);
+                let old_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
 
-                for pt_idx in 0..256 {
+                for pt_idx in 0..512 {
                     let pte = old_pt.0[pt_idx];
                     if pte & PTE_PRESENT == 0 { continue; }
+                    // Kernel identity pages (USER cleared) belong to the kernel and
+                    // must stay writable (PF/DF stacks, BSS, page tables). Only COW
+                    // user pages so the parent/child share stays correct.
+                    if pte & PTE_USER == 0 { continue; }
                     refc_inc(pte & PTE_ADDR_MASK);
                     if pte & PTE_WRITABLE == 0 { continue; }
                     old_pt.0[pt_idx] = pte & !PTE_WRITABLE;
@@ -796,8 +874,71 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     Some(new_pml4)
 }
 
+// Walk to the leaf PTE for `virt`, ensuring every page-table page along the
+// way (PDPT/PD/PT) is private to this task. Shared page-table pages (those
+// refcounted by a fork partner) are copied on write, dropping our reference
+// to the shared original. Returns a mutable reference to the leaf PTE, or
+// None if the mapping is absent or a huge page is in the way.
+fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
+    let vpn = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+
+    // PML4 is always private (each task owns its own).
+    let pml4_tbl = unsafe { &mut *(pml4 as *mut PageTable) };
+    let pml4e = pml4_tbl.0[vpn[0]];
+    if pml4e & PTE_PRESENT == 0 { return None; }
+    let mut pdpt_phys = pml4e & PTE_ADDR_MASK;
+
+    // PDPT: copy if shared.
+    if refc_get(pdpt_phys) > 0 {
+        let new_pdpt = alloc.alloc(0)?;
+        unsafe { core::ptr::copy_nonoverlapping(pdpt_phys as *const u8, new_pdpt as *mut u8, 4096); }
+        refc_dec(pdpt_phys);
+        pml4_tbl.0[vpn[0]] = new_pdpt | (pml4e & !PTE_ADDR_MASK);
+        pdpt_phys = new_pdpt;
+    }
+
+    let pdpt_tbl = unsafe { &mut *(pdpt_phys as *mut PageTable) };
+    let pdpte = pdpt_tbl.0[vpn[1]];
+    if pdpte & PTE_PRESENT == 0 { return None; }
+    if pdpte & PTE_HUGE != 0 { return None; }
+    let mut pd_phys = pdpte & PTE_ADDR_MASK;
+
+    // PD: copy if shared.
+    if refc_get(pd_phys) > 0 {
+        let new_pd = alloc.alloc(0)?;
+        unsafe { core::ptr::copy_nonoverlapping(pd_phys as *const u8, new_pd as *mut u8, 4096); }
+        refc_dec(pd_phys);
+        pdpt_tbl.0[vpn[1]] = new_pd | (pdpte & !PTE_ADDR_MASK);
+        pd_phys = new_pd;
+    }
+
+    let pd_tbl = unsafe { &mut *(pd_phys as *mut PageTable) };
+    let pde = pd_tbl.0[vpn[2]];
+    if pde & PTE_PRESENT == 0 { return None; }
+    if pde & PTE_HUGE != 0 { return None; }
+    let mut pt_phys = pde & PTE_ADDR_MASK;
+
+    // PT: copy if shared.
+    if refc_get(pt_phys) > 0 {
+        let new_pt = alloc.alloc(0)?;
+        unsafe { core::ptr::copy_nonoverlapping(pt_phys as *const u8, new_pt as *mut u8, 4096); }
+        refc_dec(pt_phys);
+        pd_tbl.0[vpn[2]] = new_pt | (pde & !PTE_ADDR_MASK);
+        pt_phys = new_pt;
+    }
+
+    let pt_tbl = unsafe { &mut *(pt_phys as *mut PageTable) };
+    Some(&mut pt_tbl.0[vpn[3]])
+}
+
 pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
-    let pte = match get_pte_in(pml4, virt) {
+    let pte = match cow_walk_pte(pml4, virt) {
         Some(p) => p,
         None => return false,
     };
@@ -805,10 +946,10 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     if *pte & PTE_PRESENT == 0 { return false; }
     if *pte & PTE_WRITABLE != 0 { return false; }
 
-    let old_phys = *pte & PTE_ADDR_MASK;
-    let flags = *pte & !PTE_ADDR_MASK;
-
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+     let old_phys = *pte & PTE_ADDR_MASK;
+     let flags = *pte & !PTE_ADDR_MASK;
+ 
+     let alloc = unsafe { &mut *crate::memory::allocator() };
 
     // The mallocng meta page must always have a private physical page reserved
     // (it may be aliased via the identity map and must never be handed out by

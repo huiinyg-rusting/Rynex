@@ -21,7 +21,10 @@ pub struct BuddyAllocator {
     reserved_count: usize,
 }
 
-const USED_BMP_WORDS: usize = 65536 / 64;
+// The used-page bitmap tracks one bit per 4K physical page. It is sized for
+// up to 8 GiB of RAM (2^21 pages); beyond that the helpers below degrade
+// gracefully (skip tracking) instead of indexing out of bounds.
+const USED_BMP_WORDS: usize = (1 << 21) / 64; // 32768 words = 8 GiB
 static mut USED_BMP: [u64; USED_BMP_WORDS] = [0; USED_BMP_WORDS];
 static DOUBLE_ALLOC_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -31,11 +34,13 @@ fn used_word(page: u64) -> (usize, u64) {
 
 fn used_set(page: u64) -> bool {
     let (w, b) = used_word(page);
+    if w >= USED_BMP_WORDS { return false; }
     unsafe { (USED_BMP[w] & b) != 0 }
 }
 
 fn used_mark(page: u64) {
     let (w, b) = used_word(page);
+    if w >= USED_BMP_WORDS { return; }
     unsafe {
         let prev = USED_BMP[w] & b;
         if prev != 0 {
@@ -52,6 +57,7 @@ fn used_mark(page: u64) {
 
 fn used_clear(page: u64) {
     let (w, b) = used_word(page);
+    if w >= USED_BMP_WORDS { return; }
     unsafe {
         if USED_BMP[w] & b == 0 {
             let p = (w as u64) * 64 + (b.trailing_zeros() as u64);

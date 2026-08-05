@@ -2687,10 +2687,18 @@ fn sys_fork() -> i64 {
     if id == 0 { return -EINVAL; }
 
     unsafe {
-        let child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-        let child_idx = task_idx(child_tid);
+        let mut child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
+        let mut child_idx = task_idx(child_tid);
 
-        // Ensure slot is free
+        // Ensure slot is free: permanent kernel tasks (e.g. ping server, tid 2)
+        // occupy low slots, so scan forward to the first free one.
+        for _ in 0..MAX_TASKS {
+            if TASKS[child_idx].id == 0 || TASKS[child_idx].state == TaskState::Empty {
+                break;
+            }
+            child_tid += 1;
+            child_idx = task_idx(child_tid);
+        }
         if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
             return -ENOMEM;
         }
@@ -2869,7 +2877,6 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     // Load the ELF
     match crate::elf::load_elf(buffer) {
         Ok(info) => {
-
             unsafe {
                 let idx = task_idx(id);
                 let old_pml4 = TASKS[idx].pml4;
@@ -2982,10 +2989,9 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     }
                     argv_buf_len = pos;
                 }
-
-                // ── Switch to the new PML4 ──
-                // All subsequent stack writes use the new address space.
+                unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
                 pt_mgr().switch_to(info.pml4);
+                unsafe { core::arch::asm!("sti", options(nostack, nomem)); }
                 crate::gdt::set_tss_rsp0(TASKS[idx].kernel_stack);
 
                 // ── Write argv strings from kernel buffer to user stack ──
@@ -3011,7 +3017,6 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 if info.is_dynamic {
                     // Build stack from bottom: random data, AUX, envp, argv, argc
                     use core::ptr::write_volatile as wv;
-
                     macro_rules! aux {
                         ($key:expr, $val:expr) => {
                             sp -= 16;
@@ -3176,13 +3181,13 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     *v = Vma { start: 0, end: 0, flags: 0 };
                 }
 
-                // Free the previous user address space. After a fork the old pml4 is a
-                // deep-copied COW clone whose page tables are private to this task, but
-                // its read-only leaf pages are shared with the parent — so free_ro=false.
-                if old_pml4 != 0 && old_pml4 != info.pml4 {
-                    crate::paging::free_address_space(old_pml4, false);
-                }
-                // The staging buffer (whole ELF image) is no longer needed; its contents
+                 // Free the previous user address space. After a fork the old pml4 is a
+                 // deep-copied COW clone whose page tables are private to this task, but
+                 // its read-only leaf pages are shared with the parent — so free_ro=false.
+                 if old_pml4 != 0 && old_pml4 != info.pml4 {
+                     crate::paging::free_address_space(old_pml4, false);
+                 }
+                 // The staging buffer (whole ELF image) is no longer needed; its contents
                 // were copied into freshly mapped pages by load_elf/load_elf_at.
                 alloc.free(buffer_phys, elford);
 
@@ -4273,15 +4278,16 @@ fn follow_symlinks(mut vn_id: u16) -> u16 {
      match crate::vfs::resolve_or_register(name) {
         Some(flat_idx) => {
             let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
-            if vn_id != 0 {
-                fill_stat_from_vnode(follow_symlinks(vn_id), statbuf)
-            } else {
-                fill_stat_from_vnode(0, statbuf) // fallback
-            }
-        }
-        None => -ENOENT,
-    }
-}
+             let r = if vn_id != 0 {
+                 fill_stat_from_vnode(follow_symlinks(vn_id), statbuf)
+             } else {
+                 fill_stat_from_vnode(0, statbuf) // fallback
+             };
+             r
+         }
+         None => -ENOENT,
+     }
+  }
 
 fn sys_fstat(fd: u32, statbuf: *mut u8) -> i64 {
     if statbuf.is_null() { return -EFAULT; }
@@ -4680,9 +4686,9 @@ pub fn test() {
         }
     }
 
-    create_applet_links();
+     create_applet_links();
 
-    let task0 = unsafe { &mut TASKS[0] };
+     let task0 = unsafe { &mut TASKS[0] };
     task0.id = 0;
     task0.state = TaskState::Running;
     task0.kernel_stack = alloc_stack(KERNEL_STACK_PAGES).expect("task0 stack");
