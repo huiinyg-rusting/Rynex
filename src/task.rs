@@ -361,6 +361,37 @@ static mut BOOT_INIT_SLOT: usize = 0;
 // Debug: count context switches
 static SWITCH_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Pending kernel tasks to spawn after scheduler handoff
+static mut PENDING_KERNEL_TASKS: [u64; 8] = [0; 8];
+static mut PENDING_KERNEL_TASK_COUNT: usize = 0;
+
+/// Register a kernel task to be spawned after the scheduler handoff to init.
+/// Returns true if registered successfully, false if the pending list is full.
+pub fn register_kernel_task(entry: u64) -> bool {
+    unsafe {
+        if PENDING_KERNEL_TASK_COUNT < PENDING_KERNEL_TASKS.len() {
+            PENDING_KERNEL_TASKS[PENDING_KERNEL_TASK_COUNT] = entry;
+            PENDING_KERNEL_TASK_COUNT += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Spawn all pending kernel tasks that were registered before the scheduler handoff.
+fn spawn_pending_kernel_tasks() {
+    unsafe {
+        for i in 0..PENDING_KERNEL_TASK_COUNT {
+            let entry = PENDING_KERNEL_TASKS[i];
+            if entry != 0 {
+                let _ = create_kernel_task(entry);
+            }
+        }
+        PENDING_KERNEL_TASK_COUNT = 0;
+    }
+}
+
 // Scratch buffer for timer interrupt frame (kernel tasks only).
 // build_frame writes 20×8 = 160 bytes. Kernel tasks use this instead of
 // writing to kernel_stack-160, which would corrupt the call chain.
