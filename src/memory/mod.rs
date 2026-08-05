@@ -8,6 +8,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_REGIONS: usize = 32;
 
+// The bootloader (GRUB) identity-maps only the first 1 GiB of physical
+// memory, and the kernel addresses every physical page through that identity
+// map. Pages above 1 GiB have no PTE at boot, so handing them to the buddy
+// would fault while writing free-list headers during init. Clamp the managed
+// range here; raising the ceiling requires extending the identity map first.
+const IDENTITY_LIMIT: u64 = 1 << 30;
+
 extern "Rust" {
     static _kernel_start: u64;
     static _kernel_end: u64;
@@ -45,7 +52,17 @@ pub fn init(info_addr: u32) {
     let region = &regions[best_idx];
     let base = buddy::page_align_up(region.base);
     let end = buddy::page_align_down(region.base + region.len);
-    let pages = (end - base) / buddy::PAGE_SIZE;
+    let mut pages = (end - base) / buddy::PAGE_SIZE;
+
+    // Clamp to the identity-map ceiling (see IDENTITY_LIMIT above). Also
+    // refuse a region that starts above the ceiling entirely.
+    if base >= IDENTITY_LIMIT {
+        return;
+    }
+    let max_pages = (IDENTITY_LIMIT - base) / buddy::PAGE_SIZE;
+    if pages > max_pages {
+        pages = max_pages;
+    }
 
     unsafe {
         ALLOC.init(base, pages);

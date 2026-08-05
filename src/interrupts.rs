@@ -637,6 +637,15 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     let rip = frame.instruction_pointer.as_u64();
     let rsp = frame.stack_pointer.as_u64();
     let cs_val = frame.code_segment.0 as u64;
+
+     // Supervisor write to a read-only page: with CR0.WP=1 these fault. Resolve
+     // non-user (identity) pages by marking them writable; for user COW pages
+     // fall through to the normal handler.
+     if (cs_val & 3) == 0 && (code.bits() & 2) != 0 && (code.bits() & 1) != 0 {
+         if crate::paging::kernel_ro_write_resolve(cr2) {
+             return;
+         }
+     }
     // Watchdog ring: record every write to the mallocng meta page (VA 0x500000)
     if cr2 >= 0x500000 && cr2 < 0x501000 && (code.bits() & 2) != 0 {
         unsafe {

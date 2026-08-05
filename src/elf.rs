@@ -89,7 +89,11 @@ pub fn load_elf(data: &[u8]) -> Result<ElfLoadInfo, &'static str> {
     if data.len() >= 16 {
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == 3 {
-            return load_elf_at(data, 0x400000, None);
+            // Load PIE binaries above the kernel image/BSS (which is identity
+            // mapped in the low VA range). 0x400000 overlaps the kernel BSS
+            // (RAMFS inode table lives around 0x3C2898-0xA23098), so user
+            // segments there would shadow kernel statics and break RAMFS.
+            return load_elf_at(data, 0x1000000, None);
         }
     }
     load_elf_at(data, 0, None)
