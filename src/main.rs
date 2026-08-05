@@ -191,6 +191,17 @@ memory::init(_info);
         );
     }
     paging::init();
+    // Resolve kernel .eh_frame_hdr for AT_SYSINFO_EHDR (auxv 33)
+    // The symbol __eh_frame_hdr_start is exported by linker.ld
+    extern "C" { static __eh_frame_hdr_start: u8; }
+    let eh_frame_hdr = unsafe { &__eh_frame_hdr_start as *const u8 as u64 };
+    crate::task::KERNEL_EH_FRAME_HDR.store(eh_frame_hdr, Ordering::Relaxed);
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        serial::write_str("EH_FRAME_HDR: 0x");
+        serial::write_hex(eh_frame_hdr);
+        serial::write_str("\n");
+    }
+
     let pages = memory::TOTAL_PAGES.load(core::sync::atomic::Ordering::SeqCst);
     vga::write_str("MEM: ");
     vga::write_dec(pages / 256);

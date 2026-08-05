@@ -21,6 +21,12 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    .eh_frame_hdr : ALIGN(4K) {
+        __eh_frame_hdr_start = .;
+        *(.eh_frame_hdr)
+        __eh_frame_hdr_end = .;
+    }
+
     .data : ALIGN(4K) {
         *(.data .data.*)
         *(.got .got.*)
