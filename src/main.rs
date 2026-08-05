@@ -222,9 +222,11 @@ memory::init(_info);
     // Service-ification self-test: run a kernel service (ping) as its own task
     // and a kernel client task that performs synchronous request/reply IPC.
     // This exercises ipc_call/ipc_reply between separate kernel tasks.
+    // Register them to be spawned AFTER the scheduler handoff so they don't
+    // starve init (which is set to Running directly, not enqueued).
     services::register(b"ping", services::ping_handler);
-    let _ = task::create_kernel_task(services::ping_server_task as u64);
-    let _ = task::create_kernel_task(services::ipc_roundtrip_selftest as u64);
+    task::register_kernel_task(services::ping_server_task as u64, b"ping_server");
+    task::register_kernel_task(services::ipc_roundtrip_selftest as u64, b"ipc_selftest");
 
     task::test();
 

@@ -110,8 +110,19 @@ pub struct Attr {
 pub type FsId = u64;
 static NEXT_FSID: AtomicU64 = AtomicU64::new(1);
 
+// Procfs filesystem ID (set when procfs is mounted)
+static PROCFS_FSID: AtomicU64 = AtomicU64::new(0);
+
 pub fn alloc_fsid() -> FsId {
     NEXT_FSID.fetch_add(1, Ordering::SeqCst)
+}
+
+pub fn set_procfs_fsid(fs_id: FsId) {
+    PROCFS_FSID.store(fs_id, Ordering::SeqCst);
+}
+
+pub fn get_proc_fsid() -> FsId {
+    PROCFS_FSID.load(Ordering::SeqCst)
 }
 
 pub const S_BLKSIZE: u64 = 4096;

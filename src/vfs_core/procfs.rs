@@ -87,7 +87,59 @@ impl ProcFs {
     }
 
     fn stat_text(&self, pid: u64, buf: &mut [u8]) -> usize {
-        // Minimal Linux /proc/<pid>/stat: "<pid> (<comm>) <state> ..."
+        // Linux /proc/<pid>/stat format (52 fields, busybox parses by offset):
+        // 1. pid %d
+        // 2. comm %s (in parentheses)
+        // 3. state %c
+        // 4. ppid %d
+        // 5. pgrp %d
+        // 6. session %d
+        // 7. tty_nr %d
+        // 8. tpgid %d
+        // 9. flags %u
+        // 10. minflt %lu
+        // 11. cminflt %lu
+        // 12. majflt %lu
+        // 13. cmajflt %lu
+        // 14. utime %lu
+        // 15. stime %lu
+        // 16. cutime %ld
+        // 17. cstime %ld
+        // 18. priority %ld
+        // 19. nice %ld
+        // 20. num_threads %ld
+        // 21. itrealvalue %ld
+        // 22. starttime %llu
+        // 23. vsize %lu
+        // 24. rss %ld
+        // 25. rsslim %lu
+        // 26. startcode %lu
+        // 27. endcode %lu
+        // 28. startstack %lu
+        // 29. kstkesp %lu
+        // 30. kstkeip %lu
+        // 31. signal %lu
+        // 32. blocked %lu
+        // 33. sigignore %lu
+        // 34. sigcatch %lu
+        // 35. wchan %lu
+        // 36. nswap %lu
+        // 37. cnswap %lu
+        // 38. exit_signal %d
+        // 39. processor %d
+        // 40. rt_priority %u
+        // 41. policy %u
+        // 42. delayacct_blkio_ticks %llu
+        // 43. guest_time %lu
+        // 44. cguest_time %ld
+        // 45. start_data %lu
+        // 46. end_data %lu
+        // 47. start_brk %lu
+        // 48. arg_start %lu
+        // 49. arg_end %lu
+        // 50. env_start %lu
+        // 51. env_end %lu
+        // 52. exit_code %d
         let mut n = 0usize;
         // pid
         let mut digits = [0u8; 20];
@@ -102,7 +154,18 @@ impl ProcFs {
             if c == 0 { break; }
             if n < buf.len() { buf[n] = c; n += 1; }
         }
-        let me = b") S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        // State, ppid, pgrp, session, tty_nr, tpgid, flags,
+        // minflt, cminflt, majflt, cmajflt,
+        // utime, stime, cutime, cstime,
+        // priority, nice, num_threads, itrealvalue,
+        // starttime, vsize, rss, rsslim,
+        // startcode, endcode, startstack, kstkesp, kstkeip,
+        // signal, blocked, sigignore, sigcatch,
+        // wchan, nswap, cnswap, exit_signal, processor,
+        // rt_priority, policy, delayacct_blkio_ticks,
+        // guest_time, cguest_time,
+        // start_data, end_data, start_brk, arg_start, arg_end, env_start, env_end, exit_code
+        let me = b") S 1 1 1 0 -1 4202496 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
         for &c in me { if n < buf.len() { buf[n] = c; n += 1; } }
         n
     }
@@ -272,12 +335,48 @@ impl VnodeOps for ProcFs {
     fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> { Err("not supported") }
 }
 
+/// Dynamically bind /proc/<pid>/stat and /proc/<pid>/cmdline for a new task.
+/// Called when a task is created after procfs is mounted.
+pub fn bind_task_procfs(pid: u64) {
+    let fs_id = crate::vfs_core::get_proc_fsid();
+    if fs_id == 0 {
+        return;
+    }
+    let ops: &'static dyn crate::vfs_core::VnodeOps = &crate::vfs_core::procfs::PROCFS;
+    let mut dbuf = [0u8; 24];
+    let mut d = 0; let mut s = pid;
+    while s > 0 { dbuf[d] = b'0' + (s % 10) as u8; s /= 10; d += 1; }
+    let mut path = [0u8; 40];
+    let p1 = b"/proc/";
+    path[..p1.len()].copy_from_slice(p1);
+    let mut off = p1.len();
+    for j in (0..d).rev() { path[off] = dbuf[j]; off += 1; }
+    let p2 = b"/stat";
+    path[off..off + p2.len()].copy_from_slice(p2);
+    off += p2.len();
+    let stat_path = &path[..off];
+    if let Some(vn_id) = crate::vfs_core::vnode_alloc(pid_stat_ino(pid), fs_id, 0, ops) {
+        crate::vfs::bind_vnode_inode(stat_path, vn_id);
+    }
+    let p3 = b"/cmdline";
+    let mut path2 = [0u8; 40];
+    path2[..p1.len()].copy_from_slice(p1);
+    let mut off2 = p1.len();
+    for j in (0..d).rev() { path2[off2] = dbuf[j]; off2 += 1; }
+    path2[off2..off2 + p3.len()].copy_from_slice(p3);
+    off2 += p3.len();
+    if let Some(vn_id) = crate::vfs_core::vnode_alloc(pid_cmdline_ino(pid), fs_id, 0, ops) {
+        crate::vfs::bind_vnode_inode(&path2[..off2], vn_id);
+    }
+}
+
 pub fn init() {
     serial::write_str("PROCFS: initializing\n");
 }
 
 pub fn mount_proc() {
     let fs_id = crate::vfs_core::alloc_fsid();
+    crate::vfs_core::set_procfs_fsid(fs_id);
     let ops: &'static dyn crate::vfs_core::VnodeOps = &crate::vfs_core::procfs::PROCFS;
     if crate::vfs_core::mount(b"/proc", fs_id, PROC_ROOT_INO, ops).is_err() {
         serial::write_str("PROCFS: mount failed\n");
