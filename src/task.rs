@@ -1133,12 +1133,12 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.ss     = KERNEL_DATA_SELECTOR;
 
             // Diagnostics: flag kernel-mode RIPs that fall outside .text
-            // (0x106000..0x11452f). A kernel task should never be "running"
+            // (0x106000..0x11AF6F). A kernel task should never be "running"
             // from .data/.rodata — this indicates the interrupted stream was
             // already corrupt (ret/jump landed in data). Captured via klog so
             // it is queryable (klog::dump()) and hideable by console level.
             let rip = regs.rip;
-            let in_text = rip >= 0x106000 && rip < 0x11452f;
+            let in_text = rip >= 0x106000 && rip < 0x11AF6F;
             if !in_text {
                 crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_SCHED);
                 crate::klog::s("[BADKERNELRIP] task=");
@@ -1420,13 +1420,13 @@ fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
         // Guard: a kernel-mode (cs.RPL==0) preempt frame whose resume RIP is
-        // outside .text (0x106000..0x11452f) means the interrupted stream was
+        // outside .text (0x106000..0x11AF6F) means the interrupted stream was
         // already corrupt (ret/jump landed in .data/.rodata). Captured via klog
         // (WARNING) so it is queryable via klog::dump() and hideable by console
         // level; user-mode RIPs legitimately exceed .text, so only warn for
         // kernel code.
         let rip = regs.rip;
-        let in_text = rip >= 0x106000 && rip < 0x11452f;
+        let in_text = rip >= 0x106000 && rip < 0x11AF6F;
         if (regs.cs & 3) == 0 && !in_text {
             crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SCHED);
             crate::klog::s("[BADPREEMPT] task=");
@@ -4751,6 +4751,11 @@ pub fn test() {
     {
         let new_task = unsafe { &mut TASKS[init_slot] };
         new_task.state = TaskState::Running;
+        // Give init higher priority (nice=-10) than kernel tasks (nice=0 -> prio=20)
+        // so it gets CPU time when kernel tasks yield.
+        new_task.normal_prio = nice_to_prio(-10);
+        new_task.prio = nice_to_prio(-10);
+        new_task.time_slice = initial_time_slice(nice_to_prio(-10));
     }
     CURRENT_TASK.store(init_tid, Ordering::SeqCst);
     unsafe { CURRENT_TASK_ID = init_tid; }
