@@ -277,6 +277,11 @@ pub struct Task {
     // For sleep syscall
     pub wakeup_tick: u64,
 
+    // For futex timed waits: deadline tick at which the waiter should be
+    // woken with ETIMEDOUT. 0 = no timeout (indefinite wait). Cleared by
+    // futex_wake when the waiter is explicitly woken.
+    pub futex_deadline: u64,
+
     // True if the address space is private (post-exec, fresh pml4) so every
     // user page belongs to this task. False for a COW-forked child that never
     // exec'd, where read-only pages are shared with the parent.
@@ -326,6 +331,7 @@ blocked_on: 0,
             comm: [0; 16],
             vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
             wakeup_tick: 0,
+            futex_deadline: 0,
             addr_space_private: false,
         }
     }
@@ -624,10 +630,13 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     } else {
         NEXT_TID.fetch_add(1, Ordering::SeqCst)
     };
+    serial::write_str("TASK: create_user_task_prio entry\n");
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
+    serial::write_str("TASK: alloc_stack done\n");
 
     // Set up TLS/TCB page for musl. Initialize full TCB per musl's pthread struct.
     let tls_phys = unsafe { &mut *crate::memory::allocator() }.alloc(0)?;
+    serial::write_str("TASK: tls_phys alloc done\n");
     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
 
     // Map the TLS page FIRST so we can write to virtual addresses
@@ -636,48 +645,55 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
         | crate::paging::PTE_USER
         | crate::paging::PTE_NO_EXECUTE;
     if PageTableManager::map_into(pml4, USER_TLS_VADDR, tls_phys, tls_flags).is_err() {
+        serial::write_str("TASK: map_into TLS FAILED\n");
         return None;
     }
+    serial::write_str("TASK: map_into TLS done\n");
 
     let tls_base = USER_TLS_VADDR;
-    let tid = if !INIT_TASK_ASSIGNED.load(Ordering::SeqCst) { 1 } else { NEXT_TID.load(Ordering::SeqCst) };
+    // NOTE: tid comes from the assignment above; do NOT recompute it here.
 
+    // NOTE: we are still running on the kernel (identity-mapped) pml4 here, so
+    // the TLS page's USER_TLS_VADDR is NOT mapped in the current address space.
+    // All TCB writes must go through the PHYSICAL address; only the values we
+    // store (self pointer, errno pointer, ...) use the virtual USER_TLS_VADDR.
+    let tls_phys_ptr = tls_phys as *mut u8;
     unsafe {
         // 0x00: DTV pointer (0 = initial thread)
-        core::ptr::write_volatile(tls_base as *mut u64, 0);
+        core::ptr::write_volatile(tls_phys_ptr as *mut u64, 0);
 
         // 0x08: Self pointer (struct pthread *)
-        core::ptr::write_volatile((tls_base + 0x08) as *mut u64, tls_base);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x08) as *mut u64, tls_base);
 
         // 0x10: Thread ID (tid) - 64-bit
-        core::ptr::write_volatile((tls_base + 0x10) as *mut u64, tid);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x10) as *mut u64, tid);
 
         // 0x14: PID (tgid) - 32-bit
-        core::ptr::write_volatile((tls_base + 0x14) as *mut u32, tid as u32);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x14) as *mut u32, tid as u32);
 
         // 0x18: errno location (pointer to thread-local errno at offset 0x100)
         let errno_loc = tls_base + 0x100;
-        core::ptr::write_volatile((tls_base + 0x18) as *mut u64, errno_loc);
-        core::ptr::write_volatile(errno_loc as *mut i32, 0);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x18) as *mut u64, errno_loc);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x100) as *mut i32, 0);
 
         // 0x20: Stack guard (canary)
         let canary = crate::pit::TICKS.load(Ordering::Relaxed) ^ tid;
-        core::ptr::write_volatile((tls_base + 0x20) as *mut u64, canary);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x20) as *mut u64, canary);
 
         // 0x28: Thread pointer (self) - for __get_tp()
-        core::ptr::write_volatile((tls_base + 0x28) as *mut u64, tls_base);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x28) as *mut u64, tls_base);
 
         // 0x30: Cancel flag (0 = not cancelled)
-        core::ptr::write_volatile((tls_base + 0x30) as *mut u32, 0);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x30) as *mut u32, 0);
 
         // 0x34: Cancel type (0 = deferred)
-        core::ptr::write_volatile((tls_base + 0x34) as *mut u32, 0);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x34) as *mut u32, 0);
 
         // 0x38: Cancel state
-        core::ptr::write_volatile((tls_base + 0x38) as *mut u32, 0);
+        core::ptr::write_volatile(tls_phys_ptr.add(0x38) as *mut u32, 0);
 
         // Zero rest of TCB area
-        core::ptr::write_bytes((tls_base + 0x40) as *mut u8, 0, 4096 - 0x40);
+        core::ptr::write_bytes(tls_phys_ptr.add(0x40), 0, 4096 - 0x40);
     }
 
     let task = unsafe { &mut TASKS[task_idx(tid)] };
@@ -686,6 +702,7 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.state = TaskState::Ready;
     task.regs = Registers::new_user(entry, user_stack_top);
     task.regs.fs_base = USER_TLS_VADDR;
+    serial::write_str("TASK: create_user_task - setting up task, about to enqueue\n");
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
         crate::klog::s("USER_TASK[");
@@ -707,18 +724,25 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.prio = task.static_prio;
     task.time_slice = initial_time_slice(task.prio);
     task.parent = Some(current_task_id());
+    serial::write_str("TASK: create_user_task - parent set\n");
 
     // Set up stdin/stdout/stderr to /dev/console
+    serial::write_str("TASK: setting up stdio\n");
     if let Some(console_idx) = crate::vfs::find_inode(b"/dev/console") {
         crate::vfs::alloc_fd_for_task(tid, console_idx, 0); // fd 0 O_RDONLY
         crate::vfs::alloc_fd_for_task(tid, console_idx, 1); // fd 1 O_WRONLY
         crate::vfs::alloc_fd_for_task(tid, console_idx, 1); // fd 2 O_WRONLY
     }
+    serial::write_str("TASK: stdio setup done\n");
 
+    serial::write_str("TASK: enqueueing task\n");
     enqueue_task(tid, task.prio);
+    serial::write_str("TASK: enqueue done\n");
 
     // Bind /proc/<pid> entries for this task
+    serial::write_str("TASK: binding procfs\n");
     crate::vfs_core::procfs::bind_task_procfs(tid);
+    serial::write_str("TASK: procfs bind done\n");
 
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
@@ -1624,6 +1648,7 @@ pub const SYS_clock_gettime: u64 = 228;
 pub const SYS_clock_nanosleep: u64 = 230;
 pub const SYS_exit_group: u64 = 231;
 pub const SYS_set_robust_list: u64 = 274;
+pub const SYS_futex: u64 = 202;
 pub const SYS_getppid: u64 = 110;
 pub const SYS_getpgid: u64 = 121;
 pub const SYS_sigaltstack: u64 = 131;
@@ -1749,6 +1774,8 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_getpgrp => sys_getpgrp(),
         SYS_setsid => sys_setsid(),
         SYS_sched_yield => sys_rynex_yield(),
+        SYS_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
+                               arg4 as *const u32, arg5 as u32),
         // Rynex-specific
         SYS_rynex_get_ticks => sys_get_ticks(),
         SYS_rynex_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
@@ -1926,12 +1953,19 @@ const FUTEX_WAKE: i32 = 1;
 const FUTEX_LOCK_PI: i32 = 6;
 const FUTEX_UNLOCK_PI: i32 = 7;
 
+const FUTEX_PRIVATE_FLAG: i32 = 128;
+const FUTEX_CLOCK_REALTIME: i32 = 256;
+const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 
 fn sys_futex(uaddr: *const u32, op: i32, val: u32,
-             _uaddr2: *const u32, _val3: u32) -> i64 {
-    match op {
-        FUTEX_WAIT => futex_wait(uaddr, val),
+             uaddr2: *const u32, _val3: u32) -> i64 {
+    // Strip FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME: musl sets these on
+    // process-private futexes; the command itself is the low bits.
+    let cmd = op & FUTEX_CMD_MASK;
+    match cmd {
+        FUTEX_WAIT => futex_wait(uaddr, val, uaddr2 as *const u64),
         FUTEX_WAKE => futex_wake(uaddr, val),
         FUTEX_LOCK_PI => futex_lock_pi(uaddr),
         FUTEX_UNLOCK_PI => futex_unlock_pi(uaddr),
@@ -1939,7 +1973,7 @@ fn sys_futex(uaddr: *const u32, op: i32, val: u32,
     }
 }
 
-pub fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
+pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
     let actual = unsafe { core::ptr::read_volatile(uaddr) };
     if actual != val {
         return -EAGAIN;
@@ -1948,6 +1982,23 @@ pub fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
+    // Relative timeout (Linux FUTEX_WAIT): parse {tv_sec, tv_nsec} timespec,
+    // convert to PIT ticks (~20ms each) and compute the deadline.
+    let deadline_tick: u64 = if !timeout.is_null() {
+        let sec = unsafe { core::ptr::read_volatile(timeout) } as i64;
+        let nsec = unsafe { core::ptr::read_volatile(timeout.add(1)) } as i64;
+        let total_ns = if sec < 0 || nsec < 0 {
+            0
+        } else {
+            (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64)
+        };
+        let ticks = (total_ns + 19_999_999) / 20_000_000;
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        now.saturating_add(ticks)
+    } else {
+        0
+    };
+
     // Remove from run queue before blocking
     remove_from_runqueue(id);
 
@@ -1955,9 +2006,27 @@ pub fn futex_wait(uaddr: *const u32, val: u32) -> i64 {
         let idx = task_idx(id);
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
+        if deadline_tick != 0 {
+            TASKS[idx].wakeup_tick = deadline_tick;
+            TASKS[idx].futex_deadline = deadline_tick;
+        } else {
+            TASKS[idx].wakeup_tick = 0;
+            TASKS[idx].futex_deadline = 0;
+        }
     }
 
     schedule();
+
+    // Distinguish an explicit wake (futex_deadline cleared) from a timeout
+    // wake (deadline reached while still blocked).
+    unsafe {
+        let idx = task_idx(id);
+        if TASKS[idx].futex_deadline != 0 {
+            TASKS[idx].futex_deadline = 0;
+            let now = crate::pit::TICKS.load(Ordering::Relaxed);
+            return -ETIMEDOUT;
+        }
+    }
     0
 }
 
@@ -1972,6 +2041,8 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
             {
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].blocked_on = 0;
+                TASKS[i].wakeup_tick = 0;
+                TASKS[i].futex_deadline = 0;
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
                 woken += 1;
             }
@@ -2105,6 +2176,8 @@ fn futex_unlock_pi(uaddr: *const u32) -> i64 {
             let w_idx = task_idx(waiter_id);
             TASKS[w_idx].state = TaskState::Ready;
             TASKS[w_idx].blocked_on = 0;
+            TASKS[w_idx].wakeup_tick = 0;
+            TASKS[w_idx].futex_deadline = 0;
             enqueue_task(waiter_id, TASKS[w_idx].prio);
         } else {
             // No waiters — unlock
@@ -2152,6 +2225,7 @@ pub const EDOM: i64 = 33;
 pub const ERANGE: i64 = 34;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
+pub const ETIMEDOUT: i64 = 110;
 pub const ENOTEMPTY: i64 = 39;
 pub const EMSGSIZE: i64 = 90;
 pub const EADDRNOTAVAIL: i64 = 99;
@@ -2865,6 +2939,7 @@ fn sys_fork() -> i64 {
             comm: parent.comm,
             vmas: parent.vmas,
             wakeup_tick: 0,
+            futex_deadline: 0,
             addr_space_private: false,
         };
 
@@ -3155,11 +3230,13 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     // AT_TLS (27): TLS base address - critical for musl's dynamic linker
                     aux!(27, USER_TLS_VADDR);
 
-                    // AT_SYSINFO_EHDR (33): .eh_frame_hdr for stack unwinding
-                    let eh_frame_hdr = crate::task::KERNEL_EH_FRAME_HDR.load(Ordering::Relaxed);
-                    if eh_frame_hdr != 0 {
-                        aux!(33, eh_frame_hdr);
-                    }
+                    // AT_SYSINFO_EHDR (33): musl's loader parses this as a real
+                    // vDSO ELF header (reads e_phoff/e_phnum from offset 0x20).
+                    // We have no vDSO yet, so it MUST stay 0; a nonzero value that
+                    // is not a genuine vDSO ELF image crashes the loader. Full vDSO
+                    // is tracked as an open bugshere task.
+                    // (KERNEL_EH_FRAME_HDR infrastructure remains for later.)
+                    aux!(33, 0u64);
 
                     // 3. envp NULL
                     sp -= 8;
@@ -3226,11 +3303,13 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     // AT_TLS (27): TLS base address - critical for musl's dynamic linker
                     aux!(27, USER_TLS_VADDR);
 
-                    // AT_SYSINFO_EHDR (33): .eh_frame_hdr for stack unwinding
-                    let eh_frame_hdr = crate::task::KERNEL_EH_FRAME_HDR.load(Ordering::Relaxed);
-                    if eh_frame_hdr != 0 {
-                        aux!(33, eh_frame_hdr);
-                    }
+                    // AT_SYSINFO_EHDR (33): musl's loader parses this as a real
+                    // vDSO ELF header (reads e_phoff/e_phnum from offset 0x20).
+                    // We have no vDSO yet, so it MUST stay 0; a nonzero value that
+                    // is not a genuine vDSO ELF image crashes the loader. Full vDSO
+                    // is tracked as an open bugshere task.
+                    // (KERNEL_EH_FRAME_HDR infrastructure remains for later.)
+                    aux!(33, 0u64);
 
                     // 3. envp NULL
                     sp -= 8;
@@ -3276,44 +3355,47 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     let tls_base = USER_TLS_VADDR;
                     let tid = id; // current task id is the new thread's tid
 
+                    // TCB writes must go through PHYSICAL address: this pml4 is
+                    // the new task's, not necessarily the currently active one.
+                    let tls_phys_ptr = tls_phys as *mut u8;
                     unsafe {
                         // 0x00: DTV pointer (0 = initial thread, no dynamic TLS modules yet)
-                        core::ptr::write_volatile(tls_base as *mut u64, 0);
+                        core::ptr::write_volatile(tls_phys_ptr as *mut u64, 0);
 
                         // 0x08: Self pointer (struct pthread *)
-                        core::ptr::write_volatile((tls_base + 0x08) as *mut u64, tls_base);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x08) as *mut u64, tls_base);
 
                         // 0x10: Thread ID (tid) - 64-bit
-                        core::ptr::write_volatile((tls_base + 0x10) as *mut u64, tid);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x10) as *mut u64, tid);
 
                         // 0x14: PID (tgid) - 32-bit
-                        core::ptr::write_volatile((tls_base + 0x14) as *mut u32, tid as u32);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x14) as *mut u32, tid as u32);
 
                         // 0x18: errno location (pointer to thread-local errno)
                         // musl stores &errno here; we allocate it in TCB at offset 0x100
                         let errno_loc = tls_base + 0x100;
-                        core::ptr::write_volatile((tls_base + 0x18) as *mut u64, errno_loc);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x18) as *mut u64, errno_loc);
                         // Initialize errno to 0
-                        core::ptr::write_volatile(errno_loc as *mut i32, 0);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x100) as *mut i32, 0);
 
                         // 0x20: Stack guard (canary) - random per thread
                         let canary = crate::pit::TICKS.load(Ordering::Relaxed) ^ tid;
-                        core::ptr::write_volatile((tls_base + 0x20) as *mut u64, canary);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x20) as *mut u64, canary);
 
                         // 0x28: Thread pointer (self) - for __get_tp()
-                        core::ptr::write_volatile((tls_base + 0x28) as *mut u64, tls_base);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x28) as *mut u64, tls_base);
 
                         // 0x30: Cancel flag (0 = not cancelled)
-                        core::ptr::write_volatile((tls_base + 0x30) as *mut u32, 0);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x30) as *mut u32, 0);
 
                         // 0x34: Cancel type (0 = deferred)
-                        core::ptr::write_volatile((tls_base + 0x34) as *mut u32, 0);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x34) as *mut u32, 0);
 
                         // 0x38: Cancel state
-                        core::ptr::write_volatile((tls_base + 0x38) as *mut u32, 0);
+                        core::ptr::write_volatile(tls_phys_ptr.add(0x38) as *mut u32, 0);
 
                         // Zero rest of TCB area (musl expects zero-initialized beyond explicit fields)
-                        core::ptr::write_bytes((tls_base + 0x40) as *mut u8, 0, 4096 - 0x40);
+                        core::ptr::write_bytes(tls_phys_ptr.add(0x40), 0, 4096 - 0x40);
                     }
 
                     TASKS[idx].regs.fs_base = USER_TLS_VADDR;
@@ -4789,6 +4871,7 @@ pub fn test() {
                         serial::write_str("TASK: about to call load_elf\n");
                         match crate::elf::load_elf(mod_data) {
                             Ok(elf_info) => {
+                                serial::write_str("TASK: load_elf OK, calling create_user_task\n");
                                 if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
                                     init_tid = tid;
                                     serial::write_str("TASK: init created tid=");

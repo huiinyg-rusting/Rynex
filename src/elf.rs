@@ -227,11 +227,19 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
     let mut is_dynamic = false;
 
     // First pass: detect PT_INTERP
+    serial::write_str("ELF: scanning program headers\n");
     for i in 0..phnum {
         let phdr = unsafe {
             let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
             &*p
         };
+        serial::write_str("ELF: phdr type=");
+        serial::write_hex(phdr.type_ as u64);
+        serial::write_str(" vaddr=0x");
+        serial::write_hex(phdr.vaddr);
+        serial::write_str(" memsz=0x");
+        serial::write_hex(phdr.memsz);
+        serial::write_str("\n");
         if phdr.type_ == PT_INTERP {
             let off = phdr.offset as usize;
             let sz = phdr.filesz as usize;
@@ -246,11 +254,19 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
     }
 
     // Load each PT_LOAD segment
+    serial::write_str("ELF: loading PT_LOAD segments\n");
     for i in 0..phnum {
         let phdr = unsafe {
             let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
             &*p
         };
+        serial::write_str("ELF: phdr type=");
+        serial::write_hex(phdr.type_ as u64);
+        serial::write_str(" vaddr=0x");
+        serial::write_hex(phdr.vaddr);
+        serial::write_str(" memsz=0x");
+        serial::write_hex(phdr.memsz);
+        serial::write_str("\n");
 
         if phdr.type_ != PT_LOAD {
             continue;
