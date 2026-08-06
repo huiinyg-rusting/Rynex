@@ -523,6 +523,135 @@ impl VnodeOps for TtyDevice {
     }
 }
 
+pub struct ZeroDevice;
+
+impl VnodeOps for ZeroDevice {
+    fn read(&self, _ino: u64, _offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        Ok(buf.len())
+    }
+    fn write(&self, _ino: u64, _offset: u64, buf: &[u8]) -> Result<usize, &'static str> {
+        Ok(buf.len())
+    }
+    fn lookup(&self, _parent_ino: u64, _name: &[u8]) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn readdir(&self, _dir_ino: u64, _offset: u64, _buf: &mut [Dirent]) -> Result<usize, &'static str> {
+        Err("not a directory")
+    }
+    fn create(&self, _parent_ino: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn mkdir(&self, _parent_ino: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn remove(&self, _parent_ino: u64, _name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn rmdir(&self, _parent_ino: u64, _name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn stat(&self, _ino: u64) -> Result<Stat, &'static str> {
+        Err("not supported")
+    }
+    fn readlink(&self, _ino: u64) -> Result<&[u8], &'static str> {
+        Err("not a symlink")
+    }
+    fn symlink(&self, _parent_ino: u64, _name: &[u8], _target: &[u8]) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn rename(&self, _old_parent: u64, _old_name: &[u8], _new_parent: u64, _new_name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn setattr(&self, _ino: u64, _attr: &Attr) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn getxattr(&self, _ino: u64, _name: &[u8], _value: &mut [u8]) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+    fn setxattr(&self, _ino: u64, _name: &[u8], _value: &[u8]) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn listxattr(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+    fn truncate(&self, _ino: u64, _size: u64) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+}
+
+pub struct UrandomDevice;
+
+impl VnodeOps for UrandomDevice {
+    fn read(&self, _ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let mut seed: u64 = offset.wrapping_mul(0x9E3779B97F4A7C15);
+        for i in 0..buf.len() {
+            seed = seed.wrapping_mul(0x5BD1E9955BD1E995).wrapping_add(i as u64);
+            buf[i] = (seed ^ (seed >> 32)) as u8;
+        }
+        Ok(buf.len())
+    }
+    fn write(&self, _ino: u64, _offset: u64, buf: &[u8]) -> Result<usize, &'static str> {
+        Ok(buf.len())
+    }
+    fn lookup(&self, _parent_ino: u64, _name: &[u8]) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn readdir(&self, _dir_ino: u64, _offset: u64, _buf: &mut [Dirent]) -> Result<usize, &'static str> {
+        Err("not a directory")
+    }
+    fn create(&self, _parent_ino: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn mkdir(&self, _parent_ino: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn remove(&self, _parent_ino: u64, _name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn rmdir(&self, _parent_ino: u64, _name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn stat(&self, _ino: u64) -> Result<Stat, &'static str> {
+        Err("not supported")
+    }
+    fn readlink(&self, _ino: u64) -> Result<&[u8], &'static str> {
+        Err("not a symlink")
+    }
+    fn symlink(&self, _parent_ino: u64, _name: &[u8], _target: &[u8]) -> Result<u64, &'static str> {
+        Err("not a directory")
+    }
+    fn rename(&self, _old_parent: u64, _old_name: &[u8], _new_parent: u64, _new_name: &[u8]) -> Result<(), &'static str> {
+        Err("not a directory")
+    }
+    fn setattr(&self, _ino: u64, _attr: &Attr) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn getxattr(&self, _ino: u64, _name: &[u8], _value: &mut [u8]) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+    fn setxattr(&self, _ino: u64, _name: &[u8], _value: &[u8]) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn listxattr(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+    fn truncate(&self, _ino: u64, _size: u64) -> Result<(), &'static str> {
+        Err("not supported")
+    }
+    fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> {
+        Err("not supported")
+    }
+}
+
+pub static ZERO_DEVICE: ZeroDevice = ZeroDevice;
+pub static URANDOM_DEVICE: UrandomDevice = UrandomDevice;
+
 pub static TTY_DEVICE: TtyDevice = TtyDevice::new();
 
 pub fn push_key(c: u8) {
