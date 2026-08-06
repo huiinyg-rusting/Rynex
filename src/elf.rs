@@ -39,6 +39,113 @@ const PT_NULL: u32 = 0;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
+const PT_DYNAMIC: u32 = 2;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+const R_X86_64_RELATIVE: u64 = 8;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Elf64Rela {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+}
+
+fn apply_rela_relocations(data: &[u8], load_addr: u64, pml4: u64, max_end: u64) -> Result<u64, &'static str> {
+    let hdr = unsafe { &*(data.as_ptr() as *const Elf64Header) };
+    let phoff = hdr.phoff as usize;
+    let phentsize = hdr.phentsize as usize;
+    let phnum = hdr.phnum as usize;
+
+    let mut dynamic_offset = 0usize;
+    let mut dynamic_filesz = 0usize;
+    let mut found_dynamic = false;
+
+    for i in 0..phnum {
+        let phdr = unsafe {
+            let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
+            &*p
+        };
+        if phdr.type_ == PT_DYNAMIC {
+            dynamic_offset = phdr.offset as usize;
+            dynamic_filesz = phdr.filesz as usize;
+            found_dynamic = true;
+            break;
+        }
+    }
+
+    if !found_dynamic {
+        return Ok(max_end);
+    }
+
+    if dynamic_offset + dynamic_filesz > data.len() {
+        return Err("DYNAMIC segment out of bounds");
+    }
+
+    let dyn_data = &data[dynamic_offset..dynamic_offset + dynamic_filesz];
+    let mut rela_addr = 0u64;
+    let mut rela_size = 0u64;
+    let mut rela_ent = 0u64;
+
+    for i in (0..dyn_data.len()).step_by(16) {
+        if i + 16 > dyn_data.len() {
+            break;
+        }
+        let tag = u64::from_le_bytes(dyn_data[i..i+8].try_into().unwrap());
+        let val = u64::from_le_bytes(dyn_data[i+8..i+16].try_into().unwrap());
+
+        match tag {
+            DT_RELA => rela_addr = val + load_addr,
+            DT_RELASZ => rela_size = val,
+            DT_RELAENT => rela_ent = val,
+            _ => {}
+        }
+    }
+
+    if rela_addr == 0 || rela_size == 0 || rela_ent == 0 {
+        return Ok(max_end);
+    }
+
+    let num_entries = (rela_size / rela_ent) as usize;
+    if num_entries == 0 {
+        return Ok(max_end);
+    }
+
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let relabuf_phys = match alloc.alloc(0) {
+        Some(p) => p,
+        None => return Err("OOM for RELA buffer"),
+    };
+    let relabuf = unsafe { core::slice::from_raw_parts_mut(relabuf_phys as *mut u8, 4096) };
+
+    let mut copied = 0usize;
+    while copied < num_entries * 24 && copied < 4096 {
+        let page_va = (rela_addr + copied as u64) & !0xFFF;
+        let offset = ((rela_addr + copied as u64) & 0xFFF) as u64;
+        let phys = crate::paging::PageTableManager::resolve_phys(pml4, page_va).ok_or("RELA page not mapped")?;
+        let src = (phys + offset) as *const u8;
+        let dst = unsafe { relabuf.as_mut_ptr().add(copied) };
+        let to_copy = core::cmp::min(4096 - offset as usize, num_entries * 24 - copied);
+        unsafe { core::ptr::copy_nonoverlapping(src, dst, to_copy) };
+        copied += to_copy;
+    }
+
+    for i in 0..num_entries {
+        let rela = unsafe { &*(relabuf.as_ptr().add(i * 24) as *const Elf64Rela) };
+        let rel_type = rela.r_info & 0xFFFFFFFF;
+        if rel_type == R_X86_64_RELATIVE {
+            let target_va = rela.r_offset + load_addr;
+            let value = load_addr as i64 + rela.r_addend;
+            let target_phys = crate::paging::PageTableManager::resolve_phys(pml4, target_va).ok_or("Relocation target not mapped")?;
+            unsafe { core::ptr::write((target_phys + (target_va & 0xFFF)) as *mut u64, value as u64); }
+        }
+    }
+
+    alloc.free(relabuf_phys, 0);
+    Ok(max_end)
+}
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -320,6 +427,9 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
             max_end = phdr.vaddr + load_addr + phdr.memsz;
         }
     }
+
+    // Apply RELA relocations for static PIE
+    max_end = apply_rela_relocations(data, load_addr, pml4, max_end)?;
 
     // PHDR is within a PT_LOAD segment — compute its user-space VA.
     let mut phdr_user = 0u64;

@@ -282,6 +282,10 @@ pub struct Task {
     // futex_wake when the waiter is explicitly woken.
     pub futex_deadline: u64,
 
+    // For CLONE_CHILD_CLEARTID: user-space address in the child's address
+    // space where the kernel clears the child's TID on exit.
+    pub child_tidptr: u64,
+
     // True if the address space is private (post-exec, fresh pml4) so every
     // user page belongs to this task. False for a COW-forked child that never
     // exec'd, where read-only pages are shared with the parent.
@@ -332,6 +336,7 @@ blocked_on: 0,
             vmas: [Vma { start: 0, end: 0, flags: 0 }; MAX_VMAS],
             wakeup_tick: 0,
             futex_deadline: 0,
+            child_tidptr: 0,
             addr_space_private: false,
         }
     }
@@ -945,6 +950,12 @@ pub fn exit_task(code: i32) {
         let idx = task_idx(id);
         TASKS[idx].state = TaskState::Zombie;
         TASKS[idx].exit_code = code;
+
+        // CLONE_CHILD_CLEARTID: clear the TID in the child's address
+        // space so that futex-based thread exit notification works.
+        if TASKS[idx].child_tidptr != 0 {
+            core::ptr::write_volatile(TASKS[idx].child_tidptr as *mut u64, 0u64);
+        }
 
         // Parent (or any task waiting on this PID) will free stacks via waitpid
         // Wake parent if it's blocked waiting for this child
@@ -1649,6 +1660,21 @@ pub const SYS_clock_nanosleep: u64 = 230;
 pub const SYS_exit_group: u64 = 231;
 pub const SYS_set_robust_list: u64 = 274;
 pub const SYS_futex: u64 = 202;
+
+// Linux clone flags (x86_64)
+pub const CLONE_VM: u64         = 0x00000100;
+pub const CLONE_FS: u64         = 0x00000200;
+pub const CLONE_FILES: u64      = 0x00000400;
+pub const CLONE_SIGHAND: u64    = 0x00000800;
+pub const CLONE_PIDFD: u64      = 0x00000010;
+pub const CLONE_PTRACE: u64     = 0x00000002;
+pub const CLONE_VFORK: u64      = 0x00004000;
+pub const CLONE_PARENT: u64     = 0x00008000;
+pub const CLONE_THREAD: u64     = 0x00010000;
+pub const CLONE_SYSVSEM: u64    = 0x00000800;
+pub const CLONE_SETTLS: u64     = 0x00080000;
+pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 pub const SYS_getppid: u64 = 110;
 pub const SYS_getpgid: u64 = 121;
 pub const SYS_sigaltstack: u64 = 131;
@@ -1747,7 +1773,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rename => sys_rename(arg1 as *const u8, arg2 as *const u8),
         SYS_openat => sys_openat(arg1 as i32, arg2 as *const u8, arg3 as i32, arg4 as u32),
         SYS_readlink => sys_readlink(arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
-        SYS_clone => sys_fork(), // clone → fork for now
+        SYS_clone => sys_clone(arg1 as u64, arg2 as u64, arg3 as *mut u64, arg4 as *mut u64, arg5 as u64),
         SYS_vfork => sys_fork(), // vfork → fork
         SYS_dup => sys_dup2(arg1 as u32, arg1 as u32), // dup → dup2(fd, fd)
         SYS_fchdir => sys_chdir_from_fd(arg1 as u32),
@@ -2940,12 +2966,172 @@ fn sys_fork() -> i64 {
             vmas: parent.vmas,
             wakeup_tick: 0,
             futex_deadline: 0,
-            addr_space_private: false,
+            child_tidptr: 0,
+            addr_space_private: true,
         };
 
         enqueue_task(child_tid, child.prio);
 
         serial::write_str("SYS_FORK: child ");
+        serial::write_dec(child_tid);
+        serial::write_str(" (parent ");
+        serial::write_dec(id);
+        serial::write_str(")\n");
+
+        child_tid as i64
+    }
+}
+
+// ── Clone ──────────────────────────────────────────────────
+// Linux x86_64 clone syscall:
+//   sys_clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
+//
+// Musl's pthread_create uses:
+//   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+//   CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS |
+//   CLONE_PARENT | CLONE_CHILD_CLEARTID
+//
+// The critical difference from fork is CLONE_VM: the child shares
+// the parent's address space (no COW fork of the PML4).
+
+fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
+             child_tidptr: *mut u64, tls: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+
+    unsafe {
+        let mut child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
+        let mut child_idx = task_idx(child_tid);
+
+        for _ in 0..MAX_TASKS {
+            if TASKS[child_idx].id == 0 || TASKS[child_idx].state == TaskState::Empty {
+                break;
+            }
+            child_tid += 1;
+            child_idx = task_idx(child_tid);
+        }
+        if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
+            return -ENOMEM;
+        }
+
+        // Clone parent's fd table so the child inherits stdin/stdout/stderr
+        let parent_fds = crate::vfs::get_fd_table();
+        if let Some(pfds) = parent_fds {
+            let cfds = crate::vfs::fd_table_for(child_tid);
+            core::ptr::copy_nonoverlapping(
+                pfds.as_ptr(),
+                cfds.as_ptr() as *mut crate::vfs::FileDesc,
+                crate::vfs::MAX_FDS_PER_TASK,
+            );
+        }
+
+        let parent_idx = task_idx(id);
+        let parent = &TASKS[parent_idx];
+        let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
+            Some(s) => s,
+            None => return -ENOMEM,
+        };
+
+        // CLONE_VM: share the parent's PML4 (no COW fork).
+        // The child runs in the same address space as the parent.
+        let child_pml4 = if flags & CLONE_VM != 0 {
+            parent.pml4
+        } else {
+            match crate::paging::cow_fork_pml4(parent.pml4) {
+                Some(p) => p,
+                None => {
+                    free_stack(kernel_stack, KERNEL_STACK_PAGES);
+                    return -ENOMEM;
+                }
+            }
+        };
+
+        // Determine tgid: CLONE_THREAD means same thread group as parent.
+        let child_tgid = if flags & CLONE_THREAD != 0 {
+            parent.tgid
+        } else {
+            child_tid
+        };
+
+        // Determine parent: CLONE_PARENT means same parent as caller.
+        let child_parent = if flags & CLONE_PARENT != 0 {
+            parent.parent
+        } else {
+            Some(id)
+        };
+
+        // Set up child register state: resume at the syscall return point.
+        // The child gets its own user stack (provided by musl).
+        let mut child_regs = parent.regs;
+        child_regs.rip = SYSCALL_USER_RIP;
+        child_regs.rsp = child_stack;
+        child_regs.rflags = SYSCALL_USER_RFLAGS;
+        child_regs.fs_base = SYSCALL_USER_FS_BASE;
+        child_regs.rax = 0; // Child gets 0 from clone
+        child_regs.rbx = SYSCALL_CALLEE_REGS[0];
+        child_regs.rbp = SYSCALL_CALLEE_REGS[1];
+        child_regs.r12 = SYSCALL_CALLEE_REGS[2];
+        child_regs.r13 = SYSCALL_CALLEE_REGS[3];
+        child_regs.r14 = SYSCALL_CALLEE_REGS[4];
+        child_regs.r15 = SYSCALL_CALLEE_REGS[5];
+
+        // CLONE_SETTLS: set the TLS pointer (FS base) for the child.
+        if flags & CLONE_SETTLS != 0 {
+            child_regs.fs_base = tls;
+        }
+
+        let child = &mut TASKS[child_idx];
+        *child = Task {
+            id: child_tid,
+            tgid: child_tgid,
+            state: TaskState::Ready,
+            regs: child_regs,
+            kernel_stack,
+            user_stack: child_stack,
+            pml4: child_pml4,
+            static_prio: parent.static_prio,
+            normal_prio: parent.normal_prio,
+            prio: parent.prio,
+            time_slice: initial_time_slice(parent.prio),
+            parent: child_parent,
+            children_head: None,
+            sibling_next: None,
+            blocked_on: 0,
+            pi_boosted: false,
+            runqueue_next: None,
+            uid: parent.uid,
+            gid: parent.gid,
+            euid: parent.euid,
+            egid: parent.egid,
+            ipc_partner: 0,
+            ipc_phys: 0,
+            ipc_vaddr: 0,
+            exit_code: 0,
+            brk_start: parent.brk_start,
+            brk_end: parent.brk_end,
+            sig_handlers: parent.sig_handlers,
+            sig_blocked: parent.sig_blocked,
+            sig_pending: 0,
+            comm: parent.comm,
+            vmas: parent.vmas,
+            wakeup_tick: 0,
+            futex_deadline: 0,
+            child_tidptr: if flags & CLONE_CHILD_CLEARTID != 0 {
+                child_tidptr as u64
+            } else {
+                0
+            },
+            addr_space_private: flags & CLONE_VM == 0,
+        };
+
+        // Store child TID in parent's buffer (CLONE_PARENT_SETTID).
+        if flags & CLONE_PARENT_SETTID != 0 && !parent_tidptr.is_null() {
+            core::ptr::write_volatile(parent_tidptr, child_tid);
+        }
+
+        enqueue_task(child_tid, child.prio);
+
+        serial::write_str("SYS_CLONE: child ");
         serial::write_dec(child_tid);
         serial::write_str(" (parent ");
         serial::write_dec(id);
@@ -4842,6 +5028,28 @@ pub fn test() {
     if crate::vfs::find_inode(b"/dev/null").is_none() {
         crate::vfs::create_file(b"/dev/null", b"");
         serial::write_str("VFS: created '/dev/null'\n");
+    }
+    if crate::vfs::find_inode(b"/dev/zero").is_none() {
+        let vn_id = crate::vfs_core::vnode_alloc(4, 0, 0, &crate::tty::ZERO_DEVICE);
+        if let Some(vn_id) = vn_id {
+            crate::vfs_core::create(b"/dev/zero", crate::vfs_core::types::S_IFCHR | 0o666).ok();
+            crate::vfs::create_file(b"/dev/zero", b"");
+            if let Some(idx) = crate::vfs::find_inode(b"/dev/zero") {
+                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
+            }
+            serial::write_str("VFS: created '/dev/zero' (char device)\n");
+        }
+    }
+    if crate::vfs::find_inode(b"/dev/urandom").is_none() {
+        let vn_id = crate::vfs_core::vnode_alloc(5, 0, 0, &crate::tty::URANDOM_DEVICE);
+        if let Some(vn_id) = vn_id {
+            crate::vfs_core::create(b"/dev/urandom", crate::vfs_core::types::S_IFCHR | 0o666).ok();
+            crate::vfs::create_file(b"/dev/urandom", b"");
+            if let Some(idx) = crate::vfs::find_inode(b"/dev/urandom") {
+                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
+            }
+            serial::write_str("VFS: created '/dev/urandom' (char device)\n");
+        }
     }
 
     // NOTE: /etc/passwd is NOT created here. Password/account handling is
