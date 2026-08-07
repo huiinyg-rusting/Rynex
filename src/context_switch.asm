@@ -72,9 +72,11 @@ syscall_entry:
     mov r8,  [r10 + 8]    // r8  = arg5
     mov r9,  [r10]        // r9  = arg6
     
-    push r9               // arg6 -> stack (7th C arg)
+    // 7th C arg (arg6) must be on top of stack ([rsp]) when `call` executes;
+    // callee sees it at [rsp+8]. So push userRSP FIRST, arg6 LAST.
     push r10              // Save user RSP (R10 is scratch in System V ABI)
-    
+    push r9               // arg6 -> stack (7th C arg)
+
     mov rcx, rdx          // rcx = arg3
     mov rdx, rsi          // rdx = arg2
     mov rsi, rdi          // rsi = arg1
@@ -84,8 +86,8 @@ syscall_entry:
     
     call syscall_handler
     
-    pop r10               // Restore user RSP (preserved across C call)
     add rsp, 8            // Remove arg6
+    pop r10               // Restore user RSP (preserved across C call)
     
     pop r11               // Restore RFLAGS
     pop rcx               // Restore RIP

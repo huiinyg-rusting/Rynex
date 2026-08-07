@@ -1365,6 +1365,9 @@ pub extern "C" fn timer_schedule() -> u64 {
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].wakeup_tick = 0;
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
+                serial::write_str("WAKEUP tid=");
+                serial::write_dec(TASKS[i].id);
+                serial::write_str("\n");
             }
         }
     }
@@ -1773,7 +1776,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rename => sys_rename(arg1 as *const u8, arg2 as *const u8),
         SYS_openat => sys_openat(arg1 as i32, arg2 as *const u8, arg3 as i32, arg4 as u32),
         SYS_readlink => sys_readlink(arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
-        SYS_clone => sys_clone(arg1 as u64, arg2 as u64, arg3 as *mut u64, arg4 as *mut u64, arg5 as u64),
+        SYS_clone => sys_clone(arg1 as u64, arg2 as u64, arg3 as *mut u64, arg4 as *mut u64, arg5 as u64, arg6),
         SYS_vfork => sys_fork(), // vfork → fork
         SYS_dup => sys_dup2(arg1 as u32, arg1 as u32), // dup → dup2(fd, fd)
         SYS_fchdir => sys_chdir_from_fd(arg1 as u32),
@@ -1786,7 +1789,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_sched_getaffinity => 0,
         SYS_set_tid_address => CURRENT_TASK.load(Ordering::SeqCst) as i64,
         SYS_clock_gettime => sys_clock_gettime(arg1 as u64, arg2 as *mut u8),
-        SYS_clock_nanosleep => sys_clock_gettime(0, core::ptr::null_mut()), // stub
+        SYS_clock_nanosleep => sys_clock_nanosleep(arg1 as u64, arg2 as u32, arg3 as *const u64, arg4 as *mut u64),
         SYS_exit_group => sys_exit(arg1 as i32),
         SYS_set_robust_list => 0,
         SYS_getrandom => sys_getrandom(arg1 as *mut u8, arg2 as usize, arg3 as u32),
@@ -2041,7 +2044,10 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
         }
     }
 
-    schedule();
+    // Must force the switch: futex_wait runs inside a syscall where
+    // in_syscall() is true, so the plain schedule() would bail out
+    // immediately and we would never actually block.
+    force_schedule();
 
     // Distinguish an explicit wake (futex_deadline cleared) from a timeout
     // wake (deadline reached while still blocked).
@@ -2995,7 +3001,7 @@ fn sys_fork() -> i64 {
 // the parent's address space (no COW fork of the PML4).
 
 fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
-             child_tidptr: *mut u64, tls: u64) -> i64 {
+             child_tidptr: *mut u64, tls: u64, func: u64) -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
@@ -3080,6 +3086,11 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             child_regs.fs_base = tls;
         }
 
+        // musl's __clone keeps the thread start function in r9 across the
+        // syscall; the child resumes at the syscall return point and does
+        // `pop %rdi; call *%r9`. Restore r9 so the new thread starts at func.
+        child_regs.r9 = func;
+
         let child = &mut TASKS[child_idx];
         *child = Task {
             id: child_tid,
@@ -3135,7 +3146,29 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
         serial::write_dec(child_tid);
         serial::write_str(" (parent ");
         serial::write_dec(id);
-        serial::write_str(")\n");
+        serial::write_str(") flags=0x");
+        serial::write_hex(flags);
+        serial::write_str(" stack=0x");
+        serial::write_hex(child_stack);
+        serial::write_str(" tls=0x");
+        serial::write_hex(tls);
+        serial::write_str(" urip=0x");
+        serial::write_hex(SYSCALL_USER_RIP);
+        serial::write_str(" crib=0x");
+        serial::write_hex(child.regs.rip);
+        serial::write_str(" crsp=0x");
+        serial::write_hex(child.regs.rsp);
+        serial::write_str(" ccs=0x");
+        serial::write_hex(child.regs.cs);
+        serial::write_str(" cfs=0x");
+        serial::write_hex(child.regs.fs_base);
+        serial::write_str(" cflags=0x");
+        serial::write_hex(child.regs.rflags);
+        serial::write_str(" r9=0x");
+        serial::write_hex(child.regs.r9);
+        serial::write_str(" func=0x");
+        serial::write_hex(func);
+        serial::write_str("\n");
 
         child_tid as i64
     }
@@ -3773,7 +3806,10 @@ fn sys_sleep(ticks: u64) -> i64 {
         TASKS[idx].state = TaskState::Blocked;
     }
 
-    schedule();
+    // Must force the switch: sys_sleep runs inside a syscall where in_syscall()
+    // is true, so the plain schedule() would bail out immediately and we would
+    // never actually block for `ticks`.
+    force_schedule();
     0
 }
 
@@ -4936,6 +4972,34 @@ fn sys_clock_gettime(_clk_id: u64, tp: *mut u8) -> i64 {
         core::ptr::write_volatile(tp as *mut u64, ns / 1_000_000_000);
         core::ptr::write_volatile((tp as *mut u64).add(1), ns % 1_000_000_000);
     }
+    0
+}
+
+fn sys_clock_nanosleep(clk_id: u64, flags: u32, req: *const u64, _rem: *mut u64) -> i64 {
+    // Support the monotonic/real-time relative sleep used by std::thread::sleep
+    // (which lands here via musl's clock_nanosleep). Absolute sleeps (TIMER_ABSTIME)
+    // are treated as relative for now, which is fine for tests.
+    let _ = (clk_id, flags);
+    if req.is_null() { return -EFAULT; }
+    let sec = unsafe { core::ptr::read_volatile(req) } as i64;
+    let nsec = unsafe { core::ptr::read_volatile(req.add(1)) } as i64;
+    let total_ns = if sec < 0 || nsec < 0 {
+        0
+    } else {
+        (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64)
+    };
+    let ticks = (total_ns + 19_999_999) / 20_000_000;
+    serial::write_str("CLKNS req=");
+    serial::write_dec(sec as u64);
+    serial::write_str(".");
+    serial::write_dec(nsec as u64);
+    serial::write_str(" ns ticks=");
+    serial::write_dec(ticks);
+    serial::write_str("\n");
+    if ticks > 0 {
+        sys_sleep(ticks);
+    }
+    serial::write_str("CLKNS woke\n");
     0
 }
 
