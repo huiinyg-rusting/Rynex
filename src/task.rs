@@ -277,6 +277,11 @@ pub struct Task {
     // For sleep syscall
     pub wakeup_tick: u64,
 
+    // Preserved user context when blocking in a syscall (sys_sleep, futex_wait, etc.)
+    // context_switch saves kernel context to regs, overwriting user context.
+    // We save user regs here before blocking, and restore on wakeup.
+    pub saved_user_regs: Option<Registers>,
+
     // For futex timed waits: deadline tick at which the waiter should be
     // woken with ETIMEDOUT. 0 = no timeout (indefinite wait). Cleared by
     // futex_wake when the waiter is explicitly woken.
@@ -338,6 +343,7 @@ blocked_on: 0,
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: false,
+            saved_user_regs: None,
         }
     }
 }
@@ -373,15 +379,17 @@ static mut BOOT_INIT_SLOT: usize = 0;
 static SWITCH_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Pending kernel tasks to spawn after scheduler handoff
-static mut PENDING_KERNEL_TASKS: [(u64, &'static [u8]); 8] = [(0, &[]); 8];
+// Stores (entry, comm, nice) where nice is the Linux nice value (default 0).
+static mut PENDING_KERNEL_TASKS: [(u64, &'static [u8], i32); 8] = [(0, &[], 0); 8];
 static mut PENDING_KERNEL_TASK_COUNT: usize = 0;
 
 /// Register a kernel task to be spawned after the scheduler handoff to init.
 /// Returns true if registered successfully, false if the pending list is full.
-pub fn register_kernel_task(entry: u64, comm: &'static [u8]) -> bool {
+/// `nice` is the Linux nice value (default 0 = normal priority). Higher nice = lower priority.
+pub fn register_kernel_task(entry: u64, comm: &'static [u8], nice: i32) -> bool {
     unsafe {
         if PENDING_KERNEL_TASK_COUNT < PENDING_KERNEL_TASKS.len() {
-            PENDING_KERNEL_TASKS[PENDING_KERNEL_TASK_COUNT] = (entry, comm);
+            PENDING_KERNEL_TASKS[PENDING_KERNEL_TASK_COUNT] = (entry, comm, nice);
             PENDING_KERNEL_TASK_COUNT += 1;
             true
         } else {
@@ -390,13 +398,18 @@ pub fn register_kernel_task(entry: u64, comm: &'static [u8]) -> bool {
     }
 }
 
+/// Register a kernel task with default priority (nice=0).
+pub fn register_kernel_task_default(entry: u64, comm: &'static [u8]) -> bool {
+    register_kernel_task(entry, comm, PRIORITY_DEFAULT_NICE)
+}
+
 /// Spawn all pending kernel tasks that were registered before the scheduler handoff.
 fn spawn_pending_kernel_tasks() {
     unsafe {
         for i in 0..PENDING_KERNEL_TASK_COUNT {
-            let (entry, comm) = PENDING_KERNEL_TASKS[i];
+            let (entry, comm, nice) = PENDING_KERNEL_TASKS[i];
             if entry != 0 {
-                let _ = create_kernel_task_prio(entry, PRIORITY_DEFAULT_NICE, comm);
+                let _ = create_kernel_task_prio(entry, nice, comm);
             }
         }
         PENDING_KERNEL_TASK_COUNT = 0;
@@ -840,7 +853,12 @@ fn schedule_inner(force: bool) {
     if current != 0 {
         let cur_idx = task_idx(current);
         let state = unsafe { TASKS[cur_idx].state };
-        if state == TaskState::Ready {
+        if state == TaskState::Running {
+            // Preempted: mark Ready and requeue
+            unsafe { TASKS[cur_idx].state = TaskState::Ready; }
+            let prio = unsafe { TASKS[cur_idx].prio };
+            unsafe { enqueue_task(current, prio); }
+        } else if state == TaskState::Ready {
             let prio = unsafe { TASKS[cur_idx].prio };
             unsafe { enqueue_task(current, prio); }
         }
@@ -1364,6 +1382,10 @@ pub extern "C" fn timer_schedule() -> u64 {
             {
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].wakeup_tick = 0;
+                // Restore user context that was saved when blocking in syscall
+                if let Some(user_regs) = TASKS[i].saved_user_regs.take() {
+                    TASKS[i].regs = user_regs;
+                }
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
                 serial::write_str("WAKEUP tid=");
                 serial::write_dec(TASKS[i].id);
@@ -2033,6 +2055,8 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
 
     unsafe {
         let idx = task_idx(id);
+        // Save user context before force_schedule overwrites TASKS[idx].regs
+        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
         if deadline_tick != 0 {
@@ -2075,6 +2099,10 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 TASKS[i].blocked_on = 0;
                 TASKS[i].wakeup_tick = 0;
                 TASKS[i].futex_deadline = 0;
+                // Restore user context that was saved when blocking in syscall
+                if let Some(user_regs) = TASKS[i].saved_user_regs.take() {
+                    TASKS[i].regs = user_regs;
+                }
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
                 woken += 1;
             }
@@ -2092,6 +2120,8 @@ pub fn block_on_futex(uaddr: *const u32) -> bool {
     remove_from_runqueue(id);
     unsafe {
         let idx = task_idx(id);
+        // Save user context before force_schedule overwrites TASKS[idx].regs
+        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
     }
@@ -2974,6 +3004,7 @@ fn sys_fork() -> i64 {
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: true,
+            saved_user_regs: None,
         };
 
         enqueue_task(child_tid, child.prio);
@@ -3133,6 +3164,7 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
                 0
             },
             addr_space_private: flags & CLONE_VM == 0,
+            saved_user_regs: None,
         };
 
         // Store child TID in parent's buffer (CLONE_PARENT_SETTID).
@@ -3802,6 +3834,8 @@ fn sys_sleep(ticks: u64) -> i64 {
 
     unsafe {
         let idx = task_idx(id);
+        // Save user context before force_schedule overwrites TASKS[idx].regs
+        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
         TASKS[idx].wakeup_tick = now + ticks;
         TASKS[idx].state = TaskState::Blocked;
     }
