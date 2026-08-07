@@ -235,10 +235,9 @@ memory::init(_info);
     // This exercises ipc_call/ipc_reply between separate kernel tasks.
     // Register them to be spawned AFTER the scheduler handoff so they don't
     // starve init (which is set to Running directly, not enqueued).
-    // Use lower priority (higher nice) for background selftest so user tasks get CPU.
     services::register(b"ping", services::ping_handler);
-    task::register_kernel_task(services::ping_server_task as u64, b"ping_server", 5);
-    task::register_kernel_task(services::ipc_roundtrip_selftest as u64, b"ipc_selftest", 10);
+    task::register_kernel_task_default(services::ping_server_task as u64, b"ping_server");
+    task::register_kernel_task_default(services::ipc_roundtrip_selftest as u64, b"ipc_selftest");
 
     task::test();
 
