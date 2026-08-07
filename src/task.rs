@@ -971,8 +971,12 @@ pub fn exit_task(code: i32) {
 
         // CLONE_CHILD_CLEARTID: clear the TID in the child's address
         // space so that futex-based thread exit notification works.
-        if TASKS[idx].child_tidptr != 0 {
-            core::ptr::write_volatile(TASKS[idx].child_tidptr as *mut u64, 0u64);
+        let child_tidptr = TASKS[idx].child_tidptr;
+        if child_tidptr != 0 {
+            core::ptr::write_volatile(child_tidptr as *mut u64, 0u64);
+            // Wake any futex waiters on this address (e.g., parent joining via futex).
+            // Use max_wake=1 to wake one waiter (the parent).
+            futex_wake(child_tidptr as *const u32, 1);
         }
 
         // Parent (or any task waiting on this PID) will free stacks via waitpid
@@ -1669,6 +1673,7 @@ pub const SYS_getgid: u64 = 104;
 pub const SYS_geteuid: u64 = 107;
 pub const SYS_getegid: u64 = 108;
 pub const SYS_arch_prctl: u64 = 158;
+pub const SYS_prctl: u64 = 157;
 pub const SYS_reboot: u64 = 169;
 pub const SYS_openat: u64 = 257;
 pub const SYS_getdents64: u64 = 217;
@@ -1775,6 +1780,7 @@ pub extern "C" fn syscall_handler(
         SYS_dup2 => sys_dup2(arg1 as u32, arg2 as u32),
         SYS_nanosleep => sys_nanosleep(arg1 as *const u64, arg2 as *mut u64),
         SYS_arch_prctl => sys_arch_prctl(arg1 as u64, arg2 as u64),
+        SYS_prctl => sys_prctl(arg1 as i32, arg2 as u64, arg3 as u64, arg4 as u64, arg5 as u64),
         SYS_getpid => sys_getpid(),
         SYS_fork => sys_fork(),
         SYS_execve => sys_execve(arg1 as *const u8, arg2 as u64, arg3 as u64),
@@ -1902,13 +1908,16 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> i64 {
 }
 
 fn sys_exit(status: i32) -> i64 {
-    serial::write_str("SYS_EXIT: ");
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    serial::write_str("SYS_EXIT: task ");
+    serial::write_dec(id as u64);
+    serial::write_str(" status=");
     serial::write_dec(status as u64);
     serial::write_str("\n");
     exit_task(status);
     // If no other task to schedule, halt
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
-    if id == 0 || unsafe { TASKS[task_idx(id)].state } == TaskState::Zombie {
+    let id2 = CURRENT_TASK.load(Ordering::SeqCst);
+    if id2 == 0 || unsafe { TASKS[task_idx(id2)].state } == TaskState::Zombie {
         serial::write_str("SYS_EXIT: no more tasks, halting\n");
         unsafe { core::arch::asm!("cli; hlt", options(noreturn)); }
     }
@@ -2050,13 +2059,31 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
         0
     };
 
+    serial::write_str("futex_wait: task ");
+    serial::write_dec(id);
+    serial::write_str(" uaddr=");
+    serial::write_hex(uaddr as u64);
+    serial::write_str(" val=");
+    serial::write_dec(val as u64);
+    serial::write_str(" deadline=");
+    serial::write_dec(deadline_tick);
+    serial::write_str("\n");
+
     // Remove from run queue before blocking
     remove_from_runqueue(id);
 
     unsafe {
         let idx = task_idx(id);
-        // Save user context before force_schedule overwrites TASKS[idx].regs
-        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
+        // Save user context from syscall entry globals (not task.regs which holds
+        // stale kernel context). This is the context to restore on wakeup.
+        TASKS[idx].saved_user_regs = Some(Registers {
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: SYSCALL_USER_RSP,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: SYSCALL_USER_RIP, rflags: SYSCALL_USER_RFLAGS,
+            cs: 0x23, ss: 0x1B, fs_base: SYSCALL_USER_FS_BASE,
+        });
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
         if deadline_tick != 0 {
@@ -2087,14 +2114,23 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
 }
 
 pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
+    let uaddr_val = uaddr as u64;
+    serial::write_str("futex_wake: uaddr=");
+    serial::write_hex(uaddr_val);
+    serial::write_str(" max_wake=");
+    serial::write_dec(max_wake as u64);
+    serial::write_str("\n");
     let mut woken = 0i64;
     unsafe {
         for i in 0..MAX_TASKS {
             if woken >= max_wake as i64 { break; }
             if TASKS[i].state == TaskState::Blocked
-                && TASKS[i].blocked_on == uaddr as u64
+                && TASKS[i].blocked_on == uaddr_val
                 && TASKS[i].id != 0
             {
+                serial::write_str("futex_wake: waking task ");
+                serial::write_dec(TASKS[i].id);
+                serial::write_str("\n");
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].blocked_on = 0;
                 TASKS[i].wakeup_tick = 0;
@@ -2108,6 +2144,9 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
             }
         }
     }
+    serial::write_str("futex_wake: woken=");
+    serial::write_dec(woken as u64);
+    serial::write_str("\n");
     woken
 }
 
@@ -2120,8 +2159,16 @@ pub fn block_on_futex(uaddr: *const u32) -> bool {
     remove_from_runqueue(id);
     unsafe {
         let idx = task_idx(id);
-        // Save user context before force_schedule overwrites TASKS[idx].regs
-        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
+        // Save user context from syscall entry globals (not task.regs which holds
+        // stale kernel context). This is the context to restore on wakeup.
+        TASKS[idx].saved_user_regs = Some(Registers {
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: SYSCALL_USER_RSP,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: SYSCALL_USER_RIP, rflags: SYSCALL_USER_RFLAGS,
+            cs: 0x23, ss: 0x1B, fs_base: SYSCALL_USER_FS_BASE,
+        });
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
     }
@@ -2301,14 +2348,15 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
     unsafe {
         loop {
             let mut found_child = false;
+            let mut wait_tidptr: u64 = 0;
             for i in 0..MAX_TASKS {
                 let child = &TASKS[i];
                 if child.id == 0 { continue; }
                 if child.parent != Some(current) { continue; }
 
-                // Filter by pid
-                if pid > 0 && child.id as i64 != pid { continue; }
-                if pid == 0 { continue; }
+// Filter by pid
+            if pid > 0 && child.id as i64 != pid { continue; }
+            if pid == 0 || pid == -1 { /* accept any */ } else if pid < -1 { continue; }
                 found_child = true;
 
                 if child.state == TaskState::Zombie {
@@ -2331,6 +2379,9 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                     }
                     TASKS[i] = Task::empty();
                     return child_id as i64;
+                } else {
+                    // Remember the child's TID futex address for blocking
+                    wait_tidptr = child.child_tidptr;
                 }
             }
 
@@ -2342,9 +2393,36 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                 return 0;
             }
 
-            // No zombie yet — yield and retry. Use the force variant so the
-            // child (created by fork, only schedulable outside a syscall)
-            // actually gets the CPU; otherwise we busy-loop forever.
+            // No zombie yet — find the specific child to wait on and block on its TID futex
+            let mut wait_tidptr: u64 = 0;
+            for i in 0..MAX_TASKS {
+                let child = &TASKS[i];
+                if child.id == 0 { continue; }
+                if child.parent != Some(current) { continue; }
+                if pid > 0 && child.id as i64 != pid { continue; }
+                if pid == 0 || pid == -1 { /* accept any */ } else if pid < -1 { continue; }
+                // Found the child we want to wait for
+                wait_tidptr = child.child_tidptr;
+                break;
+            }
+
+            if wait_tidptr != 0 {
+                serial::write_str("waitpid: task ");
+                serial::write_dec(current);
+                serial::write_str(" waiting on child TID futex 0x");
+                serial::write_hex(wait_tidptr);
+                serial::write_str("\n");
+                let uaddr = wait_tidptr as *const u32;
+                unsafe {
+                    // Wait for TID to become 0 (child clears it on exit)
+                    if *uaddr != 0 {
+                        futex_wait(uaddr, *uaddr, core::ptr::null());
+                    }
+                }
+                continue;
+            }
+
+            // Fallback if no tidptr
             yield_now_force();
         }
     }
@@ -3035,6 +3113,16 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
              child_tidptr: *mut u64, tls: u64, func: u64) -> i64 {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
+
+    serial::write_str("sys_clone: parent=");
+    serial::write_dec(id);
+    serial::write_str(" flags=0x");
+    serial::write_hex(flags);
+    serial::write_str(" child_stack=0x");
+    serial::write_hex(child_stack);
+    serial::write_str(" func=0x");
+    serial::write_hex(func);
+    serial::write_str("\n");
 
     unsafe {
         let mut child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
@@ -3824,6 +3912,36 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     }
 }
 
+fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    // PR_SET_NAME = 15: set thread name (used by Rust std)
+    if option == 15 {
+        let id = CURRENT_TASK.load(Ordering::SeqCst);
+        if id == 0 { return -EINVAL; }
+        unsafe {
+            let idx = task_idx(id);
+            let name_ptr = arg2 as *const u8;
+            if !name_ptr.is_null() {
+                // Copy up to 15 chars + null terminator
+                let mut i = 0;
+                while i < 15 {
+                    let c = core::ptr::read_volatile(name_ptr.add(i));
+                    if c == 0 { break; }
+                    TASKS[idx].comm[i] = c;
+                    i += 1;
+                }
+                // Null-terminate
+                while i < 16 {
+                    TASKS[idx].comm[i] = 0;
+                    i += 1;
+                }
+            }
+        }
+        0
+    } else {
+        -EINVAL
+    }
+}
+
 // ── Sleep ─────────────────────────────────────────────────────────
 
 fn sys_sleep(ticks: u64) -> i64 {
@@ -3834,8 +3952,16 @@ fn sys_sleep(ticks: u64) -> i64 {
 
     unsafe {
         let idx = task_idx(id);
-        // Save user context before force_schedule overwrites TASKS[idx].regs
-        TASKS[idx].saved_user_regs = Some(TASKS[idx].regs);
+        // Save user context from syscall entry globals (not task.regs which holds
+        // stale kernel context). This is the context to restore on wakeup.
+        TASKS[idx].saved_user_regs = Some(Registers {
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: SYSCALL_USER_RSP,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: SYSCALL_USER_RIP, rflags: SYSCALL_USER_RFLAGS,
+            cs: 0x23, ss: 0x1B, fs_base: SYSCALL_USER_FS_BASE,
+        });
         TASKS[idx].wakeup_tick = now + ticks;
         TASKS[idx].state = TaskState::Blocked;
     }
