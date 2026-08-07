@@ -113,21 +113,30 @@ fn apply_rela_relocations(data: &[u8], load_addr: u64, pml4: u64, max_end: u64) 
         return Ok(max_end);
     }
 
+    let total_bytes = num_entries * 24;
+    let pages_needed = (total_bytes + 0xFFF) / 0x1000;
+    let mut relbuf_order = 0;
+    while (4096usize << relbuf_order) < pages_needed * 4096 && relbuf_order < 10 {
+        relbuf_order += 1;
+    }
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    let relabuf_phys = match alloc.alloc(0) {
+    let relabuf_phys = match alloc.alloc(relbuf_order) {
         Some(p) => p,
         None => return Err("OOM for RELA buffer"),
     };
-    let relabuf = unsafe { core::slice::from_raw_parts_mut(relabuf_phys as *mut u8, 4096) };
+    let relabuf = unsafe { core::slice::from_raw_parts_mut(relabuf_phys as *mut u8, total_bytes) };
 
+    // Copy the RELA table from the freshly mapped user pages into a kernel buffer.
+    // This must NOT use `alloc.free` on a partial order (we free the exact order
+    // we allocated above).
     let mut copied = 0usize;
-    while copied < num_entries * 24 && copied < 4096 {
+    while copied < total_bytes {
         let page_va = (rela_addr + copied as u64) & !0xFFF;
         let offset = ((rela_addr + copied as u64) & 0xFFF) as u64;
         let phys = crate::paging::PageTableManager::resolve_phys(pml4, page_va).ok_or("RELA page not mapped")?;
         let src = (phys + offset) as *const u8;
         let dst = unsafe { relabuf.as_mut_ptr().add(copied) };
-        let to_copy = core::cmp::min(4096 - offset as usize, num_entries * 24 - copied);
+        let to_copy = core::cmp::min(4096 - offset as usize, total_bytes - copied);
         unsafe { core::ptr::copy_nonoverlapping(src, dst, to_copy) };
         copied += to_copy;
     }
@@ -143,7 +152,7 @@ fn apply_rela_relocations(data: &[u8], load_addr: u64, pml4: u64, max_end: u64) 
         }
     }
 
-    alloc.free(relabuf_phys, 0);
+    alloc.free(relabuf_phys, relbuf_order);
     Ok(max_end)
 }
 const PF_X: u32 = 1;
@@ -428,8 +437,9 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         }
     }
 
-    // Apply RELA relocations for static PIE
-    max_end = apply_rela_relocations(data, load_addr, pml4, max_end)?;
+    // No kernel-side RELA relocation. musl's rcrt1.o self-relocates static PIE
+    // binaries at _start, and ld-musl relocates dynamic binaries at startup.
+    // Applying relocations here would double-relocate and corrupt the image.
 
     // PHDR is within a PT_LOAD segment — compute its user-space VA.
     let mut phdr_user = 0u64;
