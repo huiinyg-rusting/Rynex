@@ -1386,10 +1386,9 @@ pub extern "C" fn timer_schedule() -> u64 {
             {
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].wakeup_tick = 0;
-                // Restore user context that was saved when blocking in syscall
-                if let Some(user_regs) = TASKS[i].saved_user_regs.take() {
-                    TASKS[i].regs = user_regs;
-                }
+                // Resume on the live regs saved by the last context_switch; do NOT
+                // stamp the zeroed saved_user_regs snapshot (would clobber r15).
+                let _ = TASKS[i].saved_user_regs.take();
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
                 serial::write_str("WAKEUP tid=");
                 serial::write_dec(TASKS[i].id);
@@ -1874,11 +1873,14 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
     // Trace every syscall into the klog ring buffer (FAC_SYSCALL, DEBUG).
     // Only mirrored to serial when console level >= DEBUG, so the crash tail
     // shows the exact syscall sequence that led to a fault.
+    let current = CURRENT_TASK.load(Ordering::SeqCst);
     crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SYSCALL);
     crate::klog::s("sc=");
     crate::klog::dec(syscall_num);
     crate::klog::s(" a1=0x");
     crate::klog::hex(arg1);
+    crate::klog::s(" tid=");
+    crate::klog::dec(current);
     crate::klog::s(" -> 0x");
     crate::klog::hex(result as u64);
     crate::klog::end();
@@ -1913,6 +1915,10 @@ fn sys_exit(status: i32) -> i64 {
     serial::write_dec(id as u64);
     serial::write_str(" status=");
     serial::write_dec(status as u64);
+    serial::write_str(" rip=0x");
+    serial::write_hex(unsafe { TASKS[task_idx(id)].regs.rip });
+    serial::write_str(" rflags=0x");
+    serial::write_hex(unsafe { TASKS[task_idx(id)].regs.rflags });
     serial::write_str("\n");
     exit_task(status);
     // If no other task to schedule, halt
@@ -2135,10 +2141,9 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 TASKS[i].blocked_on = 0;
                 TASKS[i].wakeup_tick = 0;
                 TASKS[i].futex_deadline = 0;
-                // Restore user context that was saved when blocking in syscall
-                if let Some(user_regs) = TASKS[i].saved_user_regs.take() {
-                    TASKS[i].regs = user_regs;
-                }
+                // Resume on the live regs from the last context_switch; do NOT
+                // stamp the zeroed saved_user_regs snapshot (would clobber r15).
+                let _ = TASKS[i].saved_user_regs.take();
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
                 woken += 1;
             }
@@ -2347,17 +2352,18 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
 
     unsafe {
         loop {
-            let mut found_child = false;
-            let mut wait_tidptr: u64 = 0;
+            // Look for zombie children to reap
+            let mut found_any_child = false;
             for i in 0..MAX_TASKS {
                 let child = &TASKS[i];
                 if child.id == 0 { continue; }
                 if child.parent != Some(current) { continue; }
 
-// Filter by pid
-            if pid > 0 && child.id as i64 != pid { continue; }
-            if pid == 0 || pid == -1 { /* accept any */ } else if pid < -1 { continue; }
-                found_child = true;
+                // Filter by pid
+                if pid > 0 && child.id as i64 != pid { continue; }
+                if pid == 0 || pid == -1 { /* accept any */ } else if pid < -1 { continue; }
+
+                found_any_child = true;
 
                 if child.state == TaskState::Zombie {
                     let exit_code = child.exit_code;
@@ -2366,26 +2372,26 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                     let child_pml4 = child.pml4;
                     let addr_private = child.addr_space_private;
 
+                    serial::write_str("sys_waitpid: reaping child ");
+                    serial::write_dec(child_id as u64);
+                    serial::write_str(" exit_code=");
+                    serial::write_dec(exit_code as u64);
+                    serial::write_str("\n");
+
                     if !status_ptr.is_null() {
                         core::ptr::write_volatile(status_ptr, (exit_code & 0xFF) << 8);
                     }
                     free_stack(child_ks, KERNEL_STACK_PAGES);
-                    if child_pml4 != 0 {
-                        // Free the entire user address space. After exec the pml4 is
-                        // fresh so every user page is owned by the child; a COW-forked
-                        // child that never exec'd only owns writable pages (read-only
-                        // pages are shared with the parent).
+                    // Only free address space if the child had its own (not CLONE_VM)
+                    if child_pml4 != 0 && addr_private {
                         crate::paging::free_address_space(child_pml4, addr_private);
                     }
                     TASKS[i] = Task::empty();
                     return child_id as i64;
-                } else {
-                    // Remember the child's TID futex address for blocking
-                    wait_tidptr = child.child_tidptr;
                 }
             }
 
-            if !found_child {
+            if !found_any_child {
                 return -ECHILD;
             }
 
@@ -3751,12 +3757,14 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     *v = Vma { start: 0, end: 0, flags: 0 };
                 }
 
-                 // Free the previous user address space. After a fork the old pml4 is a
-                 // deep-copied COW clone whose page tables are private to this task, but
-                 // its read-only leaf pages are shared with the parent — so free_ro=false.
-                 if old_pml4 != 0 && old_pml4 != info.pml4 {
-                     crate::paging::free_address_space(old_pml4, false);
-                 }
+// Free the previous user address space. After a fork the old pml4 is a
+                  // deep-copied COW clone whose page tables are private to this task, but
+                  // its read-only leaf pages are shared with the parent — so free_ro=false.
+                  // BUT for threads (CLONE_VM, addr_space_private=false), the old pml4
+                  // is shared with the parent and must NOT be freed.
+                  if old_pml4 != 0 && old_pml4 != info.pml4 && TASKS[idx].addr_space_private {
+                      crate::paging::free_address_space(old_pml4, false);
+                  }
                  // The staging buffer (whole ELF image) is no longer needed; its contents
                 // were copied into freshly mapped pages by load_elf/load_elf_at.
                 alloc.free(buffer_phys, elford);
@@ -3913,14 +3921,28 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 }
 
 fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    serial::write_str("sys_prctl: task ");
+    serial::write_dec(id);
+    serial::write_str(" option=");
+    serial::write_dec(option as u64);
+    serial::write_str(" arg2=0x");
+    serial::write_hex(arg2);
+    serial::write_str(" rip=0x");
+    serial::write_hex(unsafe { TASKS[task_idx(id)].regs.rip });
+    serial::write_str("\n");
     // PR_SET_NAME = 15: set thread name (used by Rust std)
     if option == 15 {
-        let id = CURRENT_TASK.load(Ordering::SeqCst);
         if id == 0 { return -EINVAL; }
         unsafe {
             let idx = task_idx(id);
             let name_ptr = arg2 as *const u8;
             if !name_ptr.is_null() {
+                // Validate user pointer before reading
+                if !user_range_valid(name_ptr as u64, 16, true) {
+                    serial::write_str("sys_prctl: user_range_valid FAILED\n");
+                    return -EFAULT;
+                }
                 // Copy up to 15 chars + null terminator
                 let mut i = 0;
                 while i < 15 {
@@ -3934,10 +3956,20 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
                     TASKS[idx].comm[i] = 0;
                     i += 1;
                 }
+                serial::write_str("sys_prctl: name set to '");
+                for j in 0..16 {
+                    let c = TASKS[idx].comm[j];
+                    if c == 0 { break; }
+                    serial::write_char(c as char);
+                }
+                serial::write_str("'\n");
             }
         }
         0
     } else {
+        serial::write_str("sys_prctl: unknown option=");
+        serial::write_dec(option as u64);
+        serial::write_str("\n");
         -EINVAL
     }
 }
