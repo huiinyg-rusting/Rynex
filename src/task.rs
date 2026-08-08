@@ -2018,6 +2018,10 @@ const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
 const FUTEX_LOCK_PI: i32 = 6;
 const FUTEX_UNLOCK_PI: i32 = 7;
+const FUTEX_WAIT_BITSET: i32 = 9;
+const FUTEX_WAKE_BITSET: i32 = 8;
+
+const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
 
 const FUTEX_PRIVATE_FLAG: i32 = 128;
 const FUTEX_CLOCK_REALTIME: i32 = 256;
@@ -2032,7 +2036,22 @@ fn sys_futex(uaddr: *const u32, op: i32, val: u32,
     let cmd = op & FUTEX_CMD_MASK;
     match cmd {
         FUTEX_WAIT => futex_wait(uaddr, val, uaddr2 as *const u64),
+        FUTEX_WAIT_BITSET => {
+            // Only FUTEX_BITSET_MATCH_ANY (std/musl thread::park) is supported.
+            if _val3 != FUTEX_BITSET_MATCH_ANY {
+                return -ENOSYS;
+            }
+            futex_wait(uaddr, val, uaddr2 as *const u64)
+        }
         FUTEX_WAKE => futex_wake(uaddr, val),
+        FUTEX_WAKE_BITSET => {
+            // WAKE_BITSET with FUTEX_BITSET_MATCH_ANY wakes all waiters, i.e. it
+            // is equivalent to plain FUTEX_WAKE with the given count.
+            if _val3 != FUTEX_BITSET_MATCH_ANY {
+                return -ENOSYS;
+            }
+            futex_wake(uaddr, val)
+        }
         FUTEX_LOCK_PI => futex_lock_pi(uaddr),
         FUTEX_UNLOCK_PI => futex_unlock_pi(uaddr),
         _ => -ENOSYS,
