@@ -705,33 +705,32 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::klog::s(" code=0x");
     crate::klog::hex(code.bits() as u64);
     crate::klog::s("\n");
+    // The interrupt frame's stack pointer for a USER-mode fault is the user
+    // rsp, which we must never deref from kernel mode (it would fault again
+    // and mask the real cause). Determine a kernel-only memory window first:
+    // "kstack" (the faulting task's kernel stack top) lives on the kernel
+    // heap (0x100000..0x100_0000); "frame rsp" is only readable if it lies
+    // in that kernel range, otherwise we substitute kstack-0x60.
+    let tid = crate::task::current_task_id();
+    let kstack = crate::task::task_kernel_stack_by_id(tid);
+    let kstack_ok = kstack >= 0x100_000 && kstack < 0x0100_0000;
     if cs_val == 8 {
-        // Identify the task and its kernel stack before dumping
-        let tid = crate::task::current_task_id();
         crate::klog::s("  task=");
         crate::klog::dec(tid);
         crate::klog::s(" kstack=0x");
-        crate::klog::hex(crate::task::task_kernel_stack_by_id(tid));
+        crate::klog::hex(kstack);
         crate::klog::s(" regs.rip=0x");
         crate::klog::hex(crate::task::current_task_regs_rip());
         crate::klog::s("\n");
-        // Dump the interrupted kernel stack for a backtrace (from the faulting
-        // rsp — may be garbage, so also dump the known-good region below).
+    }
+    if kstack_ok {
+        // Read only within [kstack-0x60 .. kstack): a purely kernel window.
         let base = frame.stack_pointer.as_u64();
-        crate::klog::s("  stack[");
-        for i in 0..32u64 {
-            let p = (base + i * 8) as *const u64;
-            let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::klog::s("\n   "); }
-            crate::klog::hex(v);
-            crate::klog::s(" ");
-        }
+        let base =
+            if base >= kstack - 0x60 && base < kstack { base } else { kstack - 0x60 };
+        crate::klog::s("  kframe[kstack-0x60..kstack]  rsp=0x");
+        crate::klog::hex(base);
         crate::klog::s("\n");
-        // Dump the syscall-entry frame (the 11 callee-saved regs + CPU retaddr
-        // that syscall_return pops + sysretq) and the call chain below the
-        // saved resume rsp. These live at the top of the task's kernel stack.
-        let kstack = crate::task::task_kernel_stack_by_id(tid);
-        crate::klog::s("  kframe[kstack-0x60..kstack]:");
         for i in 0..12u64 {
             let p = (kstack - 0x60 + i * 8) as *const u64;
             let v = unsafe { core::ptr::read_volatile(p) };
@@ -740,13 +739,16 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
             crate::klog::s(" ");
         }
         crate::klog::s("\n");
+        // kchain below saved resume rsp, clamped to the kernel window.
         let rsp = crate::task::current_task_regs_rsp();
-        crate::klog::s("  kchain[regs.rsp..] rsp=0x");
-        crate::klog::hex(rsp);
-        crate::klog::s("\n");
-        let mut addr = rsp;
+        let start = if rsp >= kstack - 0x60 && rsp < kstack {
+            rsp
+        } else {
+            kstack - 0x60
+        };
+        let mut addr = start;
         for _ in 0..40usize {
-            if addr >= kstack - 0x60 { break; }
+            if addr >= kstack { break; }
             let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
             crate::klog::s("   0x");
             crate::klog::hex(addr);
@@ -755,19 +757,11 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
             crate::klog::s("\n");
             addr += 8;
         }
-    } else if (cs_val & 3) == 3 && cr2 == rip && (code.bits() & 0x14) == 0x14 {
-        // User-mode instruction fetch fault (NX / execute of stack/data):
-        // dump the user stack to trace the corrupted return-address chain.
-        let base = frame.stack_pointer.as_u64();
-        crate::klog::s("  ustack[");
-        for i in 0..32u64 {
-            let p = (base + i * 8) as *const u64;
-            let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::klog::s("\n   "); }
-            crate::klog::hex(v);
-            crate::klog::s(" ");
-        }
-        crate::klog::s("\n");
+    } else {
+        // User-mode fault. Reading the user stack from the page-fault handler
+        // (a context where the faulting user page may not be mapped yet) would
+        // itself fault and mask the real cause. Just log the state instead.
+        crate::klog::s("  user-fault; skip user stack (safe)\n");
     }
     crate::klog::end();
 

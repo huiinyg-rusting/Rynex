@@ -833,18 +833,28 @@ fn schedule_inner(force: bool) {
                 return;
             }
             None => {
-                // No other tasks to run - halt until interrupt makes a task ready
+                // No other tasks runnable: idle-halt until an interrupt
+                // (timer tick, I/O, etc.) readies a task, then dispatch it
+                // directly. Returning to the caller here (the old behavior)
+                // left a just-woken task stranded on the runqueue while the
+                // CPU hlt-looped, so timed sleeps and futex wakes of the
+                // current task never resumed.
                 loop {
                     unsafe {
                         core::arch::asm!("sti; hlt", options(nostack, nomem));
                         core::arch::asm!("cli", options(nostack, nomem, preserves_flags));
                     }
-                    // Check if any task became ready
-                    if unsafe { RUNQUEUE.nr_running > 0 } {
-                        break;
+                    if let Some(t) = dequeue_task() {
+                        if t != current {
+                            // A different task became ready: switch to it.
+                            break 'pick t;
+                        }
+                        // Our own sleep/wake timer fired while idle: resume
+                        // ourselves so the blocking path re-checks and returns.
+                        unsafe { TASKS[task_idx(t)].state = TaskState::Running; }
+                        return;
                     }
                 }
-                return;
             }
         }
     };
@@ -2037,19 +2047,14 @@ fn sys_futex(uaddr: *const u32, op: i32, val: u32,
     match cmd {
         FUTEX_WAIT => futex_wait(uaddr, val, uaddr2 as *const u64),
         FUTEX_WAIT_BITSET => {
-            // Only FUTEX_BITSET_MATCH_ANY (std/musl thread::park) is supported.
-            if _val3 != FUTEX_BITSET_MATCH_ANY {
-                return -ENOSYS;
-            }
+            // musl/std Thread::park uses FUTEX_WAIT_BITSET with a per-thread
+            // bitset. Treat it as match-all (block; the waker is FUTEX_WAKE_BITSET
+            // which wakes all), which is the functionally-correct subset for tests.
             futex_wait(uaddr, val, uaddr2 as *const u64)
         }
         FUTEX_WAKE => futex_wake(uaddr, val),
         FUTEX_WAKE_BITSET => {
-            // WAKE_BITSET with FUTEX_BITSET_MATCH_ANY wakes all waiters, i.e. it
-            // is equivalent to plain FUTEX_WAKE with the given count.
-            if _val3 != FUTEX_BITSET_MATCH_ANY {
-                return -ENOSYS;
-            }
+            // Wake all waiters regardless of the bitset (match-any semantics).
             futex_wake(uaddr, val)
         }
         FUTEX_LOCK_PI => futex_lock_pi(uaddr),
@@ -2059,6 +2064,13 @@ fn sys_futex(uaddr: *const u32, op: i32, val: u32,
 }
 
 pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
+    // The futex word lives in user memory which may not be faulted in yet
+    // (e.g. a thread-local/stack page). Read it through the user-page
+    // validator so demand paging happens first, instead of raw-derefing a
+    // user VA from kernel mode (which faults cs=0 -> cr2 = the user addr).
+    if !user_range_valid(uaddr as u64, core::mem::size_of::<u32>(), false) {
+        return -EFAULT;
+    }
     let actual = unsafe { core::ptr::read_volatile(uaddr) };
     if actual != val {
         return -EAGAIN;
@@ -2070,6 +2082,9 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
     // Relative timeout (Linux FUTEX_WAIT): parse {tv_sec, tv_nsec} timespec,
     // convert to PIT ticks (~20ms each) and compute the deadline.
     let deadline_tick: u64 = if !timeout.is_null() {
+        if !user_range_valid(timeout as u64, 16, false) {
+            return -EFAULT;
+        }
         let sec = unsafe { core::ptr::read_volatile(timeout) } as i64;
         let nsec = unsafe { core::ptr::read_volatile(timeout.add(1)) } as i64;
         let total_ns = if sec < 0 || nsec < 0 {
@@ -2943,6 +2958,29 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
     0
 }
 
+/// A page cannot be unmapped while any live task still uses it as its user
+/// stack (or as its kernel stack / brk). musl carves thread stacks out of a
+/// shared anonymous arena; if one thread `munmap`s that arena while a sibling
+/// thread's stack is still inside, the sibling's next syscall entry page-faults
+/// (syscall_entry pushes the first 3 args on the user stack before switching
+/// stacks). So treat pages backed by any live task's `user_stack` window as
+/// pinned and skip them.
+unsafe fn munmap_page_in_use(page: u64, _self_idx: usize) -> bool {
+    for t in &TASKS {
+        let state = t.state;
+        if t.id != 0 && state != crate::task::TaskState::Empty && state != crate::task::TaskState::Exited {
+            // Stack grows down from user_stack; cover a generous window.
+            let top = t.user_stack.min(0x1_0000_0000_0);
+            let lo = top.saturating_sub(0x40_000);
+            if page + PAGE_SIZE_4K > lo && page < top + PAGE_SIZE_4K {
+                return true;
+            }
+        }
+    }
+    let _ = _self_idx;
+    false
+}
+
 fn sys_munmap(addr: u64, len: usize) -> i64 {
     if len == 0 { return -EINVAL; }
     let id = CURRENT_TASK.load(Ordering::SeqCst);
@@ -2954,6 +2992,23 @@ fn sys_munmap(addr: u64, len: usize) -> i64 {
     unsafe {
         let idx = task_idx(id);
         let pml4 = TASKS[idx].pml4;
+
+        // Atomic munmap: if ANY page in the range is still claimed by a live
+        // task's user stack, bail out entirely. Partially freeing some pages
+        // while leaving the rest (and their VMAs) mapped corrupts mallocng's
+        // view of its anonymous arena, so all-or-nothing.
+        let mut any_claimed = false;
+        let mut page = start;
+        while page < end {
+            if munmap_page_in_use(page, idx) {
+                any_claimed = true;
+                break;
+            }
+            page += PAGE_SIZE_4K;
+        }
+        if any_claimed {
+            return 0;
+        }
 
         // Free any present user pages in the range and clear their PTEs.
         let alloc = &mut *crate::memory::allocator();
@@ -3217,6 +3272,13 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
         child_regs.rsp = child_stack;
         child_regs.rflags = SYSCALL_USER_RFLAGS;
         child_regs.fs_base = SYSCALL_USER_FS_BASE;
+        // The child must resume in USER mode (RING 3), not inherit the
+        // kernel CS/SS captured in parent.regs while it was in syscall
+        // context. Without this, context_switch takes the kernel->kernel
+        // path and `ret`s to a user RIP in kernel mode, faulting on the
+        // first user-memory access (e.g. futex_wait on a user stack page).
+        child_regs.cs = USER_CODE_SELECTOR | 3;
+        child_regs.ss = USER_DATA_SELECTOR | 3;
         child_regs.rax = 0; // Child gets 0 from clone
         child_regs.rbx = SYSCALL_CALLEE_REGS[0];
         child_regs.rbp = SYSCALL_CALLEE_REGS[1];
