@@ -34,6 +34,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static FASTBOOT: AtomicBool = AtomicBool::new(true);
 
 extern "C" {
     fn syscall_entry();
@@ -237,7 +238,9 @@ memory::init(_info);
     // starve init (which is set to Running directly, not enqueued).
     services::register(b"ping", services::ping_handler);
     task::register_kernel_task_default(services::ping_server_task as u64, b"ping_server");
-    task::register_kernel_task_default(services::ipc_roundtrip_selftest as u64, b"ipc_selftest");
+    if !FASTBOOT.load(Ordering::Relaxed) {
+        task::register_kernel_task_default(services::ipc_roundtrip_selftest as u64, b"ipc_selftest");
+    }
 
     task::test();
 
