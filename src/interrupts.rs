@@ -622,10 +622,27 @@ pub unsafe extern "C" fn page_fault_probe() {
         "mov dx, 0x3f8",
         "out dx, al",
         "pop rax",
+        "push rax",
+        "push rdi",
+        "push rdx",
+        "push rcx",
+        "mov [rip + PF_RDI], rdi",
+        "mov [rip + PF_RDX], rdx",
+        "mov [rip + PF_RCX], rcx",
+        "mov [rip + PF_RAX], rax",
+        "pop rcx",
+        "pop rdx",
+        "pop rdi",
+        "pop rax",
         "jmp {}",
         sym page_fault_real,
     );
 }
+
+static mut PF_RDI: u64 = 0;
+static mut PF_RDX: u64 = 0;
+static mut PF_RCX: u64 = 0;
+static mut PF_RAX: u64 = 0;
 
 // Watchdog ring for writes to the mallocng meta page (VA 0x500000)
 static mut META_WR: [(u64, u64); 16] = [(0, 0); 16];
@@ -637,6 +654,9 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     let rip = frame.instruction_pointer.as_u64();
     let rsp = frame.stack_pointer.as_u64();
     let cs_val = frame.code_segment.0 as u64;
+    let pf_rdi = unsafe { PF_RDI };
+    let pf_rdx = unsafe { PF_RDX };
+    let pf_rcx = unsafe { PF_RCX };
 
      // Supervisor write to a read-only page: with CR0.WP=1 these fault. Resolve
      // non-user (identity) pages by marking them writable; for user COW pages
@@ -705,9 +725,36 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::klog::s(" code=0x");
     crate::klog::hex(code.bits() as u64);
     crate::klog::s("\n");
-    // The interrupt frame's stack pointer for a USER-mode fault is the user
-    // rsp, which we must never deref from kernel mode (it would fault again
-    // and mask the real cause). Determine a kernel-only memory window first:
+    crate::klog::end();
+    crate::serial::write_str("PFGPR rdi=0x");
+    crate::serial::write_hex(pf_rdi);
+    crate::serial::write_str(" rdx=0x");
+    crate::serial::write_hex(pf_rdx);
+    crate::serial::write_str(" rcx=0x");
+    crate::serial::write_hex(pf_rcx);
+    crate::serial::write_str("\n");
+    if (cs_val & 3) == 3 {
+        let cur_cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cur_cr3, options(nostack, nomem, preserves_flags)); }
+        let mut a = frame.stack_pointer.as_u64();
+        if a >= 0x7FFF_0000_0000 && a < 0x8000_0000_0000 {
+            crate::serial::write_str("PFUSTK ");
+            for _ in 0..24 {
+                if let Some(up) = crate::paging::PageTableManager::resolve_phys(cur_cr3, a) {
+                    let v: u64 = unsafe { core::ptr::read_volatile(up as *const u64) };
+                    crate::serial::write_hex(a);
+                    crate::serial::write_str(":");
+                    crate::serial::write_hex(v);
+                    crate::serial::write_str(" ");
+                } else {
+                    crate::serial::write_str("--- ");
+                }
+                a += 8;
+            }
+            crate::serial::write_str("\n");
+        }
+    }
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
     // "kstack" (the faulting task's kernel stack top) lives on the kernel
     // heap (0x100000..0x100_0000); "frame rsp" is only readable if it lies
     // in that kernel range, otherwise we substitute kstack-0x60.
