@@ -1400,9 +1400,9 @@ pub extern "C" fn timer_schedule() -> u64 {
                 // stamp the zeroed saved_user_regs snapshot (would clobber r15).
                 let _ = TASKS[i].saved_user_regs.take();
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
-                serial::write_str("WAKEUP tid=");
-                serial::write_dec(TASKS[i].id);
-                serial::write_str("\n");
+                // serial::write_str("WAKEUP tid=");
+                // serial::write_dec(TASKS[i].id);
+                // serial::write_str("\n");
             }
         }
     }
@@ -2099,15 +2099,15 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
         0
     };
 
-    serial::write_str("futex_wait: task ");
-    serial::write_dec(id);
-    serial::write_str(" uaddr=");
-    serial::write_hex(uaddr as u64);
-    serial::write_str(" val=");
-    serial::write_dec(val as u64);
-    serial::write_str(" deadline=");
-    serial::write_dec(deadline_tick);
-    serial::write_str("\n");
+    // serial::write_str("futex_wait: task ");
+    // serial::write_dec(id);
+    // serial::write_str(" uaddr=");
+    // serial::write_hex(uaddr as u64);
+    // serial::write_str(" val=");
+    // serial::write_dec(val as u64);
+    // serial::write_str(" deadline=");
+    // serial::write_hex(deadline as u64);
+    // serial::write_str("\n");
 
     // Remove from run queue before blocking
     remove_from_runqueue(id);
@@ -2155,11 +2155,11 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
 
 pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
     let uaddr_val = uaddr as u64;
-    serial::write_str("futex_wake: uaddr=");
-    serial::write_hex(uaddr_val);
-    serial::write_str(" max_wake=");
-    serial::write_dec(max_wake as u64);
-    serial::write_str("\n");
+    // serial::write_str("futex_wake: uaddr=");
+    // serial::write_hex(uaddr_val);
+    // serial::write_str(" max_wake=");
+    // serial::write_dec(max_wake as u64);
+    // serial::write_str("\n");
     let mut woken = 0i64;
     unsafe {
         for i in 0..MAX_TASKS {
@@ -2168,9 +2168,9 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 && TASKS[i].blocked_on == uaddr_val
                 && TASKS[i].id != 0
             {
-                serial::write_str("futex_wake: waking task ");
-                serial::write_dec(TASKS[i].id);
-                serial::write_str("\n");
+                // serial::write_str("futex_wake: waking task ");
+                // serial::write_dec(TASKS[i].id);
+                // serial::write_str("\n");
                 TASKS[i].state = TaskState::Ready;
                 TASKS[i].blocked_on = 0;
                 TASKS[i].wakeup_tick = 0;
@@ -2183,9 +2183,9 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
             }
         }
     }
-    serial::write_str("futex_wake: woken=");
-    serial::write_dec(woken as u64);
-    serial::write_str("\n");
+    // serial::write_str("futex_wake: woken=");
+    // serial::write_dec(woken as u64);
+    // serial::write_str("\n");
     woken
 }
 
@@ -2780,13 +2780,13 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         } else {
             page_addr
         };
-        if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-            crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-            crate::klog::s("MMAP -> 0x");
-            crate::klog::hex(final_addr);
-            crate::klog::s("\n");
-            crate::klog::end();
-        }
+        // crate::serial::write_str("MMAP-RET req=0x");
+        // crate::serial::write_hex(page_addr);
+        // crate::serial::write_str(" len=0x");
+        // crate::serial::write_hex(size);
+        // crate::serial::write_str(" -> 0x");
+        // crate::serial::write_hex(final_addr);
+        // crate::serial::write_str("\n");
 
         // Register VMA for demand paging
         let mut vma_added = false;
@@ -3349,33 +3349,33 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
 
         enqueue_task(child_tid, child.prio);
 
-        serial::write_str("SYS_CLONE: child ");
-        serial::write_dec(child_tid);
-        serial::write_str(" (parent ");
-        serial::write_dec(id);
-        serial::write_str(") flags=0x");
-        serial::write_hex(flags);
-        serial::write_str(" stack=0x");
-        serial::write_hex(child_stack);
-        serial::write_str(" tls=0x");
-        serial::write_hex(tls);
-        serial::write_str(" urip=0x");
-        serial::write_hex(SYSCALL_USER_RIP);
-        serial::write_str(" crib=0x");
-        serial::write_hex(child.regs.rip);
-        serial::write_str(" crsp=0x");
-        serial::write_hex(child.regs.rsp);
-        serial::write_str(" ccs=0x");
-        serial::write_hex(child.regs.cs);
-        serial::write_str(" cfs=0x");
-        serial::write_hex(child.regs.fs_base);
-        serial::write_str(" cflags=0x");
-        serial::write_hex(child.regs.rflags);
-        serial::write_str(" r9=0x");
-        serial::write_hex(child.regs.r9);
-        serial::write_str(" func=0x");
-        serial::write_hex(func);
-        serial::write_str("\n");
+        // serial::write_str("SYS_CLONE: child ");
+        // serial::write_dec(child_tid);
+        // serial::write_str(" (parent ");
+        // serial::write_dec(id);
+        // serial::write_str(") flags=0x");
+        // serial::write_hex(flags);
+        // serial::write_str(" stack=0x");
+        // serial::write_hex(child_stack);
+        // serial::write_str(" tls=0x");
+        // serial::write_hex(tls);
+        // serial::write_str(" urip=0x");
+        // serial::write_hex(SYSCALL_USER_RIP);
+        // serial::write_str(" crib=0x");
+        // serial::write_hex(child.regs.rip);
+        // serial::write_str(" crsp=0x");
+        // serial::write_hex(child.regs.rsp);
+        // serial::write_str(" ccs=0x");
+        // serial::write_hex(child.regs.cs);
+        // serial::write_str(" cfs=0x");
+        // serial::write_hex(child.regs.fs_base);
+        // serial::write_str(" cflags=0x");
+        // serial::write_hex(child.regs.rflags);
+        // serial::write_str(" r9=0x");
+        // serial::write_hex(child.regs.r9);
+        // serial::write_str(" func=0x");
+        // serial::write_hex(func);
+        // serial::write_str("\n");
 
         child_tid as i64
     }
@@ -5059,6 +5059,71 @@ pub fn current_task_pml4() -> u64 {
 
 /// Handle demand paging for mmap'd (or brk) regions.
 /// Returns true if the page was allocated and mapped.
+/// Map a fresh zeroed user page for a first touch inside the mallocng arena.
+/// mallocng's arena occupies the low 2M identity region (VA 0x400000..0x600000,
+/// with its meta page at 0x500000). Groups there are never requested through
+/// mmap/brk, so the supervisor identity huge page is still in place when the
+/// allocator first touches them; map_into splits the huge page and carves out
+/// a user page, keeping the rest supervisor-only.
+pub fn handle_arena_page(pml4: u64, cr2: u64) -> bool {
+    if cr2 < 0x400000 || cr2 >= 0x600000 {
+        return false;
+    }
+    let page_addr = cr2 & !0xFFF;
+    // Already a user mapping: leave it to the normal COW/demand-page paths.
+    if let Some((_, flags)) = crate::paging::resolve_phys_flags(pml4, page_addr) {
+        if flags & crate::paging::PTE_USER != 0 {
+            return false;
+        }
+    }
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let phys = match alloc.alloc(0) {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+    let mut flags = crate::paging::PTE_PRESENT
+        | crate::paging::PTE_WRITABLE
+        | crate::paging::PTE_USER
+        | crate::paging::PTE_NO_EXECUTE;
+    // Keep the mallocng meta page read-only so writes are trapped (META_WR).
+    if page_addr == 0x500000 {
+        flags &= !crate::paging::PTE_WRITABLE;
+    }
+    if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, flags).is_err() {
+        return false;
+    }
+    crate::serial::write_str("  ARENA: mapped 0x");
+    crate::serial::write_hex(page_addr);
+    crate::serial::write_str(" phys=0x");
+    crate::serial::write_hex(phys);
+    crate::serial::write_str("\n");
+    if let Some(mp) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
+        crate::serial::write_str("  ARENA meta:");
+        for mk in 0..24u64 {
+            let base = mp + 0x18 + mk * 0x28;
+            let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
+            crate::serial::write_str(" m[");
+            crate::serial::write_dec(mk);
+            crate::serial::write_str("]=");
+            crate::serial::write_hex(mem);
+        }
+        crate::serial::write_str("\n");
+    }
+    if let Some(cphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9B50) {
+        crate::serial::write_str("  ARENA ACTIVE:");
+        for ck in 0..8u64 {
+            let a: u64 = unsafe { core::ptr::read_volatile((cphys + ck * 8) as *const u64) };
+            crate::serial::write_str(" [");
+            crate::serial::write_dec(ck);
+            crate::serial::write_str("]=");
+            crate::serial::write_hex(a);
+        }
+        crate::serial::write_str("\n");
+    }
+    true
+}
+
 pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return false; }
@@ -5262,17 +5327,17 @@ fn sys_clock_nanosleep(clk_id: u64, flags: u32, req: *const u64, _rem: *mut u64)
         (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64)
     };
     let ticks = (total_ns + 19_999_999) / 20_000_000;
-    serial::write_str("CLKNS req=");
-    serial::write_dec(sec as u64);
-    serial::write_str(".");
-    serial::write_dec(nsec as u64);
-    serial::write_str(" ns ticks=");
-    serial::write_dec(ticks);
-    serial::write_str("\n");
+    // serial::write_str("CLKNS req=");
+    // serial::write_dec(sec as u64);
+    // serial::write_str(".");
+    // serial::write_dec(nsec as u64);
+    // serial::write_str(" ns ticks=");
+    // serial::write_dec(ticks);
+    // serial::write_str("\n");
     if ticks > 0 {
         sys_sleep(ticks);
     }
-    serial::write_str("CLKNS woke\n");
+    // serial::write_str("CLKNS woke\n");
     0
 }
 

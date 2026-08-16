@@ -1032,6 +1032,14 @@ pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
         return false;
     }
 
+    // User touch inside the mallocng arena (VA 0x400000..0x600000, which is
+    // still the supervisor identity huge page): carve out a fresh user page.
+    if cpl == 3 && cr2 >= 0x400000 && cr2 < 0x600000 {
+        if crate::task::handle_arena_page(task_pml4, cr2) {
+            return true;
+        }
+    }
+
     // Write to a read-only page → COW (handle both user and kernel mode,
     // since CR0.WP=1 prevents kernel writes to read-only pages too)
     if is_write && is_present {
