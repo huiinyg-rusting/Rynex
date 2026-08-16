@@ -948,7 +948,11 @@ pub fn yield_now() {
         let idx = task_idx(id);
         if TASKS[idx].state == TaskState::Running {
             TASKS[idx].state = TaskState::Ready;
-            TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
+            // NOTE: do NOT reset the time slice here. schedule() declines to
+            // switch inside a syscall (in_syscall()==true), so a spin-yield
+            // loop would otherwise keep refreshing its slice and monopolize the
+            // CPU forever (observed in the context_switch_storm stress test).
+            // Letting the slice expire lets the timer preempt normally.
         }
     }
 
@@ -1979,7 +1983,13 @@ fn sys_get_ticks() -> i64 {
 }
 
 fn sys_rynex_yield() -> i64 {
-    yield_now();
+    // sched_yield must actually hand over the CPU. A plain schedule() declines
+    // to switch while inside a syscall (in_syscall()==true), and leaving the
+    // task Running while also on the runqueue makes a spin-yield loop starve
+    // every other task (timer sees state!=Running and never preempts it).
+    // force_schedule() switches even inside a syscall; exit_task/waitpid use
+    // the same path safely.
+    yield_now_force();
     0
 }
 
