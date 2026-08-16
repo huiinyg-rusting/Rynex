@@ -2654,86 +2654,6 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         crate::klog::s("\n");
         crate::klog::end();
     }
-    // Dump musl reclaim/VMA-tracking struct (app.5 @ libc 0x100000EB940)
-    {
-        let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
-        let app_va: u64 = 0x100000_EB940;
-        if let Some(app_p) = crate::paging::PageTableManager::resolve_phys(mlog_cr3, app_va) {
-            let rd = |o: u64| -> u64 { unsafe { core::ptr::read_volatile((app_p + o) as *const u64) } };
-            let base = rd(0x0);
-            let vlist = rd(0x28);
-            let count = unsafe { core::ptr::read_volatile((app_p + 0x30) as *const u32) } as u32;
-            let c_lo = rd(0x120);
-            let c_hi = rd(0x128);
-            if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                crate::klog::s("  APP base=0x");
-                crate::klog::hex(base);
-                crate::klog::s(" vlist=0x");
-                crate::klog::hex(vlist);
-                crate::klog::s(" cnt=");
-                crate::klog::dec(count as u64);
-                crate::klog::s(" clamp=0x");
-                crate::klog::hex(c_lo);
-                crate::klog::s("-0x");
-                crate::klog::hex(c_hi);
-                crate::klog::s("\n");
-                crate::klog::end();
-            }
-            if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                for vi in 0..count.min(8) as u64 {
-                    let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
-                    if vp == 0 { continue; }
-                    let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
-                    let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
-                    let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
-                    let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
-                    crate::klog::s("    VMA[");
-                    crate::klog::dec(vi);
-                    crate::klog::s("] type=");
-                    crate::klog::dec(ty as u64);
-                    crate::klog::s(" fl=0x");
-                    crate::klog::hex(fl as u64);
-                    crate::klog::s(" 0x");
-                    crate::klog::hex(vb);
-                    crate::klog::s("-0x");
-                    crate::klog::hex(vb.wrapping_add(vs));
-                    crate::klog::s("\n");
-                }
-                crate::klog::end();
-            }
-        }
-    }
-    // Dump meta area slots 0..8 to observe group creation order
-    static META_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if META_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 25 {
-        let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
-        let mpage = crate::paging::PageTableManager::resolve_phys(mlog_cr3, 0x500000).unwrap_or(0);
-        if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-            crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-            crate::klog::s("  metapage=0x");
-            crate::klog::hex(mpage);
-            crate::klog::s(" m: ");
-            for mk in 0..8u64 {
-                let base = mpage.wrapping_add(0x18 + mk * 0x28);
-                let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
-                let avail: u32 = unsafe { core::ptr::read_volatile((base + 0x18) as *const u32) };
-                let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
-                crate::klog::s("[");
-                crate::klog::dec(mk);
-                crate::klog::s("]=0x");
-                crate::klog::hex(mem);
-                crate::klog::s("a");
-                crate::klog::hex(avail as u64);
-                crate::klog::s("s");
-                crate::klog::dec((packed >> 6) & 63);
-                crate::klog::s(" ");
-            }
-            crate::klog::s("\n");
-            crate::klog::end();
-        }
-    }
 
     let page_addr = if addr.is_null() {
         0 // We'll pick an address
@@ -2818,51 +2738,6 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
             return -ENOMEM; // Too many VMAs
         }
 
-        // Dump meta slots after the mmap completes (before returning to user)
-        if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-            if let Some(mpage) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                crate::klog::s("  POST-MMAP m[0]=0x");
-                let m0: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28) as *const u64) };
-                crate::klog::hex(m0);
-                crate::klog::s(" m[8]=0x");
-                let m8: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x140) as *const u64) };
-                crate::klog::hex(m8);
-                crate::klog::s(" m[11]=0x");
-                let m11: u64 = unsafe { core::ptr::read_volatile((mpage + 0x28 + 0x28 * 11) as *const u64) };
-                crate::klog::hex(m11);
-                crate::klog::s("\n");
-                crate::klog::end();
-            }
-        }
-        // Dump malloc_context.active[] and usage_by_class[] early
-        if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-            if let Some(cphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9B50) {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                crate::klog::s("  CTX-ACTIVE: ");
-                for ck in 0..8usize {
-                    let a: u64 = unsafe { core::ptr::read_volatile((cphys + (ck as u64) * 8) as *const u64) };
-                    crate::klog::dec(ck as u64);
-                    crate::klog::s("=");
-                    crate::klog::hex(a);
-                    crate::klog::s(" ");
-                }
-                crate::klog::s("\n");
-            }
-            if let Some(uphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9CD0) {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                crate::klog::s("  CTX-USAGE: ");
-                for ck in 0..8usize {
-                    let u: u64 = unsafe { core::ptr::read_volatile((uphys + (ck as u64) * 8) as *const u64) };
-                    crate::klog::dec(ck as u64);
-                    crate::klog::s("=");
-                    crate::klog::hex(u);
-                    crate::klog::s(" ");
-                }
-                crate::klog::s("\n");
-                crate::klog::end();
-            }
-        }
         return final_addr as i64;
     }
 }
@@ -2879,75 +2754,6 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
         crate::klog::s(" prot=0x");
         crate::klog::hex(prot as u64);
         crate::klog::end();
-    }
-    static MPROT_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if MPROT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
-        && crate::klog::get_console_level() >= crate::klog::LOG_DEBUG
-    {
-        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-        let mlog_cr3 = unsafe { TASKS[task_idx(id)].pml4 };
-        for (tag, app_va) in [("APP", 0x100000_EB940u64), ("LDSO", 0x100000_EB6A0u64)] {
-            if let Some(app_p) = crate::paging::PageTableManager::resolve_phys(mlog_cr3, app_va) {
-                let rd = |o: u64| -> u64 { unsafe { core::ptr::read_volatile((app_p + o) as *const u64) } };
-                let base = rd(0x0);
-                let vlist = rd(0x28);
-                let count = unsafe { core::ptr::read_volatile((app_p + 0x30) as *const u32) } as u32;
-                let c_lo = rd(0x120);
-                let c_hi = rd(0x128);
-                crate::klog::s("  ");
-                crate::klog::s(tag);
-                crate::klog::s(" base=0x");
-                crate::klog::hex(base);
-                crate::klog::s(" vlist=0x");
-                crate::klog::hex(vlist);
-                crate::klog::s(" cnt=");
-                crate::klog::dec(count as u64);
-                crate::klog::s(" clamp=0x");
-                crate::klog::hex(c_lo);
-                crate::klog::s("-0x");
-                crate::klog::hex(c_hi);
-                crate::klog::s(" ");
-                for vi in 0..count.min(10) as u64 {
-                    let vp = crate::paging::PageTableManager::resolve_phys(mlog_cr3, vlist + vi * 0x40).unwrap_or(0);
-                    if vp == 0 { continue; }
-                    let ty: u32 = unsafe { core::ptr::read_volatile((vp + 0x0) as *const u32) };
-                    let fl: u32 = unsafe { core::ptr::read_volatile((vp + 0x4) as *const u32) };
-                    let vb: u64 = unsafe { core::ptr::read_volatile((vp + 0x10) as *const u64) };
-                    let vs: u64 = unsafe { core::ptr::read_volatile((vp + 0x28) as *const u64) };
-                    crate::klog::s("    VMA[");
-                    crate::klog::dec(vi);
-                    crate::klog::s("] type=");
-                    crate::klog::dec(ty as u64);
-                    crate::klog::s(" fl=0x");
-                    crate::klog::hex(fl as u64);
-                    crate::klog::s(" 0x");
-                    crate::klog::hex(vb);
-                    crate::klog::s("-0x");
-                    crate::klog::hex(vb.wrapping_add(vs));
-                    crate::klog::s(" ");
-                }
-            }
-        }
-        crate::klog::end();
-        let mpage = crate::paging::PageTableManager::resolve_phys(mlog_cr3, 0x500000).unwrap_or(0);
-        if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-            crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-            crate::klog::s("  META m: ");
-            for mk in 0..14u64 {
-                let base = mpage.wrapping_add(0x18 + mk * 0x28);
-                let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
-                let packed: u64 = unsafe { core::ptr::read_volatile((base + 0x20) as *const u64) };
-                crate::klog::s("[");
-                crate::klog::dec(mk);
-                crate::klog::s("]=0x");
-                crate::klog::hex(mem);
-                crate::klog::s("(");
-                crate::klog::hex(packed);
-                crate::klog::s(") ");
-            }
-            crate::klog::s("\n");
-            crate::klog::end();
-        }
     }
     unsafe {
         let idx = task_idx(id);
@@ -4170,13 +3976,6 @@ fn sys_brk(addr: u64) -> i64 {
             core::arch::asm!("mov {}, cr3", out(reg) cr3);
             let start_page = crate::memory::buddy::page_align_down(old_end);
             let end_page = crate::memory::buddy::page_align_up(addr);
-            crate::serial::write_str("  BRK: pre-zero pages 0x");
-            crate::serial::write_hex(start_page);
-            crate::serial::write_str("-0x");
-            crate::serial::write_hex(end_page);
-            crate::serial::write_str(" cr3=0x");
-            crate::serial::write_hex(cr3);
-            crate::serial::write_str("\n");
             let mut page = start_page;
             while page < end_page {
                 let phys = {
@@ -4185,52 +3984,12 @@ fn sys_brk(addr: u64) -> i64 {
                 };
                 if let Some(phys) = phys {
                     core::ptr::write_bytes(phys as *mut u8, 0, 4096);
-                    // Force compiler to emit the write by reading back
-                    let zero_check = core::ptr::read_volatile(phys as *const u64);
-                    // Verify with multiple reads
-                    let zero_check2 = core::ptr::read_volatile((phys + 0x310) as *const u64);
-                    crate::serial::write_str("  BRK: phys=0x");
-                    crate::serial::write_hex(phys);
-                    crate::serial::write_str(" zero=0x");
-                    crate::serial::write_hex(zero_check);
-                    crate::serial::write_str(" z310=0x");
-                    crate::serial::write_hex(zero_check2);
                     let flags = crate::paging::PTE_PRESENT
                         | crate::paging::PTE_WRITABLE
                         | crate::paging::PTE_USER
                         | crate::paging::PTE_NO_EXECUTE;
-                    // Trap writes to the mallocng meta-area page (VA 0x500000)
-                    let flags = if page == 0x500000 { flags & !crate::paging::PTE_WRITABLE } else { flags };
-                    let res = crate::paging::PageTableManager::map_into(
-                        cr3, page, phys, flags
-                    );
-                    if res.is_ok() {
+                    if crate::paging::PageTableManager::map_into(cr3, page, phys, flags).is_ok() {
                         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
-                    }
-                    // Verify the mapping
-                    let verify = crate::paging::PageTableManager::resolve_phys(cr3, page).unwrap_or(!0);
-                    crate::serial::write_str(" map=0x");
-                    crate::serial::write_hex(page);
-                    crate::serial::write_str(" phys=0x");
-                    crate::serial::write_hex(phys);
-                    crate::serial::write_str(" resolve=0x");
-                    crate::serial::write_hex(verify);
-                    if res.is_ok() {
-                        crate::serial::write_str(" OK");
-                    } else {
-                        crate::serial::write_str(" FAIL");
-                    }
-                    if verify != phys {
-                        crate::serial::write_str(" MISMATCH!");
-                    }
-                    crate::serial::write_str("\n");
-                    // Reserve meta-area phys page so buddy never reuses it
-                    if page == 0x500000 {
-                        let alloc = &mut *crate::memory::allocator();
-                        alloc.reserve(phys);
-                        crate::serial::write_str("  BRK: reserved meta phys=0x");
-                        crate::serial::write_hex(phys);
-                        crate::serial::write_str("\n");
                     }
                 }
                 page += 4096;
@@ -5069,71 +4828,6 @@ pub fn current_task_pml4() -> u64 {
 
 /// Handle demand paging for mmap'd (or brk) regions.
 /// Returns true if the page was allocated and mapped.
-/// Map a fresh zeroed user page for a first touch inside the mallocng arena.
-/// mallocng's arena occupies the low 2M identity region (VA 0x400000..0x600000,
-/// with its meta page at 0x500000). Groups there are never requested through
-/// mmap/brk, so the supervisor identity huge page is still in place when the
-/// allocator first touches them; map_into splits the huge page and carves out
-/// a user page, keeping the rest supervisor-only.
-pub fn handle_arena_page(pml4: u64, cr2: u64) -> bool {
-    if cr2 < 0x400000 || cr2 >= 0x600000 {
-        return false;
-    }
-    let page_addr = cr2 & !0xFFF;
-    // Already a user mapping: leave it to the normal COW/demand-page paths.
-    if let Some((_, flags)) = crate::paging::resolve_phys_flags(pml4, page_addr) {
-        if flags & crate::paging::PTE_USER != 0 {
-            return false;
-        }
-    }
-    let alloc = unsafe { &mut *crate::memory::allocator() };
-    let phys = match alloc.alloc(0) {
-        Some(p) => p,
-        None => return false,
-    };
-    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
-    let mut flags = crate::paging::PTE_PRESENT
-        | crate::paging::PTE_WRITABLE
-        | crate::paging::PTE_USER
-        | crate::paging::PTE_NO_EXECUTE;
-    // Keep the mallocng meta page read-only so writes are trapped (META_WR).
-    if page_addr == 0x500000 {
-        flags &= !crate::paging::PTE_WRITABLE;
-    }
-    if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, flags).is_err() {
-        return false;
-    }
-    crate::serial::write_str("  ARENA: mapped 0x");
-    crate::serial::write_hex(page_addr);
-    crate::serial::write_str(" phys=0x");
-    crate::serial::write_hex(phys);
-    crate::serial::write_str("\n");
-    if let Some(mp) = crate::paging::PageTableManager::resolve_phys(pml4, 0x500000) {
-        crate::serial::write_str("  ARENA meta:");
-        for mk in 0..24u64 {
-            let base = mp + 0x18 + mk * 0x28;
-            let mem: u64 = unsafe { core::ptr::read_volatile((base + 0x10) as *const u64) };
-            crate::serial::write_str(" m[");
-            crate::serial::write_dec(mk);
-            crate::serial::write_str("]=");
-            crate::serial::write_hex(mem);
-        }
-        crate::serial::write_str("\n");
-    }
-    if let Some(cphys) = crate::paging::PageTableManager::resolve_phys(pml4, 0x100000E9B50) {
-        crate::serial::write_str("  ARENA ACTIVE:");
-        for ck in 0..8u64 {
-            let a: u64 = unsafe { core::ptr::read_volatile((cphys + ck * 8) as *const u64) };
-            crate::serial::write_str(" [");
-            crate::serial::write_dec(ck);
-            crate::serial::write_str("]=");
-            crate::serial::write_hex(a);
-        }
-        crate::serial::write_str("\n");
-    }
-    true
-}
-
 pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return false; }
