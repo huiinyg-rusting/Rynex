@@ -1725,6 +1725,22 @@ pub const SYS_setpgid: u64 = 109;
 pub const SYS_getpgrp: u64 = 111;
 pub const SYS_setsid: u64 = 112;
 pub const SYS_getrandom: u64 = 318;
+pub const SYS_statfs: u64 = 137;
+pub const SYS_fstatfs: u64 = 138;
+pub const SYS_getrlimit: u64 = 97;
+pub const SYS_setrlimit: u64 = 160;
+pub const SYS_mknod: u64 = 133;
+pub const SYS_chmod: u64 = 90;
+pub const SYS_fchmod: u64 = 91;
+pub const SYS_chown: u64 = 92;
+pub const SYS_lchown: u64 = 94;
+pub const SYS_utimensat: u64 = 280;
+pub const SYS_unlinkat: u64 = 263;
+pub const SYS_readlinkat: u64 = 267;
+pub const SYS_getgroups: u64 = 115;
+pub const SYS_setgroups: u64 = 116;
+pub const SYS_mount: u64 = 165;
+pub const SYS_umount2: u64 = 166;
 
 // Rynex-specific (high numbers, no Linux conflict)
 pub const SYS_rynex_get_ticks: u64 = 2000;
@@ -1742,6 +1758,10 @@ pub const SYS_rynex_ipc_connect: u64 = 2011;
 pub const SYS_rynex_ipc_send: u64 = 2012;
 pub const SYS_rynex_ipc_recv: u64 = 2013;
 pub const SYS_rynex_ipc_close: u64 = 2014;
+pub const SYS_rynex_port_in: u64 = 2020;
+pub const SYS_rynex_port_out: u64 = 2021;
+pub const SYS_rynex_irq_register: u64 = 2022;
+pub const SYS_rynex_irq_wait: u64 = 2023;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -1846,6 +1866,21 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_sched_yield => sys_rynex_yield(),
         SYS_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
                                arg4 as *const u32, arg5 as u32),
+        SYS_statfs => sys_statfs(arg1 as *const u8, arg2 as *mut u8),
+        SYS_fstatfs => sys_fstatfs(arg1 as u32, arg2 as *mut u8),
+        SYS_getrlimit => sys_getrlimit(arg1 as u32, arg2 as *mut u8),
+        SYS_setrlimit => sys_setrlimit(arg1 as u32, arg2 as *mut u8),
+        SYS_mknod => sys_mknod(arg1 as *const u8, arg2 as u32, arg3 as u64),
+        SYS_chmod => sys_chmod(arg1 as *const u8, arg2 as u32),
+        SYS_fchmod => sys_fchmod(arg1 as u32, arg2 as u32),
+        SYS_chown => sys_chown(arg1 as *const u8, arg2 as u32, arg3 as u32),
+        SYS_utimensat => sys_utimensat(arg1 as i32, arg2 as *const u8, arg3 as u64, arg4 as i32),
+        SYS_unlinkat => sys_unlinkat(arg1 as i32, arg2 as *const u8, arg3 as i32),
+        SYS_readlinkat => sys_readlinkat(arg1 as i32, arg2 as *const u8, arg3 as *mut u8, arg4 as usize),
+        SYS_getgroups => sys_getgroups(arg1 as i32, arg2 as *mut u8),
+        SYS_setgroups => sys_setgroups(arg1 as usize, arg2 as *const u8),
+        SYS_mount => sys_mount(arg1 as *const u8, arg2 as *const u8, arg3 as *const u8, arg4 as u64, arg5 as u64),
+        SYS_umount2 => sys_umount2(arg1 as *const u8, arg2 as i32),
         // Rynex-specific
         SYS_rynex_get_ticks => sys_get_ticks(),
         SYS_rynex_futex => sys_futex(arg1 as *const u32, arg2 as i32, arg3 as u32,
@@ -1863,6 +1898,10 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_ipc_send => crate::ipc::ipc_send(arg1 as u64, arg2 as *const u8, arg3 as usize, arg4 as u32),
         SYS_rynex_ipc_recv => crate::ipc::ipc_recv(arg1 as u64, arg2 as *mut u8, arg3 as usize),
         SYS_rynex_ipc_close => crate::ipc::ipc_close(arg1 as u64),
+        SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
+        SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
+        SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
+        SYS_rynex_irq_wait => sys_irq_wait(arg1 as u8, arg2 as u64),
         SYS_reboot => sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
         _ => {
             // Print first unknown syscall
@@ -1991,6 +2030,127 @@ fn sys_rynex_yield() -> i64 {
     // the same path safely.
     yield_now_force();
     0
+}
+
+// ── User-space driver support (P1-B) ─────────────────────────────
+// Microkernel seam: drivers run as user-space services. The kernel grants
+// them (a) privileged port I/O executed on their behalf and (b) IRQ event
+// delivery through a per-IRQ shared counter + futex wake word.
+
+/// Port I/O read. `width` is 1/2/4 for inb/inw/inl. Returns value or -EINVAL.
+fn sys_port_in(port: u16, width: u32) -> i64 {
+    match width {
+        1 => {
+            let v: u8;
+            unsafe { core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            v as i64
+        }
+        2 => {
+            let v: u16;
+            unsafe { core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            v as i64
+        }
+        4 => {
+            let v: u32;
+            unsafe { core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags)); }
+            v as i64
+        }
+        _ => -EINVAL,
+    }
+}
+
+/// Port I/O write. `width` is 1/2/4 for outb/outw/outl.
+fn sys_port_out(port: u16, width: u32, value: u64) -> i64 {
+    match width {
+        1 => {
+            let v = value as u8;
+            unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)); }
+        }
+        2 => {
+            let v = value as u16;
+            unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)); }
+        }
+        4 => {
+            let v = value as u32;
+            unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags)); }
+        }
+        _ => return -EINVAL,
+    }
+    0
+}
+
+// IRQ delivery: each registered IRQ gets a user-space counter word. The kernel
+// bumps the counter and futex-wakes the driver task on each edge. Drivers wait
+// with rynex_irq_wait (a futex wait on the same word) so they can block
+// cleanly instead of spinning.
+const MAX_DRIVER_IRQS: usize = 16;
+static mut DRIVER_IRQ_WORD: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
+
+/// Driver task registers a user-space u32 counter for `irq`. Returns 0.
+fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
+    if irq as usize >= MAX_DRIVER_IRQS {
+        return -EINVAL;
+    }
+    if counter.is_null() || !user_range_valid(counter as u64, 4, true) {
+        return -EFAULT;
+    }
+    unsafe {
+        DRIVER_IRQ_WORD[irq as usize] = counter as u64;
+        crate::pic::unmask(irq);
+    }
+    0
+}
+
+/// Driver task blocks until the IRQ counter changes. `timeout_ms` 0 = forever.
+/// Polls the counter (futex block is the natural primitive already used by
+/// the IPC layer for the same purpose).
+fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
+    if irq as usize >= MAX_DRIVER_IRQS {
+        return -EINVAL;
+    }
+    unsafe {
+        let word = DRIVER_IRQ_WORD[irq as usize];
+        if word == 0 {
+            return -EINVAL;
+        }
+        let first = core::ptr::read_volatile(word as *const u32);
+        let deadline = if timeout_ms == 0 {
+            0
+        } else {
+            crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) + timeout_ms * 100 / 1000 * 100
+        };
+        loop {
+            let now = core::ptr::read_volatile(word as *const u32);
+            if now != first {
+                return 0;
+            }
+            if deadline != 0
+                && crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) >= deadline
+            {
+                return -EAGAIN;
+            }
+            if !block_on_futex(word as *const u32) {
+                return -EAGAIN;
+            }
+        }
+    }
+}
+
+/// Called from the timer/IRQ dispatch path to deliver an IRQ edge to any
+/// waiting driver. Public so pic/device code can invoke it.
+pub fn driver_irq_edge(irq: u8) {
+    unsafe {
+        if irq as usize >= MAX_DRIVER_IRQS {
+            return;
+        }
+        let word = DRIVER_IRQ_WORD[irq as usize];
+        if word == 0 {
+            return;
+        }
+        let now = core::ptr::read_volatile(word as *const u32);
+        core::ptr::write_volatile(word as *mut u32, now.wrapping_add(1));
+        crate::task::futex_wake(word as *const u32, 1);
+    }
 }
 
 fn sys_spawn(elf_addr: *const u8, elf_size: usize) -> i64 {
@@ -4153,13 +4313,24 @@ fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
             t.sig_pending |= 1u64 << sigi;
             return 0;
         }
-        // Default action: for the terminating set, kill the process.
+        // Default action: for the terminating set, kill the task. If the target
+        // is blocked on this signal, hold it pending so it takes effect once
+        // unblocked (POSIX); otherwise act now.
         let terminates = sig == SIGINT || sig == SIGQUIT || sig == SIGILL
             || sig == SIGABRT || sig == SIGSEGV || sig == SIGTERM
             || sig == SIGPIPE || sig == SIGFPE || sig == SIGBUS
             || sig == SIGTRAP || sig == SIGALRM;
         if terminates {
-            kill_task_zombie(idx, 128 + sig);
+            if blocked {
+                t.sig_pending |= 1u64 << sigi;
+            } else if task_idx(current_task_id()) == idx {
+                // Killing ourselves: exit_task clears our TID, wakes the parent
+                // and force-schedules away, which is exactly what the normal
+                // sys_exit path does.
+                exit_task(128 + sig);
+            } else {
+                kill_task_zombie(idx, 128 + sig);
+            }
         }
         // SIGCONT etc. are no-ops here.
         0
@@ -4176,6 +4347,13 @@ fn kill_task_zombie(idx: usize, code: i32) {
         t.state = TaskState::Zombie;
         if t.id != 0 {
             remove_from_runqueue(t.id);
+        }
+        // CLONE_CHILD_CLEARTID: clear the TID and wake futex joiners so a
+        // signal-killed thread can be joined like a normally-exited one.
+        let child_tidptr = t.child_tidptr;
+        if child_tidptr != 0 {
+            core::ptr::write_volatile(child_tidptr as *mut u64, 0u64);
+            futex_wake(child_tidptr as *const u32, 1);
         }
         if let Some(p) = t.parent {
             let pidx = task_idx(p);
@@ -4439,7 +4617,21 @@ pub extern "C" fn check_deliver_signal(kstack: u64, sys_ret: u64) -> u64 {
             if TASKS[idx].sig_pending & bit == 0 { continue; }
             if (TASKS[idx].sig_blocked >> sig) & 1 != 0 { continue; }
             let act = TASKS[idx].sig_handlers[sig];
-            if act.handler == SIG_DFL as u64 || act.handler == SIG_IGN as u64 { continue; }
+            if act.handler == SIG_IGN as u64 { continue; }
+            if act.handler == SIG_DFL as u64 {
+                // A default-action signal that was held pending while blocked:
+                // apply its default behaviour now that it is unblocked.
+                let sigi = sig as i32;
+                let terminates = sigi == SIGINT || sigi == SIGQUIT || sigi == SIGILL
+                    || sigi == SIGABRT || sigi == SIGSEGV || sigi == SIGTERM
+                    || sigi == SIGPIPE || sigi == SIGFPE || sigi == SIGBUS
+                    || sigi == SIGTRAP || sigi == SIGALRM;
+                if terminates {
+                    TASKS[idx].sig_pending &= !bit;
+exit_task(128 + sigi);
+                }
+                continue;
+            }
             if act.restorer == 0 || act.flags & SA_RESTORER == 0 { continue; }
 
             // Interrupted user context, straight off this syscall's save area.
@@ -4883,6 +5075,160 @@ fn sys_sysinfo(info: *mut u8) -> i64 {
     }
     0
 }
+
+// ── Statfs / rlimit / chmod / chown / utimens / groups / mount ──
+
+// Linux struct statfs (x86_64): 6 u64 fields + 8-byte fsid + pad + 2 u64 spare.
+fn fill_statfs(buf: *mut u8) -> i64 {
+    unsafe {
+        let p = buf as *mut u64;
+        core::ptr::write_volatile(p, 0x65746e69u64);          // f_type "inte"
+        core::ptr::write_volatile(p.add(1), 4096);            // f_bsize
+        core::ptr::write_volatile(p.add(2), 1024u64 * 1024);  // f_blocks
+        core::ptr::write_volatile(p.add(3), 512u64 * 1024);   // f_bfree
+        core::ptr::write_volatile(p.add(4), 512u64 * 1024);   // f_bavail
+        core::ptr::write_volatile(p.add(5), 0);               // f_files
+        core::ptr::write_volatile(p.add(6), 0);               // f_ffree
+        core::ptr::write_volatile(buf.add(48) as *mut u64, 0); // f_fsid[2]
+        core::ptr::write_volatile(buf.add(56) as *mut u64, 0);
+        core::ptr::write_volatile(buf.add(64) as *mut i64, 0); // f_namelen
+        core::ptr::write_volatile(buf.add(72) as *mut i64, 0); // f_frsize
+        core::ptr::write_volatile(buf.add(80) as *mut u64, 0); // f_spare[4]
+        core::ptr::write_volatile(buf.add(88) as *mut u64, 0);
+        core::ptr::write_volatile(buf.add(96) as *mut u64, 0);
+        core::ptr::write_volatile(buf.add(104) as *mut u64, 0);
+    }
+    0
+}
+
+fn sys_statfs(pathname: *const u8, buf: *mut u8) -> i64 {
+    if pathname.is_null() || buf.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::resolve_or_register(name) {
+        Some(_) => fill_statfs(buf),
+        None => -ENOENT,
+    }
+}
+
+fn sys_fstatfs(fd: u32, buf: *mut u8) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    if crate::vfs::fd_to_inode(fd as usize).is_none() { return -EBADF; }
+    fill_statfs(buf)
+}
+
+// Linux struct rlimit: two u64 (rlim_cur, rlim_max).
+fn fill_rlimit(buf: *mut u8, cur: u64, max: u64) -> i64 {
+    unsafe {
+        let p = buf as *mut u64;
+        core::ptr::write_volatile(p, cur);
+        core::ptr::write_volatile(p.add(1), max);
+    }
+    0
+}
+
+fn sys_getrlimit(resource: u32, buf: *mut u8) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    // RLIM_INFINITY = u64::MAX. Values are generous; only CPU/FILE respected.
+    match resource {
+        0 => fill_rlimit(buf, u64::MAX, u64::MAX), // RLIMIT_CPU
+        3 => fill_rlimit(buf, 8192, 8192),         // RLIMIT_CORE
+        4 => fill_rlimit(buf, 1024, 1024),         // RLIMIT_DATA
+        6 => fill_rlimit(buf, u64::MAX, u64::MAX), // RLIMIT_STACK
+        7 => fill_rlimit(buf, u64::MAX, u64::MAX), // RLIMIT_NOFILE
+        8 => fill_rlimit(buf, u64::MAX, u64::MAX), // RLIMIT_AS
+        _ => fill_rlimit(buf, u64::MAX, u64::MAX),
+    }
+}
+
+fn sys_setrlimit(_resource: u32, buf: *mut u8) -> i64 {
+    if buf.is_null() { return -EFAULT; }
+    if !user_range_valid(buf as u64, 16, false) { return -EFAULT; }
+    0
+}
+
+fn sys_mknod(pathname: *const u8, mode: u32, _dev: u64) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::create_file(name, b"") {
+        Some(_) => 0,
+        None => -EIO,
+    }
+}
+
+fn sys_chmod(pathname: *const u8, mode: u32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::resolve_or_register(name) {
+        Some(_) => {
+            let _ = mode;
+            0
+        }
+        None => -ENOENT,
+    }
+}
+
+fn sys_fchmod(fd: u32, mode: u32) -> i64 {
+    if crate::vfs::fd_to_inode(fd as usize).is_none() { return -EBADF; }
+    let _ = mode;
+    0
+}
+
+fn sys_chown(pathname: *const u8, _uid: u32, _gid: u32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::resolve_or_register(name) {
+        Some(_) => 0,
+        None => -ENOENT,
+    }
+}
+
+fn sys_utimensat(_dirfd: i32, pathname: *const u8, _times: u64, _flags: i32) -> i64 {
+    if pathname.is_null() { return -EFAULT; }
+    let name = unsafe { cstr_from_ptr(pathname) };
+    if name.is_empty() { return -ENOENT; }
+    match crate::vfs::resolve_or_register(name) {
+        Some(_) => 0,
+        None => -ENOENT,
+    }
+}
+
+fn sys_unlinkat(dirfd: i32, pathname: *const u8, flags: i32) -> i64 {
+    let _ = (dirfd, flags);
+    if pathname.is_null() { return -EFAULT; }
+    sys_unlink(pathname)
+}
+
+fn sys_readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    let _ = dirfd;
+    if pathname.is_null() || buf.is_null() { return -EFAULT; }
+    sys_readlink(pathname, buf, bufsiz)
+}
+
+fn sys_getgroups(size: i32, list: *mut u8) -> i64 {
+    // Single-user system: only group 0 (root).
+    if list.is_null() || size <= 0 {
+        // Return number of groups.
+        return 1;
+    }
+    if size < 1 { return -EINVAL; }
+    unsafe {
+        core::ptr::write_volatile(list as *mut u32, 0);
+    }
+    1
+}
+
+fn sys_setgroups(_size: usize, _list: *const u8) -> i64 { 0 }
+
+fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, _flags: u64, _data: u64) -> i64 {
+    let _ = (source, target, fstype);
+    -ENOSYS
+}
+
+fn sys_umount2(_target: *const u8, _flags: i32) -> i64 { -ENOSYS }
 
 #[repr(C)]
 struct LinuxStat {
