@@ -7,14 +7,14 @@ fn main() {
     // When building with --target x86_64-unknown-none (via `make`), rust-lld is used
     // directly and doesn't understand these cc-specific flags.
     let target = std::env::var("TARGET").unwrap_or_default();
-    if target == "x86_64-unknown-linux-gnu" {
+    if target == "x86_64-unknown-linux-gnu" || target == "x86_64-unknown-linux-musl" {
         println!("cargo:rustc-link-arg=-fuse-ld=bfd");
         println!("cargo:rustc-link-arg=-nostartfiles");
+    } else {
+        // Export __eh_frame_hdr_start symbol for AT_SYSINFO_EHDR (only for bare-metal target with lld)
+        println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_start=__eh_frame_hdr_start");
+        println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_end=__eh_frame_hdr_end");
     }
-
-    // Export __eh_frame_hdr_start symbol for AT_SYSINFO_EHDR
-    println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_start=__eh_frame_hdr_start");
-    println!("cargo:rustc-link-arg=--defsym=__eh_frame_hdr_end=__eh_frame_hdr_end");
 
     // Tell cargo to rerun if linker.ld changes
     println!("cargo:rerun-if-changed=linker.ld");
