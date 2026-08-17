@@ -4145,7 +4145,11 @@ fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
         if ignored {
             return 0;
         }
-        if act.handler != SIG_DFL as u64 && !blocked {
+        // Real handler: mark the signal pending whether or not it is currently
+        // blocked (POSIX: a blocked signal is held pending and delivered once
+        // it is unblocked). check_deliver_signal runs it on the next syscall
+        // boundary once the bit is no longer blocked.
+        if act.handler != SIG_DFL as u64 {
             t.sig_pending |= 1u64 << sigi;
             return 0;
         }
@@ -4261,7 +4265,9 @@ fn handle_default_signal(target: i64, sig: i32) {
 // handler delivery can reuse it; today we store state and honour default
 // actions, matching the bug log's "kill default action" requirement.
 
-// linux kernel's internal sigaction layout for rt_sigaction syscall:
+// musl converts its struct sigaction into Linux's kernel_sigaction layout
+// ({handler, flags, restorer, mask}) before the rt_sigaction syscall, so the
+// ABI-facing struct is that layout, not the user-space struct.
 #[repr(C)]
 struct KSigAction {
     handler: u64,
@@ -4301,9 +4307,9 @@ fn sys_rt_sigaction(sig: i32, act: u64, oldact: u64) -> i64 {
             let ka = core::ptr::read_volatile(act as *const KSigAction);
             TASKS[idx].sig_handlers[sigi] = SignalAction {
                 handler: ka.handler,
-                mask: ka.mask,
                 flags: ka.flags,
                 restorer: ka.restorer,
+                mask: ka.mask,
             };
         }
     }
@@ -4333,11 +4339,197 @@ fn sys_rt_sigprocmask(how: i32, set: u64, oldset: u64) -> i64 {
     0
 }
 
+// ── Signal delivery ────────────────────────────────────────────────
+//
+// Handler execution works by rewriting the current syscall's exit context in
+// context_switch.asm: after syscall_handler returns, the assembly calls
+// check_deliver_signal(kstack, sys_ret) with a pointer to the kernel stack
+// holding this syscall's saved user registers, plus the syscall return value.
+// If a pending signal with a real handler must run, the function writes a
+// Linux-shaped rt_sigframe onto the user stack and rewrites the saved slots so
+// the normal exit path resumes at the handler with RDI=sig, RSI=&ucontext,
+// RSP=frame, and [RSP]=restorer (musl's __restore_rt). When the handler
+// returns it calls rt_sigreturn, which parks the sigcontext registers in
+// PENDING_RESTORE; the same check_deliver_signal hook restores them on the way
+// back out. No user-visible kernel trampoline is needed: musl always installs
+// SA_RESTORER.
+//
+// Frame layout (offsets match the Linux x86_64 rt_sigframe; only the kernel
+// writes/reads it, so it only needs to be self-consistent):
+//   0    pretcode (handler return address)
+//   8    struct ucontext { uc_flags, uc_link, uc_stack{ss_sp,ss_flags,ss_size} }
+//   48   struct sigcontext { r8,r9,r10,r11,r12,r13,r14,r15, rdi,rsi,rbp,rbx,
+//        rdx,rax,rcx,rsp,rip, eflags, cs,gs,fs, pad, err, trapno, oldmask,
+//        cr2, fpstate, reserved[8] }
+//   304  ucontext sigmask
+const SIG_FRAME_SIZE: u64 = 320;
+const SIG_PRETCODE: u64 = 0;
+const SIG_UC: u64 = 8;
+const SIG_MCTX: u64 = 48;
+const SIG_R8: u64 = SIG_MCTX + 0;
+const SIG_R9: u64 = SIG_MCTX + 8;
+const SIG_R10: u64 = SIG_MCTX + 16;
+const SIG_R11: u64 = SIG_MCTX + 24;
+const SIG_R12: u64 = SIG_MCTX + 32;
+const SIG_R13: u64 = SIG_MCTX + 40;
+const SIG_R14: u64 = SIG_MCTX + 48;
+const SIG_R15: u64 = SIG_MCTX + 56;
+const SIG_RDI: u64 = SIG_MCTX + 64;
+const SIG_RSI: u64 = SIG_MCTX + 72;
+const SIG_RBP: u64 = SIG_MCTX + 80;
+const SIG_RBX: u64 = SIG_MCTX + 88;
+const SIG_RDX: u64 = SIG_MCTX + 96;
+const SIG_RAX: u64 = SIG_MCTX + 104;
+const SIG_RCX: u64 = SIG_MCTX + 112;
+const SIG_RSP: u64 = SIG_MCTX + 120;
+const SIG_RIP: u64 = SIG_MCTX + 128;
+const SIG_EFLAGS: u64 = SIG_MCTX + 136;
+const SIG_CS: u64 = SIG_MCTX + 144;
+const SIG_GS: u64 = SIG_MCTX + 146;
+const SIG_FS: u64 = SIG_MCTX + 148;
+const SIG_SIGMASK: u64 = 304;
+
+// Context rt_sigreturn parked for the current syscall's exit path.
+static mut PENDING_RESTORE: Option<[u64; 14]> = None;
+
+#[inline]
+unsafe fn sig_read_u64(p: u64) -> u64 { core::ptr::read_volatile(p as *const u64) }
+#[inline]
+unsafe fn sig_write_u64(p: u64, v: u64) { core::ptr::write_volatile(p as *mut u64, v) }
+#[inline]
+unsafe fn sig_write_u16(p: u64, v: u16) { core::ptr::write_volatile(p as *mut u16, v) }
+
+/// Called from context_switch.asm right after syscall_handler returns.
+/// `kstack` points at the kernel stack holding this syscall's saved user regs:
+///   [k+0]=arg6 [k+8]=userRSP [k+16]=r9 [k+24]=r8 [k+32]=rsi [k+40]=rdi
+///   [k+48]=rdx [k+56]=r11 [k+64]=rcx [k+72..112]=r15,r14,r13,r12,rbp,rbx
+/// `sys_ret` is the syscall return value (the rax the user will see).
+/// Returns 0 when the exit path can run untouched; 1 after rewriting the slots
+/// so it enters a handler (or resumes from rt_sigreturn) instead.
+#[no_mangle]
+pub extern "C" fn check_deliver_signal(kstack: u64, sys_ret: u64) -> u64 {
+    unsafe {
+        // Resume from a previous handler: rt_sigreturn parked the restored
+        // context here, rewrite this syscall's exit slots with it.
+        if let Some(ctx) = PENDING_RESTORE.take() {
+            sig_write_u64(kstack + 40, ctx[0]);  // rdi
+            sig_write_u64(kstack + 32, ctx[1]);  // rsi
+            sig_write_u64(kstack + 48, ctx[2]);  // rdx
+            sig_write_u64(kstack + 24, ctx[3]);  // r8
+            sig_write_u64(kstack + 16, ctx[4]);  // r9
+            sig_write_u64(kstack + 64, ctx[5]);  // rcx -> rip
+            sig_write_u64(kstack + 56, ctx[6]);  // r11 -> rflags
+            sig_write_u64(kstack + 8, ctx[7].wrapping_sub(24)); // userRSP -> rsp-24
+            sig_write_u64(kstack + 72, ctx[8]);  // r15
+            sig_write_u64(kstack + 80, ctx[9]);  // r14
+            sig_write_u64(kstack + 88, ctx[10]); // r13
+            sig_write_u64(kstack + 96, ctx[11]); // r12
+            sig_write_u64(kstack + 104, ctx[12]);// rbp
+            sig_write_u64(kstack + 112, ctx[13]);// rbx
+            return 1;
+        }
+
+        let id = current_task_id();
+        if id == 0 { return 0; }
+        let idx = task_idx(id);
+        if TASKS[idx].state == TaskState::Empty { return 0; }
+
+        for sig in 1..SIGNAL_COUNT {
+            let bit = 1u64 << sig;
+            if TASKS[idx].sig_pending & bit == 0 { continue; }
+            if (TASKS[idx].sig_blocked >> sig) & 1 != 0 { continue; }
+            let act = TASKS[idx].sig_handlers[sig];
+            if act.handler == SIG_DFL as u64 || act.handler == SIG_IGN as u64 { continue; }
+            if act.restorer == 0 || act.flags & SA_RESTORER == 0 { continue; }
+
+            // Interrupted user context, straight off this syscall's save area.
+            let orig_rip = sig_read_u64(kstack + 64);
+            let orig_rflags = sig_read_u64(kstack + 56);
+            let orig_rsp = sig_read_u64(kstack + 8) + 24;
+            let rdi = sig_read_u64(kstack + 40);
+            let rsi = sig_read_u64(kstack + 32);
+            let rdx = sig_read_u64(kstack + 48);
+            let r8 = sig_read_u64(kstack + 24);
+            let r9 = sig_read_u64(kstack + 16);
+            let r15 = sig_read_u64(kstack + 72);
+            let r14 = sig_read_u64(kstack + 80);
+            let r13 = sig_read_u64(kstack + 88);
+            let r12 = sig_read_u64(kstack + 96);
+            let rbp = sig_read_u64(kstack + 104);
+            let rbx = sig_read_u64(kstack + 112);
+            let user_r10 = sig_read_u64(orig_rsp - 8); // arg4 the entry pushed
+
+            let frame = (orig_rsp - SIG_FRAME_SIZE) & !0xF;
+            sig_write_u64(frame + SIG_PRETCODE, act.restorer);
+            sig_write_u64(frame + SIG_SIGMASK, TASKS[idx].sig_blocked);
+            sig_write_u64(frame + SIG_R8, r8);
+            sig_write_u64(frame + SIG_R9, r9);
+            sig_write_u64(frame + SIG_R10, user_r10);
+            sig_write_u64(frame + SIG_R11, orig_rflags);
+            sig_write_u64(frame + SIG_R12, r12);
+            sig_write_u64(frame + SIG_R13, r13);
+            sig_write_u64(frame + SIG_R14, r14);
+            sig_write_u64(frame + SIG_R15, r15);
+            sig_write_u64(frame + SIG_RDI, rdi);
+            sig_write_u64(frame + SIG_RSI, rsi);
+            sig_write_u64(frame + SIG_RBP, rbp);
+            sig_write_u64(frame + SIG_RBX, rbx);
+            sig_write_u64(frame + SIG_RDX, rdx);
+            sig_write_u64(frame + SIG_RAX, sys_ret);
+            sig_write_u64(frame + SIG_RCX, orig_rip);
+            sig_write_u64(frame + SIG_RSP, orig_rsp);
+            sig_write_u64(frame + SIG_RIP, orig_rip);
+            sig_write_u64(frame + SIG_EFLAGS, orig_rflags);
+            sig_write_u16(frame + SIG_CS, 0x33);
+            sig_write_u16(frame + SIG_GS, 0);
+            sig_write_u16(frame + SIG_FS, 0);
+
+            // Handler runs with the signal (and its sa_mask) blocked.
+            TASKS[idx].sig_blocked |= bit | act.mask;
+            TASKS[idx].sig_pending &= !bit;
+
+            // Rewrite the exit path to enter the handler: RIP=handler,
+            // RSP=frame, RDI=sig, RSI=&ucontext. [frame] holds the restorer.
+            sig_write_u64(kstack + 40, sig as u64);
+            sig_write_u64(kstack + 32, frame + SIG_UC);
+            sig_write_u64(kstack + 64, act.handler);
+            sig_write_u64(kstack + 8, frame - 24);
+            return 1;
+        }
+    }
+    0
+}
+
 fn sys_rt_sigreturn() -> i64 {
-    // With handler delivery, this would pop the sigcontext the kernel wrote.
-    // Until handlers run, the only legal arrival here is a bogus call.
-    // Return -ENOSYS so libc treats it as unsupported rather than crashing.
-    -ENOSYS
+    unsafe {
+        // The handler returned to the restorer trampoline (musl __restore_rt),
+        // which called rt_sigreturn with the user RSP at &ucontext = frame+8.
+        let id = current_task_id();
+        if id == 0 { return -EINVAL; }
+        let idx = task_idx(id);
+        let frame = SYSCALL_USER_RSP.wrapping_sub(8);
+        let ctx = [
+            sig_read_u64(frame + SIG_RDI),
+            sig_read_u64(frame + SIG_RSI),
+            sig_read_u64(frame + SIG_RDX),
+            sig_read_u64(frame + SIG_R8),
+            sig_read_u64(frame + SIG_R9),
+            sig_read_u64(frame + SIG_RIP),
+            sig_read_u64(frame + SIG_EFLAGS),
+            sig_read_u64(frame + SIG_RSP),
+            sig_read_u64(frame + SIG_R15),
+            sig_read_u64(frame + SIG_R14),
+            sig_read_u64(frame + SIG_R13),
+            sig_read_u64(frame + SIG_R12),
+            sig_read_u64(frame + SIG_RBP),
+            sig_read_u64(frame + SIG_RBX),
+        ];
+        PENDING_RESTORE = Some(ctx);
+        TASKS[idx].sig_blocked = sig_read_u64(frame + SIG_SIGMASK);
+        // Return value becomes the user's rax after the exit path restores the
+        // parked context, so hand back the interrupted rax.
+        sig_read_u64(frame + SIG_RAX) as i64
+    }
 }
 
 fn sys_sigaltstack(ss: u64, old_ss: u64) -> i64 {
