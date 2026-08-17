@@ -241,6 +241,33 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Unmap a single 4K page from an arbitrary PML4 (user task). Returns the
+    /// previously mapped physical address, or Err if not mapped.
+    pub fn unmap_into(pml4: u64, virt: u64) -> Result<u64, &'static str> {
+        let vpn = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+        let pml4e = unsafe { (*(pml4 as *mut PageTable)).0[vpn[0]] };
+        if pml4e & PTE_PRESENT == 0 { return Err("no pml4e"); }
+        let pdpt = (pml4e & PTE_ADDR_MASK) as *mut PageTable;
+        let pdpte = unsafe { (*pdpt).0[vpn[1]] };
+        if pdpte & PTE_PRESENT == 0 { return Err("no pdpte"); }
+        if pdpte & PTE_HUGE != 0 { return Err("huge pdpte"); }
+        let pd = (pdpte & PTE_ADDR_MASK) as *mut PageTable;
+        let pde = unsafe { (*pd).0[vpn[2]] };
+        if pde & PTE_PRESENT == 0 { return Err("no pde"); }
+        if pde & PTE_HUGE != 0 { return Err("huge pde"); }
+        let pt = (pde & PTE_ADDR_MASK) as *mut PageTable;
+        let pte = unsafe { (*pt).0[vpn[3]] };
+        if pte & PTE_PRESENT == 0 { return Err("no pte"); }
+        let phys = pte & PTE_ADDR_MASK;
+        unsafe { (*pt).0[vpn[3]] = 0; }
+        Ok(phys)
+    }
+
     pub fn resolve_phys(pml4: u64, virt: u64) -> Option<u64> {
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,

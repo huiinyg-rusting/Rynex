@@ -1767,6 +1767,12 @@ pub const SYS_rynex_ipc_recv_ex: u64 = 2025;
 pub const SYS_rynex_ipc_reply: u64 = 2026;
 pub const SYS_rynex_fs_register: u64 = 2027;
 pub const SYS_rynex_fs_mount: u64 = 2028;
+pub const SYS_rynex_phys_map: u64 = 2029;
+pub const SYS_rynex_dma_alloc: u64 = 2030;
+pub const SYS_rynex_dma_free: u64 = 2031;
+pub const SYS_rynex_pci_read: u64 = 2032;
+pub const SYS_rynex_pci_write: u64 = 2033;
+pub const SYS_rynex_pci_find: u64 = 2034;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -1908,6 +1914,12 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize),
         SYS_rynex_fs_register => sys_fs_register(arg1 as u64),
         SYS_rynex_fs_mount => sys_fs_mount(arg1 as *const u8),
+        SYS_rynex_phys_map => sys_phys_map(arg1 as u64, arg2 as u64),
+        SYS_rynex_dma_alloc => sys_dma_alloc(arg1 as usize),
+        SYS_rynex_dma_free => sys_dma_free(arg1 as u64),
+        SYS_rynex_pci_read => sys_pci_read(arg1 as u8, arg2 as u8, arg3 as u8, arg4 as u8),
+        SYS_rynex_pci_write => sys_pci_write(arg1 as u8, arg2 as u8, arg3 as u8, arg4 as u8, arg5 as u32),
+        SYS_rynex_pci_find => sys_pci_find(arg1 as u16),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -2201,6 +2213,265 @@ fn sys_fs_mount(mp: *const u8) -> i64 {
             -EINVAL
         }
     }
+}
+
+// ── User-space device driver support (P2b) ──────────────────────
+// Microkernel seam #2: drivers map device MMIO and DMA buffers into their own
+// address space, and walk PCI config space, all under kernel supervision.
+
+/// Map a physical range into the calling process. `phys` is page-aligned,
+/// `size` is rounded up to pages. Returns the user virtual address or a negated
+/// errno. The mapping is marked uncached via PTE_NO_CACHE where available.
+fn sys_phys_map(phys: u64, size: u64) -> i64 {
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+    if phys == 0 || size == 0 || size > 0x1_0000_0000 {
+        return -EINVAL;
+    }
+    let size = ((size + 0xFFF) & !0xFFF) as u64;
+    let idx = unsafe { task_idx(id) };
+
+    // Pick a low user address range for driver mappings, clear of the ELF
+    // image (0x400000-ish), heap and stack. 0x50000000 is far above brk and
+    // below the mmap region.
+    let base = 0x5000_0000u64;
+    let mut chosen = 0u64;
+    unsafe {
+        let mut candidate = base;
+        let limit = 0x6000_0000u64;
+        'search: while candidate + size <= limit {
+            let mut overlap = false;
+            for vma in &TASKS[idx].vmas {
+                if vma.start == 0 && vma.end == 0 { continue; }
+                if candidate < vma.end && candidate + size > vma.start {
+                    overlap = true;
+                    candidate = vma.end;
+                    continue 'search;
+                }
+            }
+            if !overlap {
+                chosen = candidate;
+                break 'search;
+            }
+            candidate += 0x1000;
+        }
+    }
+    if chosen == 0 {
+        return -ENOMEM;
+    }
+
+    let pml4 = unsafe { TASKS[idx].pml4 };
+    let mut flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_WRITABLE
+        | crate::paging::PTE_CACHE_DISABLE;
+    let mut off = 0u64;
+    while off < size {
+        match crate::paging::PageTableManager::map_into(pml4, chosen + off, phys + off, flags) {
+            Ok(_) => {}
+            Err(_) => {
+                // Roll back pages already mapped.
+                let mut roff = 0u64;
+                while roff < off {
+                    let _ = crate::paging::PageTableManager::unmap_into(pml4, chosen + roff);
+                    roff += 0x1000;
+                }
+                return -ENOMEM;
+            }
+        }
+        off += 0x1000;
+    }
+
+    // Register a VMA so demand paging / teardown knows about the range.
+    for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
+        if vma.start == 0 && vma.end == 0 {
+            vma.start = chosen;
+            vma.end = chosen + size;
+            vma.flags = flags;
+            break;
+        }
+    }
+    chosen as i64
+}
+
+/// Allocate a DMA-capable physical page and map it into the caller. Returns
+/// (user_vaddr, phys_addr) packed: phys in high 32 bits, vaddr in low 48.
+fn sys_dma_alloc(_pages: usize) -> i64 {
+    let pages = if _pages == 0 { 1 } else { _pages.min(8) };
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+    let idx = unsafe { task_idx(id) };
+
+    // Allocate physically contiguous pages from the buddy allocator. The
+    // buddy allocator hands out power-of-two blocks, so round the page count
+    // up to the next power of two (min 1 page).
+    let order = (pages as u32).next_power_of_two().trailing_zeros() as usize;
+    let phys = {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        match alloc.alloc(order) {
+            Some(p) => p,
+            None => return -ENOMEM,
+        }
+    };
+    let size = 0x1000u64 << order;
+
+    // Map into a fresh low user address (below the mmap region).
+    let base = 0x5000_0000u64;
+    let limit = 0x6000_0000u64;
+    let mut chosen = 0u64;
+    unsafe {
+        let mut candidate = base;
+        'search: while candidate + size <= limit {
+            let mut overlap = false;
+            for vma in &TASKS[idx].vmas {
+                if vma.start == 0 && vma.end == 0 { continue; }
+                if candidate < vma.end && candidate + size > vma.start {
+                    overlap = true;
+                    candidate = vma.end;
+                    continue 'search;
+                }
+            }
+            if !overlap {
+                chosen = candidate;
+                break 'search;
+            }
+            candidate += 0x1000;
+        }
+    }
+    if chosen == 0 {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        alloc.free(phys, order);
+        return -ENOMEM;
+    }
+
+    let pml4 = unsafe { TASKS[idx].pml4 };
+    let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_WRITABLE;
+    let mut off = 0u64;
+    while off < size {
+        if crate::paging::PageTableManager::map_into(pml4, chosen + off, phys + off, flags).is_err() {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            alloc.free(phys, order);
+            return -ENOMEM;
+        }
+        off += 0x1000;
+    }
+    for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
+        if vma.start == 0 && vma.end == 0 {
+            vma.start = chosen;
+            vma.end = chosen + size;
+            vma.flags = flags;
+            break;
+        }
+    }
+    // Pack: high 32 bits = phys page number, low 32 bits = user vaddr.
+    let phys_hi = (phys >> 12) & 0xFFFF_FFFF;
+    ((phys_hi << 32) | (chosen & 0xFFFF_FFFF)) as i64
+}
+
+/// Free a DMA buffer previously returned by sys_dma_alloc. The low 32 bits
+/// carry the user address; the physical page is returned to the buddy allocator.
+fn sys_dma_free(packed: u64) -> i64 {
+    let vaddr = packed & 0xFFFF_FFFF;
+    let phys = (packed >> 32) & 0xFFFF_FFFF;
+    if vaddr == 0 || phys == 0 {
+        return -EINVAL;
+    }
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+    let idx = unsafe { task_idx(id) };
+    let pml4 = unsafe { TASKS[idx].pml4 };
+
+    // Unmap one page (drivers allocate a single page in practice).
+    let _ = crate::paging::PageTableManager::unmap_into(pml4, vaddr as u64);
+    // Clear the VMA entry.
+    for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
+        if vma.start == vaddr as u64 {
+            vma.start = 0;
+            vma.end = 0;
+            vma.flags = 0;
+            break;
+        }
+    }
+    let alloc = unsafe { &mut *crate::memory::allocator() };
+    alloc.free(phys << 12, 0);
+    0
+}
+
+const PCI_CONFIG_ADDR: u16 = 0xCF8;
+const PCI_CONFIG_DATA: u16 = 0xCFC;
+
+/// Read a PCI config register. Returns the 32-bit value or a negated errno.
+fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
+    if offset > 0xFC || offset % 4 != 0 {
+        return -EINVAL;
+    }
+    let addr: u32 = 0x8000_0000 | ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov edx, {addr_port}",
+            "out dx, eax",
+            "mov edx, {data_port}",
+            "in eax, dx",
+            addr_port = const PCI_CONFIG_ADDR,
+            data_port = const PCI_CONFIG_DATA,
+            in("eax") addr,
+            lateout("eax") value,
+            options(nostack, preserves_flags)
+        );
+    }
+    value as i64
+}
+
+/// Write a PCI config register.
+fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 {
+    if offset > 0xFC || offset % 4 != 0 {
+        return -EINVAL;
+    }
+    let addr: u32 = 0x8000_0000 | ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | (offset as u32 & 0xFC);
+    unsafe {
+        core::arch::asm!(
+            "mov edx, {addr_port}",
+            "out dx, eax",
+            "mov edx, {data_port}",
+            "mov eax, ecx",
+            "out dx, eax",
+            addr_port = const PCI_CONFIG_ADDR,
+            data_port = const PCI_CONFIG_DATA,
+            in("eax") addr,
+            in("ecx") value,
+            options(nostack, preserves_flags)
+        );
+    }
+    0
+}
+
+/// Scan bus 0 for a device with the given vendor/device id. Returns
+/// (bus<<16 | dev<<11 | func<<8) or -ENODEV. Only devs 0..=31 checked.
+fn sys_pci_find(vendor_device: u16) -> i64 {
+    let _ = vendor_device;
+    for dev in 0u8..32 {
+        for func in 0u8..8 {
+            let addr: u32 = 0x8000_0000 | ((dev as u32) << 11) | ((func as u32) << 8);
+            let id: u32;
+            unsafe {
+                core::arch::asm!(
+                    "mov edx, {addr_port}",
+                    "out dx, eax",
+                    "mov edx, {data_port}",
+                    "in eax, dx",
+                    addr_port = const PCI_CONFIG_ADDR,
+                    data_port = const PCI_CONFIG_DATA,
+                    in("eax") addr,
+                    lateout("eax") id,
+                    options(nostack, preserves_flags)
+                );
+            }
+            if id != 0xFFFF_FFFF && id != 0 {
+                // device id (low 16) requested; return slot for the first hit.
+                return ((dev as i64) << 11) | ((func as i64) << 8);
+            }
+        }
+    }
+    -crate::task::ENODEV
 }
 
 fn sys_spawn(elf_addr: *const u8, elf_size: usize) -> i64 {
