@@ -183,6 +183,10 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
         let vn_id = unsafe {
             if INODES[flat_idx].vnode_id != 0 {
                 INODES[flat_idx].vnode_id
+            } else if crate::vfs_core::is_userfs_path(norm) {
+                // Path lives under a user-space FS mount: resolve through the
+                // IPC bridge so reads/writes forward to the FS service.
+                crate::vfs_core::path_to_vnode(norm).ok()? as u16
             } else {
                 let mode = crate::vfs_core::types::S_IFREG
                     | crate::vfs_core::types::S_IRUSR

@@ -1765,6 +1765,8 @@ pub const SYS_rynex_irq_wait: u64 = 2023;
 pub const SYS_rynex_ipc_call: u64 = 2024;
 pub const SYS_rynex_ipc_recv_ex: u64 = 2025;
 pub const SYS_rynex_ipc_reply: u64 = 2026;
+pub const SYS_rynex_fs_register: u64 = 2027;
+pub const SYS_rynex_fs_mount: u64 = 2028;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -1904,6 +1906,8 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_ipc_call => crate::ipc::ipc_call(arg1 as u64, arg2 as *const u8, arg3 as usize, arg4 as *mut u8, arg5 as usize),
         SYS_rynex_ipc_recv_ex => crate::ipc::ipc_recv_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
         SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize),
+        SYS_rynex_fs_register => sys_fs_register(arg1 as u64),
+        SYS_rynex_fs_mount => sys_fs_mount(arg1 as *const u8),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -2156,6 +2160,46 @@ pub fn driver_irq_edge(irq: u8) {
         let now = core::ptr::read_volatile(word as *const u32);
         core::ptr::write_volatile(word as *mut u32, now.wrapping_add(1));
         crate::task::futex_wake(word as *const u32, 1);
+    }
+}
+
+/// User-space FS service registers its IPC port with the kernel. From then on
+/// every userfs mount forwards vnode ops to that port.
+fn sys_fs_register(port_id: u64) -> i64 {
+    if port_id == 0 {
+        return -EINVAL;
+    }
+    crate::vfs_core::userfs::set_service_port(port_id);
+    serial::write_str("VFS: userfs service registered on port ");
+    serial::write_dec(port_id);
+    serial::write_str("\n");
+    0
+}
+
+/// Mount the user-space FS service at an absolute path (e.g. /mnt/ufs).
+fn sys_fs_mount(mp: *const u8) -> i64 {
+    if mp.is_null() {
+        return -EFAULT;
+    }
+    let path = unsafe { cstr_from_ptr(mp) };
+    if path.is_empty() {
+        return -EINVAL;
+    }
+    match crate::vfs_core::mount_userfs(path) {
+        Ok(vn) => {
+            serial::write_str("VFS: userfs mounted at '");
+            serial::write_str(&alloc::format!("{}", core::str::from_utf8(path).unwrap_or("?")));
+            serial::write_str("' vnode=");
+            serial::write_dec(vn as u64);
+            serial::write_str("\n");
+            0
+        }
+        Err(e) => {
+            serial::write_str("VFS: userfs mount failed: ");
+            serial::write_str(e);
+            serial::write_str("\n");
+            -EINVAL
+        }
     }
 }
 

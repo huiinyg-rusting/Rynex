@@ -3,6 +3,7 @@ pub mod xattr;
 pub mod ext3;
 pub mod ramfs;
 pub mod procfs;
+pub mod userfs;
 
 use crate::spinlock::Mutex;
 use crate::serial;
@@ -385,6 +386,24 @@ pub fn mount(mp: &[u8], fs_id: FsId, root_ino: u64, ops: &'static dyn VnodeOps) 
     let mount_id = mt.alloc(mp, fs_id, root_ino, ops).ok_or("mount table full")?;
     let vnode_id = VNODE_TABLE.lock().alloc(root_ino, fs_id, mount_id as u64, ops).ok_or("vnode table full")?;
     Ok(vnode_id)
+}
+
+/// Mount the user-space filesystem service at `mp`. All vnode operations for
+/// this mount are forwarded over IPC to the registered user-space FS service.
+pub fn mount_userfs(mp: &[u8]) -> Result<u16, &'static str> {
+    let fs_id = alloc_fsid();
+    let ops: &'static dyn VnodeOps = &userfs::UserFs;
+    mount(mp, fs_id, 1, ops)
+}
+
+/// True if `path` (or any ancestor) is covered by a userfs mount, i.e. the
+/// path must be resolved through the IPC-forwarding bridge rather than the
+/// in-kernel ramfs.
+pub fn is_userfs_path(path: &[u8]) -> bool {
+    let mt = MOUNT_TABLE.lock();
+    mt.find_mount(path)
+        .map(|(mnt, _)| core::ptr::eq(mnt.ops, &userfs::UserFs as &dyn VnodeOps))
+        .unwrap_or(false)
 }
 
 pub fn path_to_vnode(path: &[u8]) -> Result<u16, &'static str> {
