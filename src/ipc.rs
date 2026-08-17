@@ -527,6 +527,19 @@ pub fn ipc_recv_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
     ipc_recv_ex_impl(port_id, buf, max_len, false)
 }
 
+/// User-space syscall wrapper for `ipc_recv_ex`: packs (len, reply_id) into
+/// a single i64 so the syscall ABI (single return register) can carry both.
+/// The reply token is returned in the high 32 bits, the length in the low 32.
+pub fn ipc_recv_ex_user(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
+    let (len, reply_id) = ipc_recv_ex_impl(port_id, buf, max_len, false);
+    if len < 0 {
+        return len;
+    }
+    let rl = if len > i64::from(u32::MAX) { u32::MAX as i64 } else { len };
+    let rid = (reply_id & 0xFFFF_FFFF) << 32;
+    rid as i64 | rl
+}
+
 /// In-kernel variant of `ipc_recv_ex`: `buf` lives in kernel space, so the
 /// user-range check is skipped. Used by kernel service tasks.
 pub fn ipc_recv_ex_internal(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
