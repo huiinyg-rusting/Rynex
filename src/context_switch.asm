@@ -9,6 +9,7 @@
 .extern SYSCALL_USER_FS_BASE
 .extern CURRENT_SYSCALL_STACK_TOP
 .extern SYSCALL_CALLEE_REGS
+.extern check_deliver_signal
 
 .text
 
@@ -93,6 +94,17 @@ syscall_entry:
     mov rdi, rax          // rdi = syscall_num
     
     call syscall_handler
+    
+    // Signal delivery hook: pass the kernel stack holding this syscall's saved
+    // user regs (rdi) and the syscall return value (rsi). check_deliver_signal
+    // may rewrite the saved slots so the normal restore below resumes at a
+    // signal handler (or resumes from rt_sigreturn) instead of the syscall
+    // site. It balances its own stack frame, so rsp still points at arg6.
+    mov rdi, rsp
+    push rax              // keep syscall return value in rax across the call
+    mov rsi, rax
+    call check_deliver_signal
+    pop rax               // user rax must be the syscall return value
     
     add rsp, 8            // Remove arg6
     pop r10               // Restore user RSP (preserved across C call)
