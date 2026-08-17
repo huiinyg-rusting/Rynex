@@ -2379,19 +2379,43 @@ fn sys_dma_free(packed: u64) -> i64 {
     let idx = unsafe { task_idx(id) };
     let pml4 = unsafe { TASKS[idx].pml4 };
 
-    // Unmap one page (drivers allocate a single page in practice).
-    let _ = crate::paging::PageTableManager::unmap_into(pml4, vaddr as u64);
-    // Clear the VMA entry.
+    // Find VMA to get the allocation size, then compute order.
+    let mut order = 0usize;
+    let mut found_vma = false;
     for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
         if vma.start == vaddr as u64 {
+            let size = vma.end - vma.start;
+            if size > 0 {
+                // size is power-of-two pages * 4096
+                let pages = size / 0x1000;
+                if pages > 0 {
+                    order = (pages as u32).next_power_of_two().trailing_zeros() as usize;
+                }
+            }
             vma.start = 0;
             vma.end = 0;
             vma.flags = 0;
+            found_vma = true;
             break;
         }
     }
+    if !found_vma {
+        crate::serial::write_str("BUDDY: dma_free VMA not found for vaddr=0x");
+        crate::serial::write_hex(vaddr as u64);
+        crate::serial::write_str("
+");
+        return -EINVAL;
+    }
+
+    // Unmap all pages in the range.
+    let mut off = 0u64;
+    while off < (1u64 << order) * 0x1000 {
+        let _ = crate::paging::PageTableManager::unmap_into(pml4, (vaddr + off) as u64);
+        off += 0x1000;
+    }
+
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    alloc.free(phys << 12, 0);
+    alloc.free(phys << 12, order);
     0
 }
 
