@@ -34,7 +34,6 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
-static FASTBOOT: AtomicBool = AtomicBool::new(true);
 
 extern "C" {
     fn syscall_entry();
@@ -52,8 +51,8 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     // Console log level. DEBUG traces (SYS>, [RSM:], mmap VMA/MMAP/CTX, execve
     // markers) are *always* captured in the klog ring buffer (queryable via
     // klog::dump() on a fault); they are mirrored to the serial port only when
-    // the level is DEBUG. Set to LOG_DEBUG here (and reflash) to see them live.
-    klog::set_console_level(klog::LOG_DEBUG);
+    // the level is DEBUG. Set to LOG_WARNING here (and reflash) to see them live.
+    klog::set_console_level(klog::LOG_WARNING);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("Rynex kernel v0.0.1 Alpha\n");
     }
@@ -231,18 +230,7 @@ memory::init(_info);
 
     task::init_scheduler();
 
-    // Service-ification self-test: run a kernel service (ping) as its own task
-    // and a kernel client task that performs synchronous request/reply IPC.
-    // This exercises ipc_call/ipc_reply between separate kernel tasks.
-    // Register them to be spawned AFTER the scheduler handoff so they don't
-    // starve init (which is set to Running directly, not enqueued).
-    services::register(b"ping", services::ping_handler);
-    task::register_kernel_task_default(services::ping_server_task as u64, b"ping_server");
-    if !FASTBOOT.load(Ordering::Relaxed) {
-        task::register_kernel_task_default(services::ipc_roundtrip_selftest as u64, b"ipc_selftest");
-    }
-
-    task::test();
+    task::boot_userland();
 
     vga::write_str("\nSystem halted.\n");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
@@ -252,11 +240,6 @@ memory::init(_info);
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
     }
-}
-
-extern "C" fn kernel_probe() -> ! {
-    crate::serial::write_str("KPROBE: kernel task alive\n");
-    loop { crate::task::yield_now(); }
 }
 
 #[panic_handler]
