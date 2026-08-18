@@ -147,31 +147,6 @@ fn handle_with_reply(port_id: u64, request: &[u8], reply_id: u64) -> i64 {
     result
 }
 
-/// Background service loop for a name. Blocks on the service port and handles
-/// each request as it arrives. Used for services that run as their own task.
-pub fn serve(name: &[u8]) -> ! {
-    let port = match ipc::ipc_connect(name.as_ptr(), name.len()) {
-        p if p >= 0 => p as u64,
-        _ => {
-            serial::write_str("SVC: no port for '");
-            serial::write_str(&alloc::format!("{}", core::str::from_utf8(name).unwrap_or("?")));
-            serial::write_str("'\n");
-            loop { unsafe { core::arch::asm!("hlt", options(nostack, nomem)); } }
-        }
-    };
-    loop {
-        let mut buf = [0u8; MAX_REQUEST];
-        let (n, reply_id) = ipc::ipc_recv_ex_internal(port, buf.as_mut_ptr(), MAX_REQUEST);
-        serial::write_str("SVC: recv n=");
-        serial::write_dec(n as u64);
-        serial::write_str(" rid=");
-        serial::write_dec(reply_id);
-        serial::write_str("\n");
-        if n < 0 { continue; }
-        handle_with_reply(port, &buf[..n as usize], reply_id);
-    }
-}
-
 // ── Built-in handlers ────────────────────────────────────────────
 // These are the phase-1 in-kernel implementations of each service. Each maps
 // the IPC request wire format to the existing subsystem (vfs_core, tty).
@@ -257,68 +232,6 @@ pub fn proc_handler(req: &[u8], _reply_id: u64) -> i64 {
     if req.len() < 8 { return -crate::task::EINVAL; }
     let op = read_u64(req, 0);
     if op == 0 { 0 } else { -crate::task::EINVAL }
-}
-
-/// `ping` service: echoes the request payload back to the caller via the IPv6
-/// reply channel. Used to exercise synchronous request/reply IPC end-to-end
-/// between two kernel tasks.
-pub fn ping_handler(req: &[u8], reply_id: u64) -> i64 {
-    if reply_id == 0 {
-        // Fire-and-forget: nothing to answer.
-        return req.len() as i64;
-    }
-    crate::ipc::ipc_reply(reply_id, req.as_ptr(), req.len())
-}
-
-/// Kernel service task that serves the `ping` port (used as a scheduling/
-/// IPC self-test alongside a client task).
-pub fn ping_server_task() -> ! {
-    crate::services::serve(b"ping")
-}
-
-/// Kernel task that performs an `ipc_call`/`ipc_reply` round-trip to the
-/// `ping` service and prints the result to the serial console. Serves as a
-/// smoke test that synchronous IPC works between separate kernel tasks.
-pub extern "C" fn ipc_roundtrip_selftest() -> ! {
-    let mut rounds: u32 = 0;
-    loop {
-        // Connect to the ping service and issue a synchronous call.
-        match crate::ipc::ipc_connect(b"ping".as_ptr(), 4) {
-            p if p >= 0 => {
-                let port = p as u64;
-                serial::write_str("SELFTEST: conn ok port=");
-                serial::write_dec(port);
-                serial::write_str(" calling\n");
-                let req = b"ping-IPC";
-                let mut out = [0u8; 64];
-                let n = crate::ipc::ipc_call_internal(
-                    port, req.as_ptr(), req.len(), out.as_mut_ptr(), out.len(),
-                );
-                serial::write_str("SELFTEST: ipc_call -> ");
-                serial::write_dec(n as u64);
-                if n >= 0 {
-                    serial::write_str(" '");
-                    for i in 0..(core::cmp::min(n, out.len() as i64) as usize) {
-                        let c = out[i];
-                        if c == 0 { break; }
-                        serial::write_char(c as char);
-                    }
-                    serial::write_str("'\n");
-                }
-            }
-            _ => {
-                serial::write_str("SELFTEST: ping service not found\n");
-            }
-        }
-        rounds += 1;
-        if rounds >= 3 {
-            serial::write_str("SELFTEST: done (3 rounds)\n");
-            loop { crate::task::yield_now(); }
-        }
-        // Slow the test loop so it doesn't spin on the console.
-        for _ in 0..100_000 { core::hint::spin_loop(); }
-        crate::task::yield_now();
-    }
 }
 
 fn read_u64(buf: &[u8], off: usize) -> u64 {

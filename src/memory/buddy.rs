@@ -64,6 +64,18 @@ fn used_clear(page: u64) {
             if DOUBLE_ALLOC_FIRST.compare_exchange(0, p, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
                 crate::serial::write_str("BUDDY: DOUBLE-FREE page=0x");
                 crate::serial::write_hex(p);
+                crate::serial::write_str(" addr=0x");
+                crate::serial::write_hex(p << 12);
+                unsafe {
+                    let mut rbp: u64;
+                    core::arch::asm!("mov {}, rbp", out(reg) rbp);
+                    let r0 = core::ptr::read((rbp + 8) as *const u64);
+                    let r1 = core::ptr::read((rbp + 16) as *const u64);
+                    crate::serial::write_str(" ret0=0x");
+                    crate::serial::write_hex(r0);
+                    crate::serial::write_str(" ret1=0x");
+                    crate::serial::write_hex(r1);
+                }
                 crate::serial::write_str("\n");
             }
         }
@@ -118,6 +130,19 @@ impl BuddyAllocator {
         }
     }
 
+
+    /// Check if a block at addr with given order is currently on the free list.
+    fn is_on_free_list(&self, addr: u64, order: usize) -> bool {
+        let mut curr = self.free_lists[order];
+        while !curr.is_null() {
+            if curr as u64 == addr {
+                return true;
+            }
+            unsafe { curr = (*curr).next; }
+        }
+        false
+    }
+
     fn free_one(&mut self, addr: u64, order: u8) {
         if !self.is_managed(addr) { return; }
         let mut cur = addr;
@@ -133,7 +158,7 @@ impl BuddyAllocator {
             }
             unsafe {
                 let h = &mut *(buddy as *mut Block);
-                if h.magic == MAGIC && h.order == o as u32 {
+                if h.magic == MAGIC && h.order == o as u32 && self.is_on_free_list(buddy, o as usize) {
                     self.remove_from_list(o as usize, h);
                     cur = if cur < buddy { cur } else { buddy };
                     o += 1;
@@ -144,6 +169,9 @@ impl BuddyAllocator {
         }
 
         unsafe {
+            if self.is_on_free_list(cur, o as usize) {
+                return;
+            }
             let h = &mut *(cur as *mut Block);
             h.magic = MAGIC;
             h.order = o as u32;
@@ -157,10 +185,23 @@ impl BuddyAllocator {
             let block = self.free_lists[o];
             if !block.is_null() {
                 let addr = block as u64;
+                let next = unsafe { (*block).next };
                 if self.is_reserved(addr) {
-                    // Skip reserved pages that somehow ended up in free lists
-                    self.free_lists[o] = unsafe { (*block).next };
-                    continue;
+                    // Skip reserved pages that somehow ended up in free lists.
+                    // Advance to the next block in the same order list instead
+                    // of skipping the rest of this order.
+                    self.free_lists[o] = next;
+                    if !next.is_null() {
+                        continue;
+                    }
+                    break;
+                }
+                // Clear the header of the allocated block so it won't be mistaken for free during coalescing.
+                unsafe {
+                    let h = &mut *(addr as *mut Block);
+                    h.magic = 0;
+                    h.order = 0;
+                    h.next = ptr::null_mut();
                 }
                 let pidx = self.page_index(addr);
                 if used_set(pidx) {
@@ -174,7 +215,7 @@ impl BuddyAllocator {
                     }
                 }
                 used_mark(pidx);
-                self.free_lists[o] = unsafe { (*block).next };
+                self.free_lists[o] = next;
 
                 for so in (order..o).rev() {
                     let buddy = addr + Self::block_size(so);
@@ -243,6 +284,45 @@ impl BuddyAllocator {
         self.pages
     }
 
+    pub fn free_page_count(&self) -> u64 {
+        let mut total = 0u64;
+        for o in 0..=MAX_ORDER {
+            let mut curr = self.free_lists[o];
+            while !curr.is_null() {
+                total += (1u64 << o) * (4096 / 4096);
+                unsafe { curr = (*curr).next; }
+            }
+        }
+        total
+    }
+
+    pub fn free_pages_by_order(&self) -> [u64; MAX_ORDER + 1] {
+        let mut counts = [0u64; MAX_ORDER + 1];
+        for o in 0..=MAX_ORDER {
+            let mut curr = self.free_lists[o];
+            while !curr.is_null() {
+                counts[o] += 1;
+                unsafe { curr = (*curr).next; }
+            }
+        }
+        counts
+    }
+
+    pub fn used_page_count(&self) -> u64 {
+        let mut total = 0u64;
+        let end = ((self.base + self.pages * PAGE_SIZE - 1) / PAGE_SIZE) as usize + 1;
+        for w in 0..USED_BMP_WORDS {
+            let base_page = w as u64 * 64;
+            if base_page >= end as u64 { break; }
+            unsafe { total += USED_BMP[w].count_ones() as u64; }
+        }
+        total
+    }
+
+    pub fn reserved_count(&self) -> u64 {
+        self.reserved_count as u64
+    }
+
     pub fn reserve(&mut self, addr: u64) {
         // Idempotent: the same page may be reserved multiple times (e.g. the
         // mallocng meta page shared across fork COW copies).
@@ -254,8 +334,15 @@ impl BuddyAllocator {
         if self.reserved_count < MAX_RESERVED {
             self.reserved[self.reserved_count] = addr;
             self.reserved_count += 1;
-            // Also ensure it's not in free lists
+            // Also ensure it's not in free lists and mark it used so a later
+            // used_clear (via free/free_reserved) won't report a false DOUBLE-FREE.
             self.mark_allocated(addr, PAGE_SIZE);
+            let pidx = self.page_index(addr);
+            if used_set(pidx) {
+                // If it was already marked used, it was genuinely in use; keep as is.
+            } else {
+                used_mark(pidx);
+            }
         }
     }
 

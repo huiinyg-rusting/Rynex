@@ -2219,6 +2219,21 @@ fn sys_fs_mount(mp: *const u8) -> i64 {
 // Microkernel seam #2: drivers map device MMIO and DMA buffers into their own
 // address space, and walk PCI config space, all under kernel supervision.
 
+/// Apply `f` to the mutable vmas array of every task sharing `pml4` (the
+/// whole process, including CLONE_VM threads). CLONE_VM threads share one
+/// page table, so their per-task vma arrays must be kept identical; otherwise
+/// a mapping created by one thread is invisible to another thread's demand
+/// paging, which is exactly the mallocng PAGE_FAULT root cause (a munmap by
+/// one thread cleared PTEs in the shared pml4 while a sibling's vma list
+/// was left stale, so handle_demand_page returned false and fatally faulted).
+unsafe fn for_each_pml4_vmas(pml4: u64, mut f: impl FnMut(&mut [Vma; MAX_VMAS])) {
+    for i in 0..MAX_TASKS {
+        if TASKS[i].id != 0 && TASKS[i].pml4 == pml4 {
+            f(&mut TASKS[i].vmas);
+        }
+    }
+}
+
 /// Map a physical range into the calling process. `phys` is page-aligned,
 /// `size` is rounded up to pages. Returns the user virtual address or a negated
 /// errno. The mapping is marked uncached via PTE_NO_CACHE where available.
@@ -2281,14 +2296,19 @@ fn sys_phys_map(phys: u64, size: u64) -> i64 {
     }
 
     // Register a VMA so demand paging / teardown knows about the range.
-    for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
-        if vma.start == 0 && vma.end == 0 {
-            vma.start = chosen;
-            vma.end = chosen + size;
-            vma.flags = flags;
-            break;
+    // Must register in every CLONE_VM sibling so their per-task vma arrays
+    // stay identical; otherwise a sibling's handle_demand_page finds no VMA
+    // for the mapping and fatally faults.
+    for_each_pml4_vmas(pml4, |vmas| {
+        for vma in vmas.iter_mut() {
+            if vma.start == 0 && vma.end == 0 {
+                vma.start = chosen;
+                vma.end = chosen + size;
+                vma.flags = flags;
+                break;
+            }
         }
-    }
+    });
     chosen as i64
 }
 
@@ -2353,14 +2373,19 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
         }
         off += 0x1000;
     }
-    for vma in unsafe { TASKS[idx].vmas.iter_mut() } {
-        if vma.start == 0 && vma.end == 0 {
-            vma.start = chosen;
-            vma.end = chosen + size;
-            vma.flags = flags;
-            break;
+    // Register a VMA so demand paging / teardown knows about the range.
+    // Must register in every CLONE_VM sibling so their per-task vma arrays
+    // stay identical.
+    for_each_pml4_vmas(pml4, |vmas| {
+        for vma in vmas.iter_mut() {
+            if vma.start == 0 && vma.end == 0 {
+                vma.start = chosen;
+                vma.end = chosen + size;
+                vma.flags = flags;
+                break;
+            }
         }
-    }
+    });
     // Pack: high 32 bits = phys page number, low 32 bits = user vaddr.
     let phys_hi = (phys >> 12) & 0xFFFF_FFFF;
     ((phys_hi << 32) | (chosen & 0xFFFF_FFFF)) as i64
@@ -2392,12 +2417,27 @@ fn sys_dma_free(packed: u64) -> i64 {
                     order = (pages as u32).next_power_of_two().trailing_zeros() as usize;
                 }
             }
+            found_vma = true;
+            // Clear the VMA entry AFTER reading size.
             vma.start = 0;
             vma.end = 0;
             vma.flags = 0;
-            found_vma = true;
             break;
         }
+    }
+    if found_vma {
+        // Also clear the VMA in every sibling's array so that other threads
+        // sharing this pml4 see the mapping removed.
+        for_each_pml4_vmas(pml4, |vmas| {
+            for vma in vmas.iter_mut() {
+                if vma.start == vaddr as u64 {
+                    vma.start = 0;
+                    vma.end = 0;
+                    vma.flags = 0;
+                    break;
+                }
+            }
+        });
     }
     if !found_vma {
         crate::serial::write_str("BUDDY: dma_free VMA not found for vaddr=0x");
@@ -3224,16 +3264,21 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         // crate::serial::write_str("\n");
 
         // Register VMA for demand paging
+        // Must register in every CLONE_VM sibling so their per-task vma arrays
+        // stay identical; otherwise a sibling's handle_demand_page finds no VMA
+        // for the mapping and fatally faults.
         let mut vma_added = false;
-        for vma in TASKS[idx].vmas.iter_mut() {
-            if vma.start == 0 && vma.end == 0 {
-                vma.start = final_addr;
-                vma.end = final_addr + size;
-                vma.flags = pte_flags;
-                vma_added = true;
-                break;
+        for_each_pml4_vmas(pml4, |vmas| {
+            for vma in vmas.iter_mut() {
+                if vma.start == 0 && vma.end == 0 {
+                    vma.start = final_addr;
+                    vma.end = final_addr + size;
+                    vma.flags = pte_flags;
+                    vma_added = true;
+                    break;
+                }
             }
-        }
+        });
         if !vma_added {
             if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
                 crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
@@ -3555,7 +3600,23 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
         let parent = &TASKS[parent_idx];
         let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
             Some(s) => s,
-            None => return -ENOMEM,
+            None => {
+                let alloc = unsafe { &mut *crate::memory::allocator() };
+                serial::write_str("SYS_CLONE: alloc_stack FAILED free_pages=");
+                serial::write_dec(alloc.free_page_count());
+                serial::write_str(" used=");
+                serial::write_dec(alloc.used_page_count());
+                serial::write_str(" reserved=");
+                serial::write_dec(alloc.reserved_count());
+                serial::write_str(" orders=");
+                let counts = alloc.free_pages_by_order();
+                for o in 0..=10 {
+                    serial::write_dec(counts[o]);
+                    serial::write_str("/");
+                }
+                serial::write_str("\n");
+                return -ENOMEM;
+            }
         };
 
         // CLONE_VM: share the parent's PML4 (no COW fork).
@@ -5971,7 +6032,7 @@ fn create_applet_links() {
     }
 }
 
-pub fn test() {
+pub fn boot_userland() {
     unsafe { core::arch::asm!("cli"); }
 
     // Initialize TTY devices FIRST (before creating any user tasks)

@@ -109,6 +109,11 @@ pub fn init(info_addr: u32) {
     }
 
     TOTAL_PAGES.store(pages, Ordering::SeqCst);
+    crate::serial::write_str("MEM: base=0x");
+    crate::serial::write_hex(base);
+    crate::serial::write_str(" pages=");
+    crate::serial::write_dec(pages);
+    crate::serial::write_str("\n");
 }
 
 unsafe fn add_free_region_skipping(start: u64, end: u64,
