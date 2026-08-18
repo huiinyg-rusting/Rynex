@@ -2299,16 +2299,18 @@ fn sys_phys_map(phys: u64, size: u64) -> i64 {
     // Must register in every CLONE_VM sibling so their per-task vma arrays
     // stay identical; otherwise a sibling's handle_demand_page finds no VMA
     // for the mapping and fatally faults.
-    for_each_pml4_vmas(pml4, |vmas| {
-        for vma in vmas.iter_mut() {
-            if vma.start == 0 && vma.end == 0 {
-                vma.start = chosen;
-                vma.end = chosen + size;
-                vma.flags = flags;
-                break;
+    unsafe {
+        for_each_pml4_vmas(pml4, |vmas| {
+            for vma in vmas.iter_mut() {
+                if vma.start == 0 && vma.end == 0 {
+                    vma.start = chosen;
+                    vma.end = chosen + size;
+                    vma.flags = flags;
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
     chosen as i64
 }
 
@@ -2376,16 +2378,18 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     // Register a VMA so demand paging / teardown knows about the range.
     // Must register in every CLONE_VM sibling so their per-task vma arrays
     // stay identical.
-    for_each_pml4_vmas(pml4, |vmas| {
-        for vma in vmas.iter_mut() {
-            if vma.start == 0 && vma.end == 0 {
-                vma.start = chosen;
-                vma.end = chosen + size;
-                vma.flags = flags;
-                break;
+    unsafe {
+        for_each_pml4_vmas(pml4, |vmas| {
+            for vma in vmas.iter_mut() {
+                if vma.start == 0 && vma.end == 0 {
+                    vma.start = chosen;
+                    vma.end = chosen + size;
+                    vma.flags = flags;
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
     // Pack: high 32 bits = phys page number, low 32 bits = user vaddr.
     let phys_hi = (phys >> 12) & 0xFFFF_FFFF;
     ((phys_hi << 32) | (chosen & 0xFFFF_FFFF)) as i64
@@ -2428,16 +2432,18 @@ fn sys_dma_free(packed: u64) -> i64 {
     if found_vma {
         // Also clear the VMA in every sibling's array so that other threads
         // sharing this pml4 see the mapping removed.
-        for_each_pml4_vmas(pml4, |vmas| {
-            for vma in vmas.iter_mut() {
-                if vma.start == vaddr as u64 {
-                    vma.start = 0;
-                    vma.end = 0;
-                    vma.flags = 0;
-                    break;
+        unsafe {
+            for_each_pml4_vmas(pml4, |vmas| {
+                for vma in vmas.iter_mut() {
+                    if vma.start == vaddr as u64 {
+                        vma.start = 0;
+                        vma.end = 0;
+                        vma.flags = 0;
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
     }
     if !found_vma {
         crate::serial::write_str("BUDDY: dma_free VMA not found for vaddr=0x");
@@ -4535,6 +4541,40 @@ fn sys_brk(addr: u64) -> i64 {
             }
         }
 
+        // ── 新增：将 brk VMA 同步到所有 CLONE_VM 共享该 pml4 的任务 ──
+        let pml4 = TASKS[idx].pml4;
+        for_each_pml4_vmas(pml4, |vmas| {
+            let mut found = false;
+            for v in vmas.iter() {
+                if v.start == brk_start {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                for v in vmas.iter_mut() {
+                    if v.start == 0 && v.end == 0 {
+                        v.start = brk_start;
+                        v.end = brk_start;
+                        v.flags = crate::paging::PTE_PRESENT
+                            | crate::paging::PTE_WRITABLE
+                            | crate::paging::PTE_USER
+                            | crate::paging::PTE_NO_EXECUTE;
+                        break;
+                    }
+                }
+            }
+        });
+        for_each_pml4_vmas(pml4, |vmas| {
+            for v in vmas.iter_mut() {
+                if v.start == brk_start {
+                    v.end = addr;
+                    break;
+                }
+            }
+        });
+        // ── 同步结束 ──
+
         // Pre-allocate zeroed pages for the extended brk range to overwrite
         // stale identity-map PTEs inherited from the bootloader (PML4[0]).
         if addr > old_end {
@@ -5772,35 +5812,44 @@ pub fn current_task_pml4() -> u64 {
 
 /// Handle demand paging for mmap'd (or brk) regions.
 /// Returns true if the page was allocated and mapped.
+/// CLONE_VM threads share one pml4; their per-task vma arrays must be kept
+/// identical. We scan every task sharing `pml4` rather than only the current
+/// task's copy, so a mapping registered by a sibling is visible here.
 pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
     let id = CURRENT_TASK.load(Ordering::SeqCst);
     if id == 0 { return false; }
     unsafe {
-        let idx = task_idx(id);
-        for vma in &TASKS[idx].vmas {
-            if vma.start == 0 && vma.end == 0 { continue; }
-            if cr2 >= vma.start && cr2 < vma.end {
-                let alloc = &mut *crate::memory::allocator();
-                let phys = match alloc.alloc(0) {
-                    Some(p) => p,
-                    None => return false,
-                };
-                // Zero the page so heap metadata (musl malloc) works correctly
-                core::ptr::write_bytes(phys as *mut u8, 0, 4096);
-                let page_addr = cr2 & !0xFFF;
-                if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
-                    return false;
+        // Scan every task that shares this pml4 (the whole process). CLONE_VM
+        // threads have identical page tables, so a VMA registered by any sibling
+        // must be found here, otherwise the sibling's page fault is fatal (the
+        // root cause of the mallocng PAGE_FAULT bug).
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id == 0 || TASKS[i].pml4 != pml4 { continue; }
+            for vma in &TASKS[i].vmas {
+                if vma.start == 0 && vma.end == 0 { continue; }
+                if cr2 >= vma.start && cr2 < vma.end {
+                    let alloc = &mut *crate::memory::allocator();
+                    let phys = match alloc.alloc(0) {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                    // Zero the page so heap metadata (musl malloc) works correctly
+                    core::ptr::write_bytes(phys as *mut u8, 0, 4096);
+                    let page_addr = cr2 & !0xFFF;
+                    if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
+                        return false;
+                    }
+                    if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
+                        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_PAGING);
+                        crate::klog::s("  DMD: allocated page for 0x");
+                        crate::klog::hex(page_addr);
+                        crate::klog::s(" phys=0x");
+                        crate::klog::hex(phys);
+                        crate::klog::s("\n");
+                        crate::klog::end();
+                    }
+                    return true;
                 }
-                if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                    crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_PAGING);
-                    crate::klog::s("  DMD: allocated page for 0x");
-                    crate::klog::hex(page_addr);
-                    crate::klog::s(" phys=0x");
-                    crate::klog::hex(phys);
-                    crate::klog::s("\n");
-                    crate::klog::end();
-                }
-                return true;
             }
         }
     }
