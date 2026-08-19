@@ -5,6 +5,7 @@
 #![feature(allocator_api)]
 #![feature(panic_info_message)]
 #![feature(naked_functions)]
+#![feature(core_intrinsics)]
 
 extern crate alloc;
 mod paging;

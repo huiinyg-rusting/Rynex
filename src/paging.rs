@@ -319,7 +319,7 @@ impl PageTableManager {
             (pml4e & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PDPT")?;
+            let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PDPT")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pml4e_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
             unsafe { (*pml4).0[vpn[0]] = pml4e_val; }
@@ -332,7 +332,7 @@ impl PageTableManager {
             (pdpte & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PD")?;
+            let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PD")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pdpte_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
             unsafe { (*pdpt).0[vpn[1]] = pdpte_val; }
@@ -345,7 +345,7 @@ impl PageTableManager {
             (pde & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let alloc = unsafe { &mut *crate::memory::allocator() };
-            let new_pt = alloc.alloc(0).ok_or("OOM: PT")?;
+            let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PT")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
             unsafe { (*pd).0[vpn[2]] = pde_val; }
@@ -532,7 +532,7 @@ pub fn default_flags(user: bool) -> u64 {
 pub fn init() {
     unsafe {
         let alloc = &mut *crate::memory::allocator();
-        PT_MGR.kernel_pml4 = alloc.alloc(0).unwrap();
+        PT_MGR.kernel_pml4 = alloc.alloc_zeroed_page().unwrap();
         KERNEL_PML4.store(PT_MGR.kernel_pml4, Ordering::SeqCst);
         let pml4 = unsafe { &mut *(PT_MGR.kernel_pml4 as *mut PageTable) };
         pml4.clear();
@@ -711,6 +711,41 @@ pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str>
 // are never touched.
 pub fn free_address_space(pml4: u64, free_ro: bool) {
     let alloc = unsafe { &mut *crate::memory::allocator() };
+    let base = crate::memory::buddy::alloc_base();
+    let end = base + crate::memory::buddy::alloc_pages() * crate::memory::buddy::PAGE_SIZE;
+    // Guard against walking a bogus pml4: it must be a real allocated page
+    // within the managed range and marked used by the buddy. A corrupted
+    // TASKS[idx].pml4 (e.g. pointing into the module/ramfs area) would make
+    // this walk read arbitrary data as page tables and free pages that were
+    // never allocated, corrupting the buddy free lists (the DOUBLE-FREE bug).
+    if pml4 < base || pml4 >= end || !crate::memory::buddy::page_is_used(pml4) {
+        crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+        crate::klog::s("FAS: BAD PML4 pml4=0x");
+        crate::klog::hex(pml4);
+        crate::klog::s(" caller=0x");
+        crate::klog::hex(core::intrinsics::return_address() as u64);
+        crate::klog::s(" task=");
+        crate::klog::dec(crate::task::current_task_id());
+        crate::klog::s(" in_range=");
+        crate::klog::dec(if pml4 >= base && pml4 < end { 1 } else { 0 });
+        crate::klog::s(" used=");
+        crate::klog::dec(if crate::memory::buddy::page_is_used(pml4) { 1 } else { 0 });
+        crate::klog::end();
+        if pml4 >= base && pml4 < end {
+            unsafe {
+                let t = &*(pml4 as *const PageTable);
+                for i in 0..8 {
+                    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                    crate::klog::s("FAS: pml4e[");
+                    crate::klog::dec(i as u64);
+                    crate::klog::s("]=0x");
+                    crate::klog::hex(t.0[i]);
+                    crate::klog::end();
+                }
+            }
+        }
+        return;
+    }
     unsafe {
         let table = &*(pml4 as *const PageTable);
         for pml4_idx in 0..256 {
@@ -718,19 +753,45 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
             if pml4e & PTE_PRESENT == 0 { continue; }
             let pdpt = (pml4e & PTE_ADDR_MASK) as *mut PageTable;
 
-            let mut pdpt_user = false;
+let mut pdpt_user = false;
             for pdpt_idx in 0..512 {
                 let pdpte = (*pdpt).0[pdpt_idx];
                 if pdpte & PTE_PRESENT == 0 { continue; }
                 if pdpte & PTE_HUGE != 0 { continue; } // 1G kernel identity
-                let pd = (pdpte & PTE_ADDR_MASK) as *mut PageTable;
+                let pdpt_phys = pdpte & PTE_ADDR_MASK;
+                if pdpt_phys < base || pdpt_phys >= end || !crate::memory::buddy::page_is_used(pdpt_phys) {
+                    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                    crate::klog::s("FAS: BAD PDPT pml4=0x");
+                    crate::klog::hex(pml4);
+                    crate::klog::s(" pdpt_idx=");
+                    crate::klog::dec(pdpt_idx as u64);
+                    crate::klog::s(" pdpt_phys=0x");
+                    crate::klog::hex(pdpt_phys);
+                    crate::klog::end();
+                    continue;
+                }
+                let pd = pdpt_phys as *mut PageTable;
 
                 let mut pd_user = false;
                 for pd_idx in 0..512 {
                     let pde = (*pd).0[pd_idx];
                     if pde & PTE_PRESENT == 0 { continue; }
                     if pde & PTE_HUGE != 0 { continue; } // 2M kernel identity
-                    let pt = (pde & PTE_ADDR_MASK) as *mut PageTable;
+                    let pd_phys = pde & PTE_ADDR_MASK;
+                    if pd_phys < base || pd_phys >= end || !crate::memory::buddy::page_is_used(pd_phys) {
+                        crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                        crate::klog::s("FAS: BAD PD pml4=0x");
+                        crate::klog::hex(pml4);
+                        crate::klog::s(" pdpt_idx=");
+                        crate::klog::dec(pdpt_idx as u64);
+                        crate::klog::s(" pd_idx=");
+                        crate::klog::dec(pd_idx as u64);
+                        crate::klog::s(" pd_phys=0x");
+                        crate::klog::hex(pd_phys);
+                        crate::klog::end();
+                        continue;
+                    }
+                    let pt = pd_phys as *mut PageTable;
 
                     let mut pt_user = false;
                     for pt_idx in 0..512 {
@@ -740,6 +801,60 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                         // sub-pages (non-USER) map physical memory and are shared.
                         if pte & PTE_USER != 0 {
                             let phys = pte & PTE_ADDR_MASK;
+                            // DOUBLE-FREE/pml4-corruption diagnostics:
+                            // detect pages that are out of the managed RAM range
+                            // (garbage PTE) or in range but never marked used.
+                            if phys < base || phys >= end {
+                                crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                                crate::klog::s("FAS: OOB PTE pml4=0x");
+                                crate::klog::hex(pml4);
+                                crate::klog::s(" pos=");
+                                crate::klog::dec(pml4_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pdpt_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pd_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pt_idx as u64);
+                                crate::klog::s(" pte=0x");
+                                crate::klog::hex(pte);
+                                crate::klog::s(" phys=0x");
+                                crate::klog::hex(phys);
+                                crate::klog::s(" task=");
+                                crate::klog::dec(crate::task::current_task_id());
+                                crate::klog::end();
+                                continue;
+                            }
+                            let pidx = (phys >> 12) as usize;
+                            if !crate::memory::buddy::page_is_used(phys) {
+                                crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                                crate::klog::s("FAS: UNUSED pml4=0x");
+                                crate::klog::hex(pml4);
+                                crate::klog::s(" pos=");
+                                crate::klog::dec(pml4_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pdpt_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pd_idx as u64);
+                                crate::klog::s("/");
+                                crate::klog::dec(pt_idx as u64);
+                                crate::klog::s(" phys=0x");
+                                crate::klog::hex(phys);
+                                crate::klog::s(" pidx=");
+                                crate::klog::dec(pidx as u64);
+                                crate::klog::s(" pte=0x");
+                                crate::klog::hex(pte);
+                                let (fc, ft, fo) = crate::memory::buddy::df_info(phys);
+                                crate::klog::s(" first_caller=0x");
+                                crate::klog::hex(fc as u64);
+                                crate::klog::s(" first_tick=");
+                                crate::klog::dec(ft as u64);
+                                crate::klog::s(" first_order=");
+                                crate::klog::dec(fo as u64);
+                                crate::klog::s(" task=");
+                                crate::klog::dec(crate::task::current_task_id());
+                                crate::klog::end();
+                            }
                             if pte & PTE_WRITABLE != 0 || free_ro {
                                 // Release this reference: if the page is still
                                 // shared with another task, drop our refcount;
@@ -747,7 +862,10 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                                 if refc_get(phys) > 0 {
                                     refc_dec(phys);
                                 } else {
-                                    alloc.free(phys, 0);
+                                    // Guard: skip free if phys is OOB or never marked used
+                                    if phys >= base && phys < end && crate::memory::buddy::page_is_used(phys) {
+                                        alloc.free(phys, 0);
+                                    }
                                 }
                             } else if refc_get(phys) > 0 {
                                 // Read-only leaf in a fork clone being torn down
@@ -759,7 +877,9 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                                 // other owner already copied it away (e.g. the
                                 // parent un-COW'd its copy), so this page is
                                 // orphaned. Free it.
-                                alloc.free(phys, 0);
+                                if phys >= base && phys < end && crate::memory::buddy::page_is_used(phys) {
+                                    alloc.free(phys, 0);
+                                }
                             }
                             pt_user = true;
                         }
@@ -770,7 +890,7 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                         let pt_phys = pde & PTE_ADDR_MASK;
                         if refc_get(pt_phys) > 0 {
                             refc_dec(pt_phys);
-                        } else {
+                        } else if pt_phys >= base && pt_phys < end && crate::memory::buddy::page_is_used(pt_phys) {
                             alloc.free(pt_phys, 0);
                         }
                         pd_user = true;
@@ -780,7 +900,7 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                     let pd_phys = pdpte & PTE_ADDR_MASK;
                     if refc_get(pd_phys) > 0 {
                         refc_dec(pd_phys);
-                    } else {
+                    } else if pd_phys >= base && pd_phys < end && crate::memory::buddy::page_is_used(pd_phys) {
                         alloc.free(pd_phys, 0);
                     }
                     pdpt_user = true;
@@ -790,12 +910,15 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
                 let pdpt_phys = pml4e & PTE_ADDR_MASK;
                 if refc_get(pdpt_phys) > 0 {
                     refc_dec(pdpt_phys);
-                } else {
+                } else if pdpt_phys >= base && pdpt_phys < end && crate::memory::buddy::page_is_used(pdpt_phys) {
                     alloc.free(pdpt_phys, 0);
                 }
             }
         }
-        alloc.free(pml4, 0); // PML4 itself
+        // Guard PML4 free
+        if pml4 >= base && pml4 < end && crate::memory::buddy::page_is_used(pml4) {
+            alloc.free(pml4, 0);
+        }
     }
 }
 
@@ -806,7 +929,7 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
 // map) stay shared writable.
 pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    let new_pml4 = alloc.alloc(0)?;
+    let new_pml4 = alloc.alloc_zeroed_page()?;
     unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
 
     let old_table = unsafe { &*(old_pml4 as *const PageTable) };
@@ -923,7 +1046,7 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
 
     // PDPT: copy if shared.
     if refc_get(pdpt_phys) > 0 {
-        let new_pdpt = alloc.alloc(0)?;
+        let new_pdpt = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pdpt_phys as *const u8, new_pdpt as *mut u8, 4096); }
         refc_dec(pdpt_phys);
         pml4_tbl.0[vpn[0]] = new_pdpt | (pml4e & !PTE_ADDR_MASK);
@@ -938,7 +1061,7 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
 
     // PD: copy if shared.
     if refc_get(pd_phys) > 0 {
-        let new_pd = alloc.alloc(0)?;
+        let new_pd = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pd_phys as *const u8, new_pd as *mut u8, 4096); }
         refc_dec(pd_phys);
         pdpt_tbl.0[vpn[1]] = new_pd | (pdpte & !PTE_ADDR_MASK);
@@ -953,7 +1076,7 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
 
     // PT: copy if shared.
     if refc_get(pt_phys) > 0 {
-        let new_pt = alloc.alloc(0)?;
+        let new_pt = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pt_phys as *const u8, new_pt as *mut u8, 4096); }
         refc_dec(pt_phys);
         pd_tbl.0[vpn[2]] = new_pt | (pde & !PTE_ADDR_MASK);
@@ -997,7 +1120,7 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
             crate::serial::write_hex(old_phys);
             crate::serial::write_str("\n");
         }
-        let new_phys = match alloc.alloc(0) {
+let new_phys = match alloc.alloc_zeroed_page() {
             Some(p) => p,
             None => return false,
         };
@@ -1025,7 +1148,7 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
 
     // Shared: copy the page and drop our reference to the shared original.
     refc_dec(old_phys);
-    let new_phys = match alloc.alloc(0) {
+    let new_phys = match alloc.alloc_zeroed_page() {
         Some(p) => p,
         None => return false,
     };
@@ -1088,14 +1211,14 @@ pub fn test() {
     let mgr = pt_mgr();
 
     let alloc = unsafe { &mut *crate::memory::allocator() };
-    let p = alloc.alloc(0).expect("OOM");
+    let p = alloc.alloc_zeroed_page().expect("OOM");
     mgr.map_page(0x4000_0000, p, PTE_PRESENT | PTE_WRITABLE).expect("map failed");
 
     let phys = mgr.translate(0x4000_0000).expect("translate failed");
     assert_eq!(phys, p);
     crate::serial::write_str("PAGING: map/translate 4K OK\n");
 
-    let p2 = alloc.alloc(0).expect("OOM");
+    let p2 = alloc.alloc_zeroed_page().expect("OOM");
     mgr.map_2m(0x5000_0000, p2, PTE_PRESENT | PTE_WRITABLE).expect("map 2M failed");
     let phys2 = mgr.translate(0x5000_0000).expect("translate 2M failed");
     assert_eq!(phys2, p2);
