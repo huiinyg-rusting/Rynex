@@ -325,13 +325,15 @@ impl VnodeOps for TtyDevice {
                 self.push_input(c);
                 continue;
             }
-            // No input available, enable interrupts briefly to allow timer/serial interrupts
+            // No input available. The kernel disables timer preemption inside a
+            // syscall (syscall_entry cli + timer_schedule's in_syscall() guard),
+            // so a bare spin here would monopolize the CPU and starve every
+            // other task (observed: a blocking console read in the runit shell
+            // service froze wthit's threads forever). Yield periodically so the
+            // scheduler runs other tasks; we re-check input on every resume.
             wait_count += 1;
             if wait_count % 100000 == 0 {
-                crate::serial::write_str("");
-            }
-            unsafe {
-                core::arch::asm!("sti; pause; cli", options(nostack, preserves_flags));
+                crate::task::yield_now_force();
             }
         }
     }
