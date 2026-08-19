@@ -7,7 +7,132 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: usize = 10;
 const MAX_RESERVED: usize = 2048;
 
-// ── DOUBLE-FREE diagnostics (temporary) ───────────────────────────
+// ── Page type tracking (2 bits per page, separate array) ────────────────────
+// Sized for up to 8 GiB of RAM (2^21 pages = 2,097,152)
+const MAX_REFC_PAGES: usize = 1 << 21;
+static mut PAGE_TYPE: [u8; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
+
+pub const PAGE_TYPE_FREE: u8 = 0;      // on free list
+pub const PAGE_TYPE_PTE: u8 = 1;       // page table page (PML4/PDPT/PD/PT)
+pub const PAGE_TYPE_DATA: u8 = 2;      // general data page
+pub const PAGE_TYPE_STACK: u8 = 3;     // kernel stack page
+
+#[inline(always)]
+pub fn page_type_get(addr: u64) -> u8 {
+    let idx = (addr >> 12) as usize;
+    if idx < MAX_REFC_PAGES {
+        unsafe { PAGE_TYPE[idx] }
+    } else {
+        PAGE_TYPE_FREE
+    }
+}
+
+pub fn page_type_set(addr: u64, t: u8) {
+    let idx = (addr >> 12) as usize;
+    if idx < MAX_REFC_PAGES {
+        unsafe { PAGE_TYPE[idx] = t; }
+    }
+}
+
+fn page_type_assert(addr: u64, expected: u8, context: &str) {
+    let actual = page_type_get(addr);
+    if actual != expected {
+        crate::serial::write_str("\n=== PAGE TYPE MISMATCH ===\n");
+        crate::serial::write_str("addr=0x");
+        crate::serial::write_hex(addr);
+        crate::serial::write_str(" expected=");
+        crate::serial::write_dec(expected as u64);
+        crate::serial::write_str(" actual=");
+        crate::serial::write_dec(actual as u64);
+        crate::serial::write_str(" ctx=");
+        crate::serial::write_str(context);
+        crate::serial::write_str(" cr3=0x");
+        crate::serial::write_hex(crate::task::current_task_pml4());
+        crate::serial::write_str(" task=");
+        crate::serial::write_dec(crate::task::current_task_id());
+        crate::serial::write_str("\n");
+    }
+}
+
+// ── Quarantine for freed page-table pages (breaks free→realloc cycle) ──────
+const QUARANTINE_INIT_CAP: usize = 256;    // 初始容量
+const QUARANTINE_MAX_CAP: usize = 1024;    // 最大扩容上限
+
+static mut QUARANTINE: [u64; QUARANTINE_MAX_CAP] = [0; QUARANTINE_MAX_CAP];
+static mut QUARANTINE_CAP: usize = QUARANTINE_INIT_CAP;
+static mut QUARANTINE_HEAD: usize = 0;
+static mut QUARANTINE_COUNT: usize = 0;
+static mut QUARANTINE_FULL_COUNT: u64 = 0;
+
+fn q_push(addr: u64) {
+    unsafe {
+        if QUARANTINE_COUNT < QUARANTINE_CAP {
+            QUARANTINE[QUARANTINE_HEAD] = addr;
+            QUARANTINE_HEAD = (QUARANTINE_HEAD + 1) % QUARANTINE_CAP;
+            QUARANTINE_COUNT += 1;
+        } else {
+            // 隔离区满：记录并丢弃（直接丢弃该页，不回收）
+            QUARANTINE_FULL_COUNT += 1;
+            if QUARANTINE_FULL_COUNT <= 10 || QUARANTINE_FULL_COUNT % 100 == 0 {
+                q_log_full();
+            }
+            // 动态扩容（仅前几次，且未达上限）
+            if QUARANTINE_CAP < QUARANTINE_MAX_CAP && QUARANTINE_FULL_COUNT <= 5 {
+                QUARANTINE_CAP = (QUARANTINE_CAP * 2).min(QUARANTINE_MAX_CAP);
+                crate::serial::write_str("QUARANTINE: expanded to ");
+                crate::serial::write_dec(QUARANTINE_CAP as u64);
+                crate::serial::write_str("\n");
+            }
+        }
+    }
+}
+
+fn q_pop() -> Option<u64> {
+    unsafe {
+        if QUARANTINE_COUNT == 0 { return None; }
+        let idx = (QUARANTINE_HEAD + QUARANTINE_MAX_CAP - QUARANTINE_COUNT) % QUARANTINE_MAX_CAP;
+        let addr = QUARANTINE[idx];
+        QUARANTINE_COUNT -= 1;
+        Some(addr)
+    }
+}
+
+fn q_log_full() {
+    crate::serial::write_str("\n=== QUARANTINE FULL ===\n");
+    crate::serial::write_str("count=");
+    crate::serial::write_dec(unsafe { QUARANTINE_COUNT as u64 });
+    crate::serial::write_str(" capacity=");
+    crate::serial::write_dec(unsafe { QUARANTINE_CAP as u64 });
+    crate::serial::write_str(" full_count=");
+    crate::serial::write_dec(unsafe { QUARANTINE_FULL_COUNT as u64 });
+    crate::serial::write_str(" cr3=0x");
+    crate::serial::write_hex(crate::task::current_task_pml4());
+    crate::serial::write_str(" task=");
+    crate::serial::write_dec(crate::task::current_task_id());
+    crate::serial::write_str("\n");
+}
+
+fn log_double_free(addr: u64, ctx: &str, order: usize, caller: u64) {
+    crate::serial::write_str("\n=== DOUBLE-FREE DETECTED ===\n");
+    crate::serial::write_str("addr=0x");
+    crate::serial::write_hex(addr);
+    crate::serial::write_str(" order=");
+    crate::serial::write_dec(order as u64);
+    crate::serial::write_str(" caller=0x");
+    crate::serial::write_hex(caller);
+    crate::serial::write_str(" ctx=");
+    crate::serial::write_str(ctx);
+    crate::serial::write_str(" type=");
+    crate::serial::write_dec(page_type_get(addr) as u64);
+    crate::serial::write_str(" used=");
+    crate::serial::write_dec(used_set((addr >> 12) as u64) as u64);
+    crate::serial::write_str(" cr3=0x");
+    crate::serial::write_hex(crate::task::current_task_pml4());
+    crate::serial::write_str(" task=");
+    crate::serial::write_dec(crate::task::current_task_id());
+    crate::serial::write_str("\n");
+}
+
 // Per-page record of the MOST RECENT free. When a page is freed twice without
 // an intervening alloc (used_clear sees an already-clear bit), the latch fires
 // and dumps the first free site so the DOUBLE-FREE root cause can be found.
@@ -257,6 +382,8 @@ impl BuddyAllocator {
                     }
                 }
 
+                // 通用数据页标记
+                page_type_set(addr, PAGE_TYPE_DATA);
                 return Some(addr);
             }
         }
@@ -264,9 +391,18 @@ impl BuddyAllocator {
     }
 
     /// Allocate a zeroed page (order 0) for page tables, guaranteeing clean PTEs.
+    /// First tries to reclaim from quarantine (FIFO), otherwise allocates fresh.
     pub fn alloc_zeroed_page(&mut self) -> Option<u64> {
+        // Try to reclaim from quarantine first (breaks free→realloc cycle)
+        if let Some(addr) = q_pop() {
+            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
+            page_type_set(addr, PAGE_TYPE_PTE);
+            return Some(addr);
+        }
+        // Fallback: fresh allocation
         self.alloc(0).map(|addr| {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
+            page_type_set(addr, PAGE_TYPE_PTE);
             addr
         })
     }
@@ -280,12 +416,22 @@ impl BuddyAllocator {
         }
         let pidx = self.page_index(addr);
         let caller = core::intrinsics::return_address() as u64;
-        if !used_set(pidx) {
+        let old_type = page_type_get(addr);
+        if !used_set(pidx) || old_type == PAGE_TYPE_FREE {
             df_latch(pidx, caller, order);
+            log_double_free(addr, "free", order, caller);
+            return;
         }
         used_clear(pidx);
+        page_type_set(addr, PAGE_TYPE_FREE);
         df_record(pidx, caller, order);
-        self.free_one(addr, order as u8);
+
+        // 页表页进入隔离区，延迟回收；其他直接释放
+        if order == 0 && old_type == PAGE_TYPE_PTE {
+            q_push(addr);
+        } else {
+            self.free_one(addr, order as u8);
+        }
     }
 
     pub fn mark_allocated(&mut self, start: u64, size: u64) {
@@ -409,12 +555,20 @@ impl BuddyAllocator {
         if self.unreserve(addr) {
             let pidx = self.page_index(addr);
             let caller = core::intrinsics::return_address() as u64;
-            if !used_set(pidx) {
+            let old_type = page_type_get(addr);
+            if !used_set(pidx) || old_type == PAGE_TYPE_FREE {
                 df_latch(pidx, caller, order);
+                log_double_free(addr, "free_reserved", order, caller);
+                return true;
             }
             used_clear(pidx);
+            page_type_set(addr, PAGE_TYPE_FREE);
             df_record(pidx, caller, order);
-            self.free_one(addr, order as u8);
+            if order == 0 && old_type == PAGE_TYPE_PTE {
+                q_push(addr);
+            } else {
+                self.free_one(addr, order as u8);
+            }
             true
         } else {
             false
