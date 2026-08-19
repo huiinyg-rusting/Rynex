@@ -888,8 +888,8 @@ let mut pdpt_user = false;
                         // PT page: if still shared (fork partner references it),
                         // drop our reference; otherwise it is ours to free.
                         let pt_phys = pde & PTE_ADDR_MASK;
-                        if refc_get(pt_phys) > 0 {
-                            refc_dec(pt_phys);
+                        if crate::memory::buddy::pte_refc_get(pt_phys) > 0 {
+                            crate::memory::buddy::pte_refc_dec(pt_phys);
                         } else if pt_phys >= base && pt_phys < end && crate::memory::buddy::page_is_used(pt_phys) {
                             alloc.free(pt_phys, 0);
                         }
@@ -898,8 +898,8 @@ let mut pdpt_user = false;
                 }
                 if pd_user {
                     let pd_phys = pdpte & PTE_ADDR_MASK;
-                    if refc_get(pd_phys) > 0 {
-                        refc_dec(pd_phys);
+                    if crate::memory::buddy::pte_refc_get(pd_phys) > 0 {
+                        crate::memory::buddy::pte_refc_dec(pd_phys);
                     } else if pd_phys >= base && pd_phys < end && crate::memory::buddy::page_is_used(pd_phys) {
                         alloc.free(pd_phys, 0);
                     }
@@ -908,8 +908,8 @@ let mut pdpt_user = false;
             }
             if pdpt_user {
                 let pdpt_phys = pml4e & PTE_ADDR_MASK;
-                if refc_get(pdpt_phys) > 0 {
-                    refc_dec(pdpt_phys);
+                if crate::memory::buddy::pte_refc_get(pdpt_phys) > 0 {
+                    crate::memory::buddy::pte_refc_dec(pdpt_phys);
                 } else if pdpt_phys >= base && pdpt_phys < end && crate::memory::buddy::page_is_used(pdpt_phys) {
                     alloc.free(pdpt_phys, 0);
                 }
@@ -956,6 +956,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
         let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
         // Page-table page: both parent and child now reference it.
         refc_inc(old_pdpt_phys);
+        crate::memory::buddy::pte_refc_inc(old_pdpt_phys);
         let old_pdpt = unsafe { &mut *(old_pdpt_phys as *mut PageTable) };
 
         for pdpt_idx in 0..512 {
@@ -977,6 +978,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
             let old_pd_phys = pdpte & PTE_ADDR_MASK;
             // Page-table page: shared between parent and child.
             refc_inc(old_pd_phys);
+            crate::memory::buddy::pte_refc_inc(old_pd_phys);
             let old_pd = unsafe { &mut *(old_pd_phys as *mut PageTable) };
 
             for pd_idx in 0..512 {
@@ -994,10 +996,11 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
                 }
 
                 // 4K page — mark all user PTEs as read-only (COW)
-                let old_pt_phys = pde & PTE_ADDR_MASK;
-                // Page-table page: shared between parent and child.
-                refc_inc(old_pt_phys);
-                let old_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
+let old_pt_phys = pde & PTE_ADDR_MASK;
+            // Page-table page: shared between parent and child.
+            refc_inc(old_pt_phys);
+            crate::memory::buddy::pte_refc_inc(old_pt_phys);
+            let old_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
 
                 for pt_idx in 0..512 {
                     let pte = old_pt.0[pt_idx];
@@ -1045,10 +1048,10 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
     let mut pdpt_phys = pml4e & PTE_ADDR_MASK;
 
     // PDPT: copy if shared.
-    if refc_get(pdpt_phys) > 0 {
+    if crate::memory::buddy::pte_refc_get(pdpt_phys) > 0 {
         let new_pdpt = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pdpt_phys as *const u8, new_pdpt as *mut u8, 4096); }
-        refc_dec(pdpt_phys);
+        crate::memory::buddy::pte_refc_dec(pdpt_phys);
         pml4_tbl.0[vpn[0]] = new_pdpt | (pml4e & !PTE_ADDR_MASK);
         pdpt_phys = new_pdpt;
     }
@@ -1060,10 +1063,10 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
     let mut pd_phys = pdpte & PTE_ADDR_MASK;
 
     // PD: copy if shared.
-    if refc_get(pd_phys) > 0 {
+    if crate::memory::buddy::pte_refc_get(pd_phys) > 0 {
         let new_pd = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pd_phys as *const u8, new_pd as *mut u8, 4096); }
-        refc_dec(pd_phys);
+        crate::memory::buddy::pte_refc_dec(pd_phys);
         pdpt_tbl.0[vpn[1]] = new_pd | (pdpte & !PTE_ADDR_MASK);
         pd_phys = new_pd;
     }
@@ -1075,10 +1078,10 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
     let mut pt_phys = pde & PTE_ADDR_MASK;
 
     // PT: copy if shared.
-    if refc_get(pt_phys) > 0 {
+    if crate::memory::buddy::pte_refc_get(pt_phys) > 0 {
         let new_pt = alloc.alloc_zeroed_page()?;
         unsafe { core::ptr::copy_nonoverlapping(pt_phys as *const u8, new_pt as *mut u8, 4096); }
-        refc_dec(pt_phys);
+        crate::memory::buddy::pte_refc_dec(pt_phys);
         pd_tbl.0[vpn[2]] = new_pt | (pde & !PTE_ADDR_MASK);
         pt_phys = new_pt;
     }
