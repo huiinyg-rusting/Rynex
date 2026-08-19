@@ -126,6 +126,10 @@ syscall_entry:
     
     mov rsp, r10
     add rsp, 24
+    // Linux syscall ABI preserves r10/r8/r9 across a syscall. r10 was clobbered
+    // above (used as the user-RSP carrier); the original r10 (arg4) was pushed
+    // on the user stack at entry ([rsp-8] = [X-8]) and is restored here.
+    mov r10, [rsp - 8]
     // Keep IF=0 through sysretq: at this point RSP is a *user* address, so a
     // timer interrupt here would push its save area onto the user stack and
     // never restore that memory, corrupting the user's stack frame. sysretq

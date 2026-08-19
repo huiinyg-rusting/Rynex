@@ -5850,15 +5850,6 @@ pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
                     if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
                         return false;
                     }
-                    if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_PAGING);
-                        crate::klog::s("  DMD: allocated page for 0x");
-                        crate::klog::hex(page_addr);
-                        crate::klog::s(" phys=0x");
-                        crate::klog::hex(phys);
-                        crate::klog::s("\n");
-                        crate::klog::end();
-                    }
                     return true;
                 }
             }
