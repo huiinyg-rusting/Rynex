@@ -580,12 +580,20 @@ fn order_for_pages(pages: usize) -> usize {
 fn alloc_stack(pages: usize) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let order = order_for_pages(pages + 1);
-    alloc.alloc(order).map(|p| p + pages as u64 * PAGE_SIZE)
+    alloc.alloc(order).map(|p| {
+        for i in 0..=pages {
+            crate::memory::buddy::page_type_set(p + i as u64 * PAGE_SIZE, crate::memory::buddy::PAGE_TYPE_STACK);
+        }
+        p + pages as u64 * PAGE_SIZE
+    })
 }
 
 fn free_stack(base: u64, pages: usize) {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let addr = base - pages as u64 * PAGE_SIZE;
+    for i in 0..=pages {
+        crate::memory::buddy::page_type_set(addr + i as u64 * PAGE_SIZE, crate::memory::buddy::PAGE_TYPE_FREE);
+    }
     alloc.free(addr, order_for_pages(pages + 1));
 }
 
