@@ -1258,7 +1258,7 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
                 crate::klog::s("[BADKERNELRIP] task=");
                 crate::klog::dec(current);
                 crate::klog::s(" kstack=0x");
-                crate::klog::hex(TASKS[idx].kernel_stack);
+                crate::klog::hex(unsafe { TASKS[idx].kernel_stack });
                 crate::klog::s(" rip=0x");
                 crate::klog::hex(rip);
                 crate::klog::s(" frame[0]=0x");
@@ -2287,11 +2287,15 @@ fn sys_phys_map(phys: u64, size: u64) -> i64 {
                 let mut roff = 0u64;
                 while roff < off {
                     let _ = crate::paging::PageTableManager::unmap_into(pml4, chosen + roff);
+                    unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + roff), options(nostack, preserves_flags)); }
                     roff += 0x1000;
                 }
                 return -ENOMEM;
             }
         }
+        // Flush stale TLB entries; the vaddr range may have been mapped to a
+        // different phys in a previous phys_map/dma_alloc.
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + off), options(nostack, preserves_flags)); }
         off += 0x1000;
     }
 
@@ -2373,8 +2377,14 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
             alloc.free(phys, order);
             return -ENOMEM;
         }
+        // Flush any stale TLB entry: this vaddr range may have been handed to
+        // another DMA allocation before, so an old translation must not survive.
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + off), options(nostack, preserves_flags)); }
         off += 0x1000;
     }
+    // Zero the freshly mapped DMA pages before handing them to userspace.
+    // DMA buffers handed to a device must not leak stale page content.
+    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, size as usize); }
     // Register a VMA so demand paging / teardown knows about the range.
     // Must register in every CLONE_VM sibling so their per-task vma arrays
     // stay identical.
@@ -2457,6 +2467,7 @@ fn sys_dma_free(packed: u64) -> i64 {
     let mut off = 0u64;
     while off < (1u64 << order) * 0x1000 {
         let _ = crate::paging::PageTableManager::unmap_into(pml4, (vaddr + off) as u64);
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) (vaddr + off), options(nostack, preserves_flags)); }
         off += 0x1000;
     }
 
