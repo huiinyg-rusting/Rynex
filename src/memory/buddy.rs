@@ -26,7 +26,6 @@ pub struct BuddyAllocator {
 // gracefully (skip tracking) instead of indexing out of bounds.
 const USED_BMP_WORDS: usize = (1 << 21) / 64; // 32768 words = 8 GiB
 static mut USED_BMP: [u64; USED_BMP_WORDS] = [0; USED_BMP_WORDS];
-static DOUBLE_ALLOC_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn used_word(page: u64) -> (usize, u64) {
     ((page as usize) >> 6, 1u64 << ((page as usize) & 63))
@@ -41,46 +40,13 @@ fn used_set(page: u64) -> bool {
 fn used_mark(page: u64) {
     let (w, b) = used_word(page);
     if w >= USED_BMP_WORDS { return; }
-    unsafe {
-        let prev = USED_BMP[w] & b;
-        if prev != 0 {
-            let p = (w as u64) * 64 + (b.trailing_zeros() as u64);
-            if DOUBLE_ALLOC_FIRST.compare_exchange(0, p, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
-                crate::serial::write_str("BUDDY: DOUBLE-ALLOC page=0x");
-                crate::serial::write_hex(p);
-                crate::serial::write_str("\n");
-            }
-        }
-        USED_BMP[w] |= b;
-    }
+    unsafe { USED_BMP[w] |= b; }
 }
 
 fn used_clear(page: u64) {
     let (w, b) = used_word(page);
     if w >= USED_BMP_WORDS { return; }
-    unsafe {
-        if USED_BMP[w] & b == 0 {
-            let p = (w as u64) * 64 + (b.trailing_zeros() as u64);
-            if DOUBLE_ALLOC_FIRST.compare_exchange(0, p, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
-                crate::serial::write_str("BUDDY: DOUBLE-FREE page=0x");
-                crate::serial::write_hex(p);
-                crate::serial::write_str(" addr=0x");
-                crate::serial::write_hex(p << 12);
-                unsafe {
-                    let mut rbp: u64;
-                    core::arch::asm!("mov {}, rbp", out(reg) rbp);
-                    let r0 = core::ptr::read((rbp + 8) as *const u64);
-                    let r1 = core::ptr::read((rbp + 16) as *const u64);
-                    crate::serial::write_str(" ret0=0x");
-                    crate::serial::write_hex(r0);
-                    crate::serial::write_str(" ret1=0x");
-                    crate::serial::write_hex(r1);
-                }
-                crate::serial::write_str("\n");
-            }
-        }
-        USED_BMP[w] &= !b;
-    }
+    unsafe { USED_BMP[w] &= !b; }
 }
 
 impl BuddyAllocator {
@@ -204,16 +170,6 @@ impl BuddyAllocator {
                     h.next = ptr::null_mut();
                 }
                 let pidx = self.page_index(addr);
-                if used_set(pidx) {
-                    if DOUBLE_ALLOC_FIRST.compare_exchange(0, pidx,
-                        core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
-                        crate::serial::write_str("BUDDY: ALLOC-already-used page=0x");
-                        crate::serial::write_hex(addr);
-                        crate::serial::write_str(" idx=");
-                        crate::serial::write_dec(pidx);
-                        crate::serial::write_str("\n");
-                    }
-                }
                 used_mark(pidx);
                 self.free_lists[o] = next;
 
