@@ -211,7 +211,7 @@ pub struct Vma {
     pub flags: u64,
 }
 
-pub const MAX_VMAS: usize = 64;
+pub const MAX_VMAS: usize = 1024;
 
 #[derive(Copy, Clone)]
 pub struct Task {
@@ -2386,19 +2386,38 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     // DMA buffers handed to a device must not leak stale page content.
     unsafe { core::ptr::write_bytes(phys as *mut u8, 0, size as usize); }
     // Register a VMA so demand paging / teardown knows about the range.
-    // Must register in every CLONE_VM sibling so their per-task vma arrays
-    // stay identical.
+    // Register in the calling task's array first (fail if full), then keep
+    // the CLONE_VM siblings' arrays in sync.
+    let mut registered = false;
     unsafe {
-        for_each_pml4_vmas(pml4, |vmas| {
-            for vma in vmas.iter_mut() {
-                if vma.start == 0 && vma.end == 0 {
-                    vma.start = chosen;
-                    vma.end = chosen + size;
-                    vma.flags = flags;
-                    break;
+        for vma in TASKS[idx].vmas.iter_mut() {
+            if vma.start == 0 && vma.end == 0 {
+                vma.start = chosen;
+                vma.end = chosen + size;
+                vma.flags = flags;
+                registered = true;
+                break;
+            }
+        }
+    }
+    if !registered {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        alloc.free(phys, order);
+        return -ENOMEM;
+    }
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id != 0 && TASKS[i].pml4 == pml4 && i != idx {
+                for vma in TASKS[i].vmas.iter_mut() {
+                    if vma.start == 0 && vma.end == 0 {
+                        vma.start = chosen;
+                        vma.end = chosen + size;
+                        vma.flags = flags;
+                        break;
+                    }
                 }
             }
-        });
+        }
     }
     // Pack: high 32 bits = phys page number, low 32 bits = user vaddr.
     let phys_hi = (phys >> 12) & 0xFFFF_FFFF;
@@ -3280,29 +3299,42 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         // crate::serial::write_hex(final_addr);
         // crate::serial::write_str("\n");
 
-        // Register VMA for demand paging
-        // Must register in every CLONE_VM sibling so their per-task vma arrays
-        // stay identical; otherwise a sibling's handle_demand_page finds no VMA
-        // for the mapping and fatally faults.
-        let mut vma_added = false;
-        for_each_pml4_vmas(pml4, |vmas| {
-            for vma in vmas.iter_mut() {
+        // Register in the calling task's own array first; if it is full the
+        // mapping cannot be tracked (demand paging / overlap scan read it
+        // from the caller's array), so fail with ENOMEM instead of returning
+        // an address that would overlap future mappings.
+        let mut registered = false;
+        unsafe {
+            let idx = task_idx(id);
+            for vma in TASKS[idx].vmas.iter_mut() {
                 if vma.start == 0 && vma.end == 0 {
                     vma.start = final_addr;
                     vma.end = final_addr + size;
                     vma.flags = pte_flags;
-                    vma_added = true;
+                    registered = true;
                     break;
                 }
             }
-        });
-        if !vma_added {
-            if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                crate::klog::s("MMAP -> -ENOMEM (vma)\n");
-                crate::klog::end();
-            }
+        }
+        if !registered {
             return -ENOMEM; // Too many VMAs
+        }
+        // Keep the CLONE_VM siblings' arrays in sync so their demand paging
+        // and munmap see the same mappings. Skip the calling task: its entry
+        // was already added above (for_each_pml4_vmas would add a duplicate).
+        unsafe {
+            for i in 0..MAX_TASKS {
+                if TASKS[i].id != 0 && TASKS[i].pml4 == pml4 && i != idx {
+                    for vma in TASKS[i].vmas.iter_mut() {
+                        if vma.start == 0 && vma.end == 0 {
+                            vma.start = final_addr;
+                            vma.end = final_addr + size;
+                            vma.flags = pte_flags;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         return final_addr as i64;
@@ -3351,12 +3383,22 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
 unsafe fn munmap_page_in_use(page: u64, _self_idx: usize) -> bool {
     for t in &TASKS {
         let state = t.state;
-        if t.id != 0 && state != crate::task::TaskState::Empty && state != crate::task::TaskState::Exited {
-            // Stack grows down from user_stack; cover a generous window.
-            let top = t.user_stack.min(0x1_0000_0000_0);
-            let lo = top.saturating_sub(0x40_000);
-            if page + PAGE_SIZE_4K > lo && page < top + PAGE_SIZE_4K {
-                return true;
+        if t.id != 0 && state != crate::task::TaskState::Empty && state != crate::task::TaskState::Exited
+            && t.user_stack != 0
+        {
+            // Protect only the pages that actually back a live task's stack
+            // (the VMA covering its user_stack), not a wide heuristic window:
+            // mallocng meta pages land next to thread stacks and a 256KB
+            // window makes their munmap bail out, so those mappings leak and
+            // the per-task VMA table fills up (stress tests -> EAGAIN).
+            for vma in &t.vmas {
+                if vma.start == 0 && vma.end == 0 { continue; }
+                if t.user_stack >= vma.start && t.user_stack < vma.end {
+                    if page + PAGE_SIZE_4K > vma.start && page < vma.end {
+                        return true;
+                    }
+                    break;
+                }
             }
         }
     }
