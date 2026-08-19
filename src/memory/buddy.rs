@@ -17,6 +17,35 @@ pub const PAGE_TYPE_PTE: u8 = 1;       // page table page (PML4/PDPT/PD/PT)
 pub const PAGE_TYPE_DATA: u8 = 2;      // general data page
 pub const PAGE_TYPE_STACK: u8 = 3;     // kernel stack page
 
+// ── PTE_REFC: independent lifecycle refcount for page-table pages ───────────
+// Separate from COW's PAGE_REFC; tracks PTE page lifecycle (alloc/free/quarantine)
+static mut PTE_REFC: [u16; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
+
+#[inline(always)]
+pub fn pte_refc_inc(addr: u64) {
+    let idx = (addr >> 12) as usize;
+    if idx < MAX_REFC_PAGES {
+        unsafe { PTE_REFC[idx] = PTE_REFC[idx].saturating_add(1); }
+    }
+}
+
+#[inline(always)]
+pub fn pte_refc_dec(addr: u64) -> bool {
+    let idx = (addr >> 12) as usize;
+    if idx < MAX_REFC_PAGES {
+        unsafe {
+            if PTE_REFC[idx] > 0 { PTE_REFC[idx] -= 1; }
+            PTE_REFC[idx] == 0
+        }
+    } else { true }
+}
+
+#[inline(always)]
+pub fn pte_refc_get(addr: u64) -> u16 {
+    let idx = (addr >> 12) as usize;
+    if idx < MAX_REFC_PAGES { unsafe { PTE_REFC[idx] } } else { 0 }
+}
+
 #[inline(always)]
 pub fn page_type_get(addr: u64) -> u8 {
     let idx = (addr >> 12) as usize;
@@ -93,6 +122,7 @@ fn q_pop() -> Option<u64> {
         let idx = (QUARANTINE_HEAD + QUARANTINE_MAX_CAP - QUARANTINE_COUNT) % QUARANTINE_MAX_CAP;
         let addr = QUARANTINE[idx];
         QUARANTINE_COUNT -= 1;
+        pte_refc_inc(addr);
         Some(addr)
     }
 }
@@ -311,6 +341,17 @@ impl BuddyAllocator {
 
     fn free_one(&mut self, addr: u64, order: u8) {
         if !self.is_managed(addr) { return; }
+        // PTE 页 order=0：直接入 free list，不合并
+        if order == 0 && page_type_get(addr) == PAGE_TYPE_PTE {
+            unsafe {
+                let h = &mut *(addr as *mut Block);
+                h.magic = MAGIC;
+                h.order = 0;
+                h.next = self.free_lists[0];
+                self.free_lists[0] = h;
+            }
+            return;
+        }
         let mut cur = addr;
         let mut o = order;
 
@@ -397,12 +438,14 @@ impl BuddyAllocator {
         if let Some(addr) = q_pop() {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
             page_type_set(addr, PAGE_TYPE_PTE);
+            pte_refc_inc(addr);
             return Some(addr);
         }
         // Fallback: fresh allocation
         self.alloc(0).map(|addr| {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
             page_type_set(addr, PAGE_TYPE_PTE);
+            pte_refc_inc(addr);
             addr
         })
     }
@@ -426,9 +469,11 @@ impl BuddyAllocator {
         page_type_set(addr, PAGE_TYPE_FREE);
         df_record(pidx, caller, order);
 
-        // 页表页进入隔离区，延迟回收；其他直接释放
+        // PTE 页：走引用计数，归零才真正释放（入隔离区）
         if order == 0 && old_type == PAGE_TYPE_PTE {
-            q_push(addr);
+            if pte_refc_dec(addr) {
+                q_push(addr);
+            }
         } else {
             self.free_one(addr, order as u8);
         }
@@ -549,8 +594,6 @@ impl BuddyAllocator {
         false
     }
 
-    /// Remove a page from the reserved list and free it.
-    /// Returns true if the page was reserved and has been freed.
     pub fn free_reserved(&mut self, addr: u64, order: usize) -> bool {
         if self.unreserve(addr) {
             let pidx = self.page_index(addr);
@@ -565,7 +608,9 @@ impl BuddyAllocator {
             page_type_set(addr, PAGE_TYPE_FREE);
             df_record(pidx, caller, order);
             if order == 0 && old_type == PAGE_TYPE_PTE {
-                q_push(addr);
+                if pte_refc_dec(addr) {
+                    q_push(addr);
+                }
             } else {
                 self.free_one(addr, order as u8);
             }
