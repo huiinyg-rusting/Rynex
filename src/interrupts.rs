@@ -299,7 +299,6 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         return;
     }
-
     crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
     crate::klog::s("EXC: PAGE_FAULT rip=0x");
     crate::klog::hex(rip);

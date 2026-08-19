@@ -7,8 +7,7 @@
 #![feature(naked_functions)]
 
 extern crate alloc;
-mod virtio_fix;
-
+mod paging;
 mod vga;
 mod serial;
 mod klog;
@@ -18,7 +17,6 @@ mod interrupts;
 mod memory;
 mod multiboot2;
 mod task;
-mod paging;
 mod pic;
 mod pit;
 mod ipc;
@@ -64,12 +62,6 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     vga::set_color(0x0A, 0x00);
     vga::write_str("Booting...\n");
     vga::set_color(0x0F, 0x00);
-
-    // Virtio-blk legacy read timeout fix
-    // Write to virtio device notification register (16-bit port output)
-    // Fix: write value 2 to port base+0x10 to properly notify the device
-    use virtio_fix::virtio_legacy_notify;
-    virtio_legacy_notify();
 
     gdt::init();
     vga::write_str("GDT: OK\n");
