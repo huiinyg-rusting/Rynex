@@ -1,10 +1,85 @@
 use core::ptr;
+use core::sync::atomic::Ordering;
+
+const MAGIC: u32 = 0xDEADBEEF;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: usize = 10;
 const MAX_RESERVED: usize = 2048;
 
-const MAGIC: u32 = 0xDEADBEEF;
+// ── DOUBLE-FREE diagnostics (temporary) ───────────────────────────
+// Per-page record of the MOST RECENT free. When a page is freed twice without
+// an intervening alloc (used_clear sees an already-clear bit), the latch fires
+// and dumps the first free site so the DOUBLE-FREE root cause can be found.
+// Sized for up to 256 MiB of RAM (65536 pages); the test rig uses -m 64M.
+const DF_MAX_PAGES: usize = 65536;
+static mut DF_LAST_CALLER: [u32; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
+static mut DF_LAST_TICK: [u32; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
+static mut DF_LAST_ORDER: [u8; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
+
+fn df_record(pidx: u64, caller: u64, order: usize) {
+    if (pidx as usize) >= DF_MAX_PAGES { return; }
+    unsafe {
+        DF_LAST_CALLER[pidx as usize] = caller as u32;
+        DF_LAST_TICK[pidx as usize] = crate::pit::TICKS.load(Ordering::Relaxed) as u32;
+        DF_LAST_ORDER[pidx as usize] = order as u8;
+    }
+}
+
+fn df_latch(pidx: u64, caller: u64, order: usize) {
+    unsafe {
+        crate::serial::write_str("\n=== DOUBLE-FREE LATCH ===\n");
+        crate::serial::write_str("page=0x");
+        crate::serial::write_hex(pidx << 12);
+        crate::serial::write_str(" pidx=");
+        crate::serial::write_dec(pidx);
+        crate::serial::write_str(" order=");
+        crate::serial::write_dec(order as u64);
+        crate::serial::write_str(" tick=");
+        crate::serial::write_dec(crate::pit::TICKS.load(Ordering::Relaxed));
+        crate::serial::write_str(" this_caller=0x");
+        crate::serial::write_hex(caller);
+        if (pidx as usize) < DF_MAX_PAGES {
+            crate::serial::write_str(" first_caller=0x");
+            crate::serial::write_hex(DF_LAST_CALLER[pidx as usize] as u64);
+            crate::serial::write_str(" first_tick=");
+            crate::serial::write_dec(DF_LAST_TICK[pidx as usize] as u64);
+            crate::serial::write_str(" first_order=");
+            crate::serial::write_dec(DF_LAST_ORDER[pidx as usize] as u64);
+        }
+        crate::serial::write_str(" cr3=0x");
+        crate::serial::write_hex(crate::task::current_task_pml4());
+        crate::serial::write_str(" task=");
+        crate::serial::write_dec(crate::task::current_task_id());
+        crate::serial::write_str("\n");
+    }
+}
+
+/// Query helper for paging.rs walk diagnostics: is this physical page marked
+/// used in the buddy bitmap? (page not tracked -> false)
+pub fn page_is_used(phys: u64) -> bool {
+    used_set((phys >> 12) as u64)
+}
+
+/// Query helper: last recorded free site for a physical page.
+pub fn df_info(phys: u64) -> (u32, u32, u8) {
+    let pidx = (phys >> 12) as usize;
+    unsafe {
+        if pidx < DF_MAX_PAGES {
+            (DF_LAST_CALLER[pidx], DF_LAST_TICK[pidx], DF_LAST_ORDER[pidx])
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
+pub fn alloc_base() -> u64 {
+    crate::memory::allocator().base
+}
+
+pub fn alloc_pages() -> u64 {
+    crate::memory::allocator().pages
+}
 
 #[repr(C)]
 struct Block {
@@ -153,16 +228,12 @@ impl BuddyAllocator {
                 let addr = block as u64;
                 let next = unsafe { (*block).next };
                 if self.is_reserved(addr) {
-                    // Skip reserved pages that somehow ended up in free lists.
-                    // Advance to the next block in the same order list instead
-                    // of skipping the rest of this order.
                     self.free_lists[o] = next;
                     if !next.is_null() {
                         continue;
                     }
                     break;
                 }
-                // Clear the header of the allocated block so it won't be mistaken for free during coalescing.
                 unsafe {
                     let h = &mut *(addr as *mut Block);
                     h.magic = 0;
@@ -192,6 +263,14 @@ impl BuddyAllocator {
         None
     }
 
+    /// Allocate a zeroed page (order 0) for page tables, guaranteeing clean PTEs.
+    pub fn alloc_zeroed_page(&mut self) -> Option<u64> {
+        self.alloc(0).map(|addr| {
+            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
+            addr
+        })
+    }
+
     pub fn free(&mut self, addr: u64, order: usize) {
         // If the page was reserved, unreserve it first so it can be properly freed.
         // This handles the mallocng meta page which is reserved to prevent buddy
@@ -200,7 +279,12 @@ impl BuddyAllocator {
             self.unreserve(addr);
         }
         let pidx = self.page_index(addr);
+        let caller = core::intrinsics::return_address() as u64;
+        if !used_set(pidx) {
+            df_latch(pidx, caller, order);
+        }
         used_clear(pidx);
+        df_record(pidx, caller, order);
         self.free_one(addr, order as u8);
     }
 
@@ -324,7 +408,12 @@ impl BuddyAllocator {
     pub fn free_reserved(&mut self, addr: u64, order: usize) -> bool {
         if self.unreserve(addr) {
             let pidx = self.page_index(addr);
+            let caller = core::intrinsics::return_address() as u64;
+            if !used_set(pidx) {
+                df_latch(pidx, caller, order);
+            }
             used_clear(pidx);
+            df_record(pidx, caller, order);
             self.free_one(addr, order as u8);
             true
         } else {

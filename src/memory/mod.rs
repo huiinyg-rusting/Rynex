@@ -15,6 +15,32 @@ const MAX_REGIONS: usize = 32;
 // range here; raising the ceiling requires extending the identity map first.
 const IDENTITY_LIMIT: u64 = 1 << 30;
 
+// Module regions that must never be allocated by the buddy (GRUB loads them
+// and the kernel must treat them as reserved). Filled at init time.
+// Stored as compile-time constants after init for O(1) checks.
+const MAX_MODULE_REGIONS: usize = 16;
+static mut MODULE_REGIONS: [(u64, u64); MAX_MODULE_REGIONS] = [(0, 0); MAX_MODULE_REGIONS];
+static mut MODULE_REGIONS_COUNT: usize = 0;
+
+#[inline(always)]
+fn is_in_module_region(addr: u64) -> bool {
+    unsafe {
+        for i in 0..MODULE_REGIONS_COUNT {
+            let (start, end) = MODULE_REGIONS[i];
+            if addr >= start && addr < end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Public wrapper for module-region checks from other modules (e.g., paging).
+#[inline(always)]
+pub fn page_in_module_region(addr: u64) -> bool {
+    is_in_module_region(addr)
+}
+
 extern "Rust" {
     static _kernel_start: u64;
     static _kernel_end: u64;
@@ -86,7 +112,27 @@ pub fn init(info_addr: u32) {
         crate::serial::write_str("\n");
     }
 
+    // Populate module regions for runtime checks (sanitization, guards)
+    unsafe {
+        MODULE_REGIONS_COUNT = nmodules.min(MAX_MODULE_REGIONS);
+        for i in 0..nmodules {
+            let ms = buddy::page_align_down(modules[i].start);
+            let me = buddy::page_align_up(modules[i].end);
+            MODULE_REGIONS[i] = (ms, me);
+        }
+    }
+
     let info_page = buddy::page_align_down(info_addr as u64);
+
+    // Reserve the gap between kernel end and first module (if any) so the
+    // buddy doesn't hand out pages from the kernel-module gap for pml4s.
+    let mut first_module_start = base + pages * buddy::PAGE_SIZE;
+    for i in 0..nmodules {
+        let ms = buddy::page_align_down(modules[i].start);
+        if ms < first_module_start {
+            first_module_start = ms;
+        }
+    }
 
     unsafe {
         if ks >= base && ks < base + pages * buddy::PAGE_SIZE {
@@ -99,9 +145,16 @@ pub fn init(info_addr: u32) {
             // lower region: base -> adj_start, skipping module + info pages
             add_free_region_skipping(base, adj_start, &modules, nmodules, info_page);
             ALLOC.mark_allocated(adj_start, adj_end - adj_start);
-            // upper region: adj_end -> end
-            if adj_end < base + pages * buddy::PAGE_SIZE {
-                add_free_region_skipping(adj_end, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
+
+            // Also mark the gap between kernel end and first module as allocated
+            // to prevent the buddy from using the kernel-module gap for pml4s.
+            if adj_end < first_module_start {
+                ALLOC.mark_allocated(adj_end, first_module_start - adj_end);
+            }
+
+            // upper region: first_module_start -> end (skip kernel-module gap entirely)
+            if first_module_start < base + pages * buddy::PAGE_SIZE {
+                add_free_region_skipping(first_module_start, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
             }
         } else {
             add_free_region_skipping(base, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
@@ -114,42 +167,77 @@ pub fn init(info_addr: u32) {
     crate::serial::write_str(" pages=");
     crate::serial::write_dec(pages);
     crate::serial::write_str("\n");
+
+    // Sanitize all existing tasks' pml4: any pointing into module regions
+    // are legacy corruption from before the allocator fix; clear them to 0
+    // so free_address_space won't walk garbage.
+    crate::task::sanitize_task_pml4s();
 }
 
 unsafe fn add_free_region_skipping(start: u64, end: u64,
     modules: &[crate::multiboot2::ModuleInfo], nmodules: usize, info_page: u64)
 {
+    // Build a sorted list of reserved intervals [start, end) within [start, end)
+    let mut reserved = [(0u64, 0u64); 32]; // kernel + modules + info_page
+    let mut rcount = 0;
+
+    // Kernel is already marked allocated separately, but add it as reserved here
+    // for completeness in this region-splitting logic.
+    // Note: the actual kernel pages are marked via mark_allocated() separately.
+
+    // Add module regions (page-aligned)
+    for i in 0..nmodules {
+        let ms = buddy::page_align_down(modules[i].start);
+        let me = buddy::page_align_up(modules[i].end);
+        if ms < end && me > start {
+            let rs = ms.max(start);
+            let re = me.min(end);
+            if rs < re {
+                reserved[rcount] = (rs, re);
+                rcount += 1;
+            }
+        }
+    }
+
+    // Add info page
+    if info_page >= start && info_page < end {
+        reserved[rcount] = (info_page, info_page + buddy::PAGE_SIZE);
+        rcount += 1;
+    }
+
+    // Sort reserved intervals by start
+    for i in 0..rcount {
+        for j in i + 1..rcount {
+            if reserved[j].0 < reserved[i].0 {
+                reserved.swap(i, j);
+            }
+        }
+    }
+
+    // Merge overlapping/adjacent reserved intervals
+    let mut merged = [(0u64, 0u64); 32];
+    let mut mcount = 0;
+    for i in 0..rcount {
+        let (rs, re) = reserved[i];
+        if mcount == 0 || rs > merged[mcount - 1].1 {
+            merged[mcount] = (rs, re);
+            mcount += 1;
+        } else if re > merged[mcount - 1].1 {
+            merged[mcount - 1].1 = re;
+        }
+    }
+
+    // Add the gaps between reserved intervals as free regions
     let mut cur = start;
-    while cur < end {
-        // Find the next reserved page that intersects [cur, end)
-        let mut next_reserved = end;
-        if info_page >= cur && info_page < end {
-            next_reserved = info_page;
+    for i in 0..mcount {
+        let (rs, re) = merged[i];
+        if cur < rs {
+            ALLOC.add_region(cur, rs - cur);
         }
-        for i in 0..nmodules {
-            let ms = buddy::page_align_down(modules[i].start);
-            let me = buddy::page_align_up(modules[i].end);
-            if ms >= cur && ms < end && ms < next_reserved {
-                next_reserved = ms;
-            }
-        }
-        if next_reserved > cur {
-            ALLOC.add_region(cur, next_reserved - cur);
-        }
-        // skip the reserved block
-        let reserved_end = end;
-        let mut skip_to = next_reserved + buddy::PAGE_SIZE;
-        if info_page >= next_reserved && info_page < reserved_end {
-            skip_to = skip_to.max(info_page + buddy::PAGE_SIZE);
-        }
-        for i in 0..nmodules {
-            let ms = buddy::page_align_down(modules[i].start);
-            let me = buddy::page_align_up(modules[i].end);
-            if ms >= next_reserved && ms < reserved_end && me > skip_to {
-                skip_to = me;
-            }
-        }
-        cur = skip_to;
+        cur = cur.max(re);
+    }
+    if cur < end {
+        ALLOC.add_region(cur, end - cur);
     }
 }
 

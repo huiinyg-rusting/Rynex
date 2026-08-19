@@ -5868,6 +5868,27 @@ pub fn current_task_pml4() -> u64 {
     unsafe { TASKS[task_idx(id)].pml4 }
 }
 
+/// Sanitize all tasks' pml4 pointers: clear any that point into GRUB module regions
+/// (legacy corruption from before the allocator fix). Must be called after
+/// the allocator is fully initialized.
+pub fn sanitize_task_pml4s() {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].id != 0 && TASKS[i].state != TaskState::Empty {
+                let pml4 = TASKS[i].pml4;
+                if pml4 != 0 && crate::memory::page_in_module_region(pml4) {
+                    TASKS[i].pml4 = 0;
+                    crate::serial::write_str("MEM: sanitized task ");
+                    crate::serial::write_dec(TASKS[i].id);
+                    crate::serial::write_str(" pml4=0x");
+                    crate::serial::write_hex(pml4);
+                    crate::serial::write_str(" (was in module region)\n");
+                }
+            }
+        }
+    }
+}
+
 /// Handle demand paging for mmap'd (or brk) regions.
 /// Returns true if the page was allocated and mapped.
 /// CLONE_VM threads share one pml4; their per-task vma arrays must be kept
