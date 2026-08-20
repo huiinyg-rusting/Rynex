@@ -246,6 +246,19 @@ memory::init(_info);
 fn panic(info: &PanicInfo) -> ! {
     serial::write_str("\nPANIC\n");
     vga::write_str("\nKERNEL PANIC\n");
+    serial::write_str(" caller=0x");
+    serial::write_hex(core::intrinsics::return_address() as u64);
+    serial::write_str("\n");
+    use core::fmt::Write;
+    struct W;
+    impl Write for W {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            serial::write_str(s);
+            Ok(())
+        }
+    }
+    let _ = core::fmt::write(&mut W, format_args!("{}", info.message()));
+    serial::write_str("\n");
     if let Some(loc) = info.location() {
         serial::write_str(loc.file());
         serial::write_str(":");

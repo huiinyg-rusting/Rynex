@@ -2,10 +2,31 @@ use core::ptr;
 use core::sync::atomic::Ordering;
 
 const MAGIC: u32 = 0xDEADBEEF;
+const AUDIT_PERIOD: u64 = 8;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_ORDER: usize = 10;
 const MAX_RESERVED: usize = 2048;
+
+static mut BUDDY_AUDIT_COUNTER: u64 = 0;
+static mut AUDIT_ACTIVE: bool = false;
+
+/// Convert a physical address into the base-relative page index used by the
+/// buddy bitmap and page-type arrays (addr >> 12 is NOT the bitmap index
+/// unless the allocator base is 0).
+fn phys_to_idx(phys: u64) -> u64 {
+    let base = alloc_base();
+    if phys < base {
+        return u64::MAX; // not tracked
+    }
+    (phys - base) >> 12
+}
+
+/// Query helper for paging.rs walk diagnostics: is this physical page marked
+/// used in the buddy bitmap? (page not tracked -> false)
+pub fn page_is_used(phys: u64) -> bool {
+    used_set(phys_to_idx(phys))
+}
 
 // ── Page type tracking (2 bits per page, separate array) ────────────────────
 // Sized for up to 8 GiB of RAM (2^21 pages = 2,097,152)
@@ -23,7 +44,7 @@ static mut PTE_REFC: [u16; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
 
 #[inline(always)]
 pub fn pte_refc_inc(addr: u64) {
-    let idx = (addr >> 12) as usize;
+    let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
         unsafe { PTE_REFC[idx] = PTE_REFC[idx].saturating_add(1); }
     }
@@ -31,7 +52,7 @@ pub fn pte_refc_inc(addr: u64) {
 
 #[inline(always)]
 pub fn pte_refc_dec(addr: u64) -> bool {
-    let idx = (addr >> 12) as usize;
+    let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
         unsafe {
             if PTE_REFC[idx] > 0 { PTE_REFC[idx] -= 1; }
@@ -42,13 +63,13 @@ pub fn pte_refc_dec(addr: u64) -> bool {
 
 #[inline(always)]
 pub fn pte_refc_get(addr: u64) -> u16 {
-    let idx = (addr >> 12) as usize;
+    let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES { unsafe { PTE_REFC[idx] } } else { 0 }
 }
 
 #[inline(always)]
 pub fn page_type_get(addr: u64) -> u8 {
-    let idx = (addr >> 12) as usize;
+    let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
         unsafe { PAGE_TYPE[idx] }
     } else {
@@ -57,7 +78,7 @@ pub fn page_type_get(addr: u64) -> u8 {
 }
 
 pub fn page_type_set(addr: u64, t: u8) {
-    let idx = (addr >> 12) as usize;
+    let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
         unsafe { PAGE_TYPE[idx] = t; }
     }
@@ -210,15 +231,9 @@ fn df_latch(pidx: u64, caller: u64, order: usize) {
     }
 }
 
-/// Query helper for paging.rs walk diagnostics: is this physical page marked
-/// used in the buddy bitmap? (page not tracked -> false)
-pub fn page_is_used(phys: u64) -> bool {
-    used_set((phys >> 12) as u64)
-}
-
 /// Query helper: last recorded free site for a physical page.
 pub fn df_info(phys: u64) -> (u32, u32, u8) {
-    let pidx = (phys >> 12) as usize;
+    let pidx = phys_to_idx(phys) as usize;
     unsafe {
         if pidx < DF_MAX_PAGES {
             (DF_LAST_CALLER[pidx], DF_LAST_TICK[pidx], DF_LAST_ORDER[pidx])
@@ -226,6 +241,24 @@ pub fn df_info(phys: u64) -> (u32, u32, u8) {
             (0, 0, 0)
         }
     }
+}
+
+/// Check if a physical page is in the reserved array.
+pub fn is_reserved_page(addr: u64) -> bool {
+    unsafe {
+        let alloc = &*crate::memory::allocator();
+        for i in 0..alloc.reserved_count {
+            if alloc.reserved[i] == addr {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Get the head of a free list for a given order.
+pub fn free_list_head(order: usize) -> u64 {
+    unsafe { crate::memory::allocator().free_lists[order] as u64 }
 }
 
 pub fn alloc_base() -> u64 {
@@ -293,6 +326,38 @@ impl BuddyAllocator {
     pub fn init(&mut self, base: u64, pages: u64) {
         self.base = base;
         self.pages = pages;
+    }
+
+    fn maybe_audit(&mut self) {
+        unsafe {
+            BUDDY_AUDIT_COUNTER += 1;
+            if BUDDY_AUDIT_COUNTER % AUDIT_PERIOD == 0 {
+                let _ = self.audit_free_lists();
+            }
+        }
+    }
+
+    fn audit_free_lists(&mut self) -> bool {
+        unsafe {
+            if AUDIT_ACTIVE {
+                return true;
+            }
+            AUDIT_ACTIVE = true;
+        }
+        // Walk free lists and verify magic/order on each block
+        for order in 0..=MAX_ORDER {
+            let mut curr = self.free_lists[order];
+            while !curr.is_null() {
+                let block = unsafe { &*curr };
+                if block.magic != MAGIC || block.order != order as u32 {
+                    unsafe { AUDIT_ACTIVE = false; }
+                    return false;
+                }
+                curr = block.next;
+            }
+        }
+        unsafe { AUDIT_ACTIVE = false; }
+        true
     }
 
     fn page_index(&self, addr: u64) -> u64 {
@@ -477,6 +542,7 @@ impl BuddyAllocator {
         } else {
             self.free_one(addr, order as u8);
         }
+        self.maybe_audit();
     }
 
     pub fn mark_allocated(&mut self, start: u64, size: u64) {

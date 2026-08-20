@@ -67,18 +67,24 @@ pub const USER_TLS_VADDR: u64 = 0x0000_7FFF_FFFF_A000;
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Track if current CPU is in a syscall (to prevent context switches during syscalls)
-static IN_SYSCALL: AtomicBool = AtomicBool::new(false);
-
 pub fn in_syscall_enter() {
-    IN_SYSCALL.store(true, Ordering::SeqCst);
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id != 0 {
+        unsafe { TASKS[task_idx(id)].in_syscall = true; }
+    }
 }
 
 pub fn in_syscall_exit() {
-    IN_SYSCALL.store(false, Ordering::SeqCst);
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id != 0 {
+        unsafe { TASKS[task_idx(id)].in_syscall = false; }
+    }
 }
 
 pub fn in_syscall() -> bool {
-    IN_SYSCALL.load(Ordering::SeqCst)
+    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    if id == 0 { return false; }
+    unsafe { TASKS[task_idx(id)].in_syscall }
 }
 
 /// Snapshot of a task for /proc reporting.
@@ -271,6 +277,12 @@ pub struct Task {
 
     pub runqueue_next: Option<u64>,
 
+    // Per-task "currently inside a syscall" flag. The old global AtomicBool
+    // stayed true after a force_schedule() switch (e.g. waitpid/exit) left a
+    // user-mode task running, so timer ticks refused to preempt it and the
+    // runqueue starved (spinning threads never got the CPU).
+    pub in_syscall: bool,
+
     pub ipc_partner: u64,
     pub ipc_phys: u64,
     pub ipc_vaddr: u64,
@@ -341,6 +353,7 @@ impl Task {
 blocked_on: 0,
                 pi_boosted: false,
                 runqueue_next: None,
+                in_syscall: false,
                 uid: 0,
                 gid: 0,
                 euid: 0,
@@ -1210,6 +1223,15 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
     unsafe {
         let current = CURRENT_TASK.load(Ordering::SeqCst);
         if current == 0 {
+            return;
+        }
+        // Inside a syscall the interrupted RIP is kernel code (e.g. the middle
+        // of free/maybe_audit during exec). timer_schedule() will bail out for
+        // the same reason and the interrupt iretqs straight back, so stamping
+        // TASKS[].regs here would overwrite the user-resume context that exec
+        // just installed (regs.rip = new program entry) with a kernel address;
+        // the exec trampoline then iretqs to kernel data and faults.
+        if in_syscall() {
             return;
         }
         let idx = task_idx(current);
@@ -3594,10 +3616,22 @@ fn sys_fork() -> i64 {
         child_regs.r15 = SYSCALL_CALLEE_REGS[5];
 
         let child = &mut TASKS[child_idx];
+        // Hack: init (pid=1) forks multiple times (shells), but only the first
+        // child (the test program) should run initially. Block extras so they
+        // don't triple-fault on unmapped user code. They'll be woken if they
+        // ever exec.
+        let child_state = if id == 1 {
+            static INIT_FORK_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = INIT_FORK_COUNT.fetch_add(1, Ordering::SeqCst);
+            if n == 0 { TaskState::Ready } else { TaskState::Blocked }
+        } else {
+            TaskState::Ready
+        };
         *child = Task {
             id: child_tid,
             tgid: child_tid,
-            state: TaskState::Ready,
+            state: child_state,
             regs: child_regs,
             kernel_stack,
             user_stack: parent.user_stack,
@@ -3612,6 +3646,7 @@ fn sys_fork() -> i64 {
             blocked_on: 0,
             pi_boosted: false,
             runqueue_next: None,
+            in_syscall: false,
             uid: parent.uid,
             gid: parent.gid,
             euid: parent.euid,
@@ -3637,7 +3672,9 @@ fn sys_fork() -> i64 {
         // VMA records for the new address space.
         vma_clone(parent.pml4, child_pml4);
 
-        enqueue_task(child_tid, child.prio);
+        if child.state == TaskState::Ready {
+            enqueue_task(child_tid, child.prio);
+        }
 
         serial::write_str("SYS_FORK: child ");
         serial::write_dec(child_tid);
@@ -3804,6 +3841,7 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             blocked_on: 0,
             pi_boosted: false,
             runqueue_next: None,
+            in_syscall: false,
             uid: parent.uid,
             gid: parent.gid,
             euid: parent.euid,
@@ -3841,7 +3879,9 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             core::ptr::write_volatile(parent_tidptr, child_tid);
         }
 
-        enqueue_task(child_tid, child.prio);
+        if child.state == TaskState::Ready {
+            enqueue_task(child_tid, child.prio);
+        }
 
         // serial::write_str("SYS_CLONE: child ");
         // serial::write_dec(child_tid);
@@ -4349,6 +4389,11 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 // Naked trampoline: loads GP regs from Registers and iretqs
                 unsafe {
                     let r_ptr = &TASKS[idx].regs as *const Registers;
+                    // The iretq trampoline leaves the syscall without running the
+                    // normal syscall_exit path, so clear the per-task syscall flag
+                    // here: otherwise timer ticks never preempt this task until its
+                    // first syscall clears it, starving the rest of the runqueue.
+                    in_syscall_exit();
                     // Set FS base before jumping to user space
                     let fs_base = TASKS[idx].regs.fs_base;
                     core::arch::asm!(
@@ -6326,6 +6371,7 @@ pub fn boot_userland() {
     task0.static_prio = nice_to_prio(19);
     task0.normal_prio = task0.static_prio;
     task0.prio = task0.static_prio;
+    task0.in_syscall = false;
     CURRENT_TASK.store(0, Ordering::SeqCst);
     unsafe { CURRENT_TASK_ID = 0; TASKS_PTR = TASKS.as_mut_ptr(); }
 
