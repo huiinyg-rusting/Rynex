@@ -2615,7 +2615,7 @@ const PCI_CONFIG_ADDR: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// Read a PCI config register. Returns the 32-bit value or a negated errno.
-fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
+pub fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
     if offset > 0xFC || offset % 4 != 0 {
         return -EINVAL;
     }
@@ -2638,7 +2638,7 @@ fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
 }
 
 /// Write a PCI config register.
-fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 {
+pub fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 {
     if offset > 0xFC || offset % 4 != 0 {
         return -EINVAL;
     }
@@ -2662,7 +2662,7 @@ fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 {
 
 /// Scan bus 0 for a device with the given vendor/device id. Returns
 /// (bus<<16 | dev<<11 | func<<8) or -ENODEV. Only devs 0..=31 checked.
-fn sys_pci_find(vendor_device: u16) -> i64 {
+pub fn sys_pci_find(vendor_device: u16) -> i64 {
     let _ = vendor_device;
     for dev in 0u8..32 {
         for func in 0u8..8 {
