@@ -220,6 +220,29 @@ memory::init(_info);
     drivers::virtio_blk::init_virtio_blk();
     drivers::block_device::init_block_device().expect("block device init failed");
 
+    // Test block device read/write
+    serial::write_str(">>> Starting block test...\n");
+    {
+        use drivers::block_device::{block_read, block_write};
+        let test_data = b"Hello virtio-blk!";
+        serial::write_str(">>> Test: writing sector 10\n");
+        let write_ok = block_write(10, test_data);
+        serial::write_str("block: write sector 10 = ");
+        serial::write_str(if write_ok { "OK" } else { "FAIL" });
+        serial::write_str("\n");
+        
+        if let Some(ptr) = block_read(10) {
+            let read_data = unsafe { core::slice::from_raw_parts(ptr, test_data.len()) };
+            let read_ok = read_data == test_data;
+            serial::write_str("block: read sector 10 = ");
+            serial::write_str(if read_ok { "OK" } else { "FAIL" });
+            serial::write_str("\n");
+        } else {
+            serial::write_str("block: read sector 10 = FAIL (null)\n");
+        }
+    }
+    serial::write_str(">>> Block test complete\n");
+
     // Register kernel services as named IPC ports. Clients connect to these by
     // name; in this phase the services remain in-kernel (see services.rs).
     services::register(b"vfs", services::vfs_handler);

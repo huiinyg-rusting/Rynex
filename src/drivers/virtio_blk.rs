@@ -302,13 +302,7 @@ impl VirtioBlk {
             return None;
         }
 
-        serial::write_str("virtio-blk: found device at ");
-        serial::write_hex(bus as u64);
-        serial::write_str(":");
-        serial::write_hex(dev as u64);
-        serial::write_str(".");
-        serial::write_hex(func as u64);
-        serial::write_str("\n");
+        
 
         let bar0_raw = task::sys_pci_read(bus, dev, func, 0x10);
         let bar0 = (bar0_raw as u64) & 0xFFFFFFF0;
@@ -363,27 +357,28 @@ impl VirtioBlk {
                 serial::write_hex(cap_next as u64);
                 serial::write_str("\n");
                 
-                if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
+if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
                     // PCI vendor-specific capability (0x09) for virtio 1.0:
                     // Byte 0: cap_id (0x09)
-                    // Byte 1: cap_next
-                    // Byte 2: length of vendor-specific data
+                    // Byte 1: next_ptr
+                    // Byte 2: length
                     // Byte 3: vendor-specific ID (0x02 for virtio)
-                    // Byte 4-7: BAR (4 bytes, low byte = BAR number)
+                    // Byte 4: cfg_type
+                    // Byte 5-7: BAR (3 bytes, low byte = BAR number)
                     // Byte 8-11: offset (4 bytes)
                     // Byte 12-15: length (4 bytes)
-                    // dword0 (cap_ptr): cap_id, cap_next, length, vndr_id
-                    let cap_dword = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, cap_ptr as u8);
-                    let vndr_id = ((cap_dword >> 24) & 0xFF) as u8;  // byte 3 = vendor-specific ID
+                    let aligned_ptr = cap_ptr & !3;
+                    let cap_dword = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, aligned_ptr);
+                    let vndr_id = ((cap_dword >> 24) & 0xFF) as u8;
+                    let cap_id_check = (cap_dword & 0xFF) as u8;
+                    let cap_next_check = ((cap_dword >> 8) & 0xFF) as u8;
                     
-                    serial::write_str("virtio-blk: vendor_id=");
-                    serial::write_hex(vndr_id as u64);
-                    serial::write_str("\n");
                     if vndr_id == 0x02 { // VIRTIO_PCI_CAP_VENDOR_SPECIFIC
-                        let cfg_type = (task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (cap_ptr + 4) as u8) & 0xFF) as u8;
-                        let bar = (task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (cap_ptr + 4) as u8) & 0xFF) as u8;
-                        let offset = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (cap_ptr + 8) as u8);
-                        let length = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (cap_ptr + 12) as u8);
+                        let dword1 = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 4) as u8);
+                        let cfg_type = (dword1 & 0xFF) as u8;
+                        let bar = ((dword1 >> 8) & 0xFF) as u8;
+                        let offset = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 8) as u8);
+                        let length = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 12) as u8);
                         
                         serial::write_str("virtio-blk: found virtio cap, cfg_type=");
                         serial::write_hex(cfg_type as u64);
@@ -394,8 +389,6 @@ impl VirtioBlk {
                         serial::write_str(" length=");
                         serial::write_dec(length as u64);
                         serial::write_str("\n");
-                        
-                        serial::write_str("virtio-blk: found virtio cap, cfg_type=");
                         serial::write_hex(cfg_type as u64);
                         serial::write_str(" bar=");
                         serial::write_hex(bar as u64);
@@ -430,7 +423,7 @@ impl VirtioBlk {
             }
 
             if self.common_cfg.is_null() || self.device_cfg.is_null() || self.notify_base.is_null() {
-                serial::write_str("virtio-blk: modern caps missing, trying legacy interface\n");
+                
                 return self.init_legacy();
             }
 
@@ -482,7 +475,7 @@ impl VirtioBlk {
 
     fn init_legacy(&mut self) -> bool {
         unsafe {
-            serial::write_str("virtio-blk: trying legacy interface\n");
+            
             
             let bar0_raw = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x10);
             let bar0_raw_u64 = bar0_raw as u64;
@@ -523,9 +516,7 @@ impl VirtioBlk {
                 core::arch::asm!("in eax, dx", in("dx") bar_port, lateout("eax") val, options(nostack, nomem, preserves_flags));
                 val
             };
-            serial::write_str("virtio-blk: legacy device features = 0x");
-            serial::write_hex(features as u64);
-            serial::write_str("\n");
+            
             
             // Acknowledge features
             core::arch::asm!("out dx, eax", in("dx") (bar_port + 0x04) as u16, in("eax") features, options(nostack, nomem, preserves_flags));
@@ -549,22 +540,32 @@ impl VirtioBlk {
             self.capacity = ((capacity_high as u64) << 32) | (capacity_low as u64);
             self.blk_size = 512;
             
-            serial::write_str("virtio-blk: legacy capacity = ");
-            serial::write_dec(self.capacity);
-            serial::write_str(" sectors\n");
+            
             
             if self.setup_legacy_virtqueue(bar_port).is_err() {
                 return false;
             }
             
             // Set DRIVER_OK status (after queue setup per virtio spec)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 15u8, options(nostack, nomem, preserves_flags));
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            
+            // Verify DRIVER_OK was accepted
+            let verify_status = {
+                let mut val: u8;
+                core::arch::asm!("in al, dx", 
+                    in("dx") (bar_port + 0x0F) as u16, 
+                    lateout("al") val, 
+                    options(nostack, nomem, preserves_flags));
+                val
+            };
             
             self.legacy_mode = true;
             self.legacy_bar = bar_addr;
             self.legacy_bar_port = bar_port;
             
-            serial::write_str("virtio-blk: legacy init complete\n");
+            
             true
         }
     }
@@ -585,9 +586,7 @@ impl VirtioBlk {
                 return Err("queue size is 0");
             }
             
-            serial::write_str("virtio-blk: legacy queue size = ");
-            serial::write_dec(queue_size as u64);
-            serial::write_str("\n");
+            
             
             let alloc = crate::memory::allocator();
             let queue_size = queue_size as usize;
@@ -642,7 +641,7 @@ impl VirtioBlk {
                 self.legacy_free_list[i] = i as u16;
             }
             
-            serial::write_str("virtio-blk: legacy virtqueue setup complete\n");
+            
             Ok(())
         }
     }
@@ -881,6 +880,26 @@ impl VirtioBlk {
             
             let mut timeout = 1000000;
             loop {
+                // Debug: read device status and ISR every 10000 iterations
+                if timeout % 100000 == 0 {
+                    let dev_status = {
+                        let mut val: u8;
+                        core::arch::asm!("in al, dx", 
+                            in("dx") (self.legacy_bar_port + 0x0F) as u16, 
+                            lateout("al") val, 
+                            options(nostack, nomem, preserves_flags));
+                        val
+                    };
+                    let isr_status = {
+                        let mut val: u8;
+                        core::arch::asm!("in al, dx", 
+                            in("dx") (self.legacy_bar_port + 0x10) as u16, 
+                            lateout("al") val, 
+                            options(nostack, nomem, preserves_flags));
+                        val
+                    };
+                }
+                
                 if let Some((id, _len)) = self.legacy_get_used() {
                     if id == head {
                         self.legacy_free_desc_chain(head);
