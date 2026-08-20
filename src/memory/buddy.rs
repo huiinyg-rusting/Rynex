@@ -11,6 +11,36 @@ const MAX_RESERVED: usize = 2048;
 static mut BUDDY_AUDIT_COUNTER: u64 = 0;
 static mut AUDIT_ACTIVE: bool = false;
 
+// Global free tracking to catch double-free at allocator level
+const FREED_PAGES_CAP: usize = 1 << 16; // 65536 pages
+static mut FREED_PAGES: [u64; FREED_PAGES_CAP] = [0; FREED_PAGES_CAP];
+static mut FREED_COUNT: usize = 0;
+
+fn track_freed_page(addr: u64) -> bool {
+    let idx = phys_to_idx(addr) as usize;
+    if idx >= MAX_REFC_PAGES { return false; }
+    unsafe {
+        for i in 0..FREED_COUNT {
+            if FREED_PAGES[i] == addr {
+                // Double-free detected at allocator level
+                let caller = core::intrinsics::return_address() as u64;
+                crate::serial::write_str("\n=== ALLOCATOR DOUBLE-FREE ===\n");
+                crate::serial::write_str("addr=0x");
+                crate::serial::write_hex(addr);
+                crate::serial::write_str(" caller=0x");
+                crate::serial::write_hex(caller);
+                crate::serial::write_str("\n");
+                return true;
+            }
+        }
+        if FREED_COUNT < FREED_PAGES_CAP {
+            FREED_PAGES[FREED_COUNT] = addr;
+            FREED_COUNT += 1;
+        }
+    }
+    false
+}
+
 /// Convert a physical address into the base-relative page index used by the
 /// buddy bitmap and page-type arrays (addr >> 12 is NOT the bitmap index
 /// unless the allocator base is 0).
@@ -516,6 +546,11 @@ impl BuddyAllocator {
     }
 
     pub fn free(&mut self, addr: u64, order: usize) {
+        // Global double-free detection at allocator level
+        if crate::memory::buddy::track_freed_page(addr) {
+            return; // Double-free detected, silently return
+        }
+
         // If the page was reserved, unreserve it first so it can be properly freed.
         // This handles the mallocng meta page which is reserved to prevent buddy
         // from reusing it during its lifetime, but must be freed when the task exits.
@@ -533,6 +568,7 @@ impl BuddyAllocator {
         used_clear(pidx);
         page_type_set(addr, PAGE_TYPE_FREE);
         df_record(pidx, caller, order);
+        crate::memory::buddy::track_freed_page(addr);
 
         // PTE 页：走引用计数，归零才真正释放（入隔离区）
         if order == 0 && old_type == PAGE_TYPE_PTE {
