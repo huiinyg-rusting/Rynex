@@ -144,11 +144,11 @@ pub extern "x86-interrupt" fn bound_range(frame: InterruptStackFrame) {
 
 pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     exit_user_task(&frame, "Invalid Opcode", &[]);
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_str("EXC: Invalid Opcode rip=0x");
     crate::serial::write_hex(frame.instruction_pointer.as_u64());
     crate::serial::write_str(" cs=0x");
-    let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_hex(cs as u64);
     crate::serial::write_str("\n");
     halt();
@@ -288,14 +288,14 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     let rsp = frame.stack_pointer.as_u64();
     let cs_val = frame.code_segment.0 as u64;
 
-     // Supervisor write to a read-only page: with CR0.WP=1 these fault. Resolve
-     // non-user (identity) pages by marking them writable; for user COW pages
-     // fall through to the normal handler.
-     if (cs_val & 3) == 0 && (code.bits() & 2) != 0 && (code.bits() & 1) != 0 {
-         if crate::paging::kernel_ro_write_resolve(cr2) {
-             return;
-         }
-     }
+    // Supervisor write to a read-only page: with CR0.WP=1 these fault. Resolve
+    // non-user (identity) pages by marking them writable; for user COW pages
+    // fall through to the normal handler.
+    if (cs_val & 3) == 0 && (code.bits() & 2) != 0 && (code.bits() & 1) != 0 {
+        if crate::paging::kernel_ro_write_resolve(cr2) {
+            return;
+        }
+    }
     if crate::paging::page_fault_resolve(cr2, code.bits() as u64, frame.code_segment.rpl() as u64) {
         return;
     }
@@ -313,63 +313,6 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::klog::s(" code=0x");
     crate::klog::hex(code.bits() as u64);
     crate::klog::s("\n");
-    crate::klog::end();
-    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
-    // "kstack" (the faulting task's kernel stack top) lives on the kernel
-    // heap (0x100000..0x100_0000); "frame rsp" is only readable if it lies
-    // in that kernel range, otherwise we substitute kstack-0x60.
-    let tid = crate::task::current_task_id();
-    let kstack = crate::task::task_kernel_stack_by_id(tid);
-    let kstack_ok = kstack >= 0x100_000 && kstack < 0x0100_0000;
-    if cs_val == 8 {
-        crate::klog::s("  task=");
-        crate::klog::dec(tid);
-        crate::klog::s(" kstack=0x");
-        crate::klog::hex(kstack);
-        crate::klog::s(" regs.rip=0x");
-        crate::klog::hex(crate::task::current_task_regs_rip());
-        crate::klog::s("\n");
-    }
-    if kstack_ok {
-        // Read only within [kstack-0x60 .. kstack): a purely kernel window.
-        let base = frame.stack_pointer.as_u64();
-        let base =
-            if base >= kstack - 0x60 && base < kstack { base } else { kstack - 0x60 };
-        crate::klog::s("  kframe[kstack-0x60..kstack]  rsp=0x");
-        crate::klog::hex(base);
-        crate::klog::s("\n");
-        for i in 0..12u64 {
-            let p = (kstack - 0x60 + i * 8) as *const u64;
-            let v = unsafe { core::ptr::read_volatile(p) };
-            if i % 4 == 0 { crate::klog::s("\n   "); }
-            crate::klog::hex(v);
-            crate::klog::s(" ");
-        }
-        crate::klog::s("\n");
-        // kchain below saved resume rsp, clamped to the kernel window.
-        let rsp = crate::task::current_task_regs_rsp();
-        let start = if rsp >= kstack - 0x60 && rsp < kstack {
-            rsp
-        } else {
-            kstack - 0x60
-        };
-        let mut addr = start;
-        for _ in 0..40usize {
-            if addr >= kstack { break; }
-            let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
-            crate::klog::s("   0x");
-            crate::klog::hex(addr);
-            crate::klog::s(" 0x");
-            crate::klog::hex(v);
-            crate::klog::s("\n");
-            addr += 8;
-        }
-    } else {
-        // User-mode fault. Reading the user stack from the page-fault handler
-        // (a context where the faulting user page may not be mapped yet) would
-        // itself fault and mask the real cause. Just log the state instead.
-        crate::klog::s("  user-fault; skip user stack (safe)\n");
-    }
     crate::klog::end();
 
     exit_user_task(&frame, "Page Fault", &[("addr", cr2), ("pf_code", code.bits())]);
