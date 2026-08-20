@@ -28,6 +28,7 @@ mod vfs;
 mod keyboard;
 mod tty;
 mod services;
+mod drivers;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -215,6 +216,9 @@ memory::init(_info);
     vfs_core::ramfs::init();
     vfs_core::init();
     let _root_vnode = vfs_core::mount_root();
+
+    drivers::virtio_blk::init_virtio_blk();
+    drivers::block_device::init_block_device().expect("block device init failed");
 
     // Register kernel services as named IPC ports. Clients connect to these by
     // name; in this phase the services remain in-kernel (see services.rs).
