@@ -234,6 +234,19 @@ impl TtyDevice {
         written
     }
 
+    /// Return the foreground process group owning this TTY. Shells use this via
+    /// `tcgetpgrp(0)` to decide whether they are in the foreground; if it does
+    /// not match their own pgrp they stop themselves with SIGTTIN. Returning a
+    /// stale/zero value here is what made ash hang before printing a prompt.
+    pub fn get_fg_pgrp(&self) -> i32 {
+        *self.fg_pgrp.lock()
+    }
+
+    /// Set the foreground process group (tcsetpgrp).
+    pub fn set_fg_pgrp(&self, pg: i32) {
+        *self.fg_pgrp.lock() = pg;
+    }
+
     fn get_termios(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         let termios = self.termios.lock();
         if buf.len() < core::mem::size_of::<Termios>() {
@@ -280,14 +293,6 @@ impl TtyDevice {
             );
         }
         Ok(core::mem::size_of::<Winsize>())
-    }
-
-    fn set_fg_pgrp(&self, pgrp: i32) {
-        *self.fg_pgrp.lock() = pgrp;
-    }
-
-    fn get_fg_pgrp(&self) -> i32 {
-        *self.fg_pgrp.lock()
     }
 }
 

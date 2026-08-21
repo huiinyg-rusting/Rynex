@@ -67,6 +67,21 @@ fn phys_to_idx(phys: u64) -> u64 {
     (phys - base) >> 12
 }
 
+/// Mark a freshly allocated page as used in the allocator bookkeeping and drop
+/// any stale double-free-tracker entry. Needed because reclaim-from-quarantine
+/// (`alloc_zeroed_page` -> `q_pop`) returns a page whose used bit / tracker
+/// entry were cleared when it was originally freed. Callers that allocate a
+/// page-table root this way (e.g. COW fork) must re-mark it so
+/// `free_address_space`'s guards don't misfire (FAS BADPML4) and so the page is
+/// not double-freed later.
+pub fn mark_page_used(phys: u64) {
+    let pidx = phys_to_idx(phys);
+    if pidx != u64::MAX {
+        used_mark(pidx);
+    }
+    untrack_freed_page(phys);
+}
+
 /// Query helper for paging.rs walk diagnostics: is this physical page marked
 /// used in the buddy bitmap? (page not tracked -> false)
 pub fn page_is_used(phys: u64) -> bool {
@@ -561,6 +576,10 @@ impl BuddyAllocator {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
             page_type_set(addr, PAGE_TYPE_PTE);
             pte_refc_inc(addr);
+            // The page was previously freed (recorded in the double-free
+            // tracker); reclaiming it makes a future free legitimate, so drop
+            // the stale tracker entry to avoid a false ALLOCATOR DOUBLE-FREE.
+            untrack_freed_page(addr);
             return Some(addr);
         }
         // Fallback: fresh allocation

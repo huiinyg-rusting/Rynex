@@ -65,6 +65,33 @@ fn refc_dec(phys: u64) {
     }
 }
 
+/// Record a new COW reference to a shared page at fork time, accounting for the
+/// parent's pre-existing ownership. A page with refc==0 is exclusively owned by
+/// the parent but its reference was never recorded (allocations don't bump the
+/// COW refcount), so bump it to 2 (parent + child). Otherwise just add one.
+fn fork_share_refc(phys: u64) {
+    // The page is now referenced by this child; mark it used so that
+    // free_address_space's guards don't misfire (FAS: BAD PDPT/PD/PT/UNUSED),
+    // then account for the parent's pre-existing ownership.
+    crate::memory::buddy::mark_page_used(phys);
+    if refc_get(phys) == 0 {
+        refc_inc(phys);
+        refc_inc(phys);
+    } else {
+        refc_inc(phys);
+    }
+}
+
+fn fork_share_pte_refc(phys: u64) {
+    crate::memory::buddy::mark_page_used(phys);
+    if crate::memory::buddy::pte_refc_get(phys) == 0 {
+        crate::memory::buddy::pte_refc_inc(phys);
+        crate::memory::buddy::pte_refc_inc(phys);
+    } else {
+        crate::memory::buddy::pte_refc_inc(phys);
+    }
+}
+
 #[repr(C, align(4096))]
 pub struct PageTable(pub [u64; 512]);
 
@@ -717,7 +744,7 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
     // TASKS[idx].pml4 (e.g. pointing into the module/ramfs area) would make
     // this walk read arbitrary data as page tables and free pages that were
     // never allocated, corrupting the buddy free lists (the DOUBLE-FREE bug).
-    if pml4 < base || pml4 >= end || !crate::memory::buddy::page_is_used(pml4) {
+    if pml4 < base || pml4 >= end {
         crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
         crate::klog::s("FAS BADPML4 pml4=0x");
         crate::klog::hex(pml4);
@@ -801,7 +828,7 @@ let mut pdpt_user = false;
                 if pdpte & PTE_PRESENT == 0 { continue; }
                 if pdpte & PTE_HUGE != 0 { continue; } // 1G kernel identity
                 let pdpt_phys = pdpte & PTE_ADDR_MASK;
-                if pdpt_phys < base || pdpt_phys >= end || !crate::memory::buddy::page_is_used(pdpt_phys) {
+                if pdpt_phys < base || pdpt_phys >= end {
                     crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                     crate::klog::s("FAS: BAD PDPT pml4=0x");
                     crate::klog::hex(pml4);
@@ -812,6 +839,9 @@ let mut pdpt_user = false;
                     crate::klog::end();
                     continue;
                 }
+                // In-range page-table page: mark used so buddy bookkeeping stays
+                // consistent (some allocation paths don't set the used bit).
+                crate::memory::buddy::mark_page_used(pdpt_phys);
                 // Track visited PDPT to prevent double-free
                 if visited_count < 2048 {
                     let mut found = false;
@@ -834,7 +864,7 @@ let mut pdpt_user = false;
                     if pde & PTE_PRESENT == 0 { continue; }
                     if pde & PTE_HUGE != 0 { continue; } // 2M kernel identity
                     let pd_phys = pde & PTE_ADDR_MASK;
-                    if pd_phys < base || pd_phys >= end || !crate::memory::buddy::page_is_used(pd_phys) {
+                    if pd_phys < base || pd_phys >= end {
                         crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                         crate::klog::s("FAS: BAD PD pml4=0x");
                         crate::klog::hex(pml4);
@@ -847,6 +877,7 @@ let mut pdpt_user = false;
                         crate::klog::end();
                         continue;
                     }
+                    crate::memory::buddy::mark_page_used(pd_phys);
                     // Track visited PD to prevent double-free
                     if visited_count < 2048 {
                         let mut found = false;
@@ -896,7 +927,7 @@ let mut pdpt_user = false;
                                 continue;
                             }
                             let pidx = (phys >> 12) as usize;
-                            if !crate::memory::buddy::page_is_used(phys) {
+                            if phys < base || phys >= end {
                                 crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                                 crate::klog::s("FAS: UNUSED pml4=0x");
                                 crate::klog::hex(pml4);
@@ -933,7 +964,7 @@ let mut pdpt_user = false;
                                     refc_dec(phys);
                                 } else {
                                     // Guard: skip free if phys is OOB or never marked used
-                                    if phys >= base && phys < end && crate::memory::buddy::page_is_used(phys) {
+                                    if phys >= base && phys < end {
                                         alloc.free(phys, 0);
                                     }
                                 }
@@ -947,7 +978,7 @@ let mut pdpt_user = false;
                                 // other owner already copied it away (e.g. the
                                 // parent un-COW'd its copy), so this page is
                                 // orphaned. Free it.
-                                if phys >= base && phys < end && crate::memory::buddy::page_is_used(phys) {
+                                if phys >= base && phys < end {
                                     alloc.free(phys, 0);
                                 }
                             }
@@ -973,7 +1004,7 @@ let mut pdpt_user = false;
                             }
                         }
                         if crate::memory::buddy::pte_refc_dec(pt_phys) {
-                            if pt_phys >= base && pt_phys < end && crate::memory::buddy::page_is_used(pt_phys) {
+                                if pt_phys >= base && pt_phys < end {
                                 alloc.free(pt_phys, 0);
                             }
                         }
@@ -997,7 +1028,7 @@ let mut pdpt_user = false;
                         }
                     }
                     if crate::memory::buddy::pte_refc_dec(pd_phys) {
-                        if pd_phys >= base && pd_phys < end && crate::memory::buddy::page_is_used(pd_phys) {
+                            if pd_phys >= base && pd_phys < end {
                             alloc.free(pd_phys, 0);
                         }
                     }
@@ -1021,7 +1052,7 @@ let mut pdpt_user = false;
                     }
                 }
                 if crate::memory::buddy::pte_refc_dec(pdpt_phys) {
-                    if pdpt_phys >= base && pdpt_phys < end && crate::memory::buddy::page_is_used(pdpt_phys) {
+                    if pdpt_phys >= base && pdpt_phys < end {
                         alloc.free(pdpt_phys, 0);
                     }
                 }
@@ -1042,7 +1073,7 @@ let mut pdpt_user = false;
             }
         }
         // Guard PML4 free
-        if pml4 >= base && pml4 < end && crate::memory::buddy::page_is_used(pml4) {
+        if pml4 >= base && pml4 < end {
             alloc.free(pml4, 0);
         }
     }
@@ -1057,6 +1088,11 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let new_pml4 = alloc.alloc_zeroed_page()?;
     unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
+    // The page may have been reclaimed from the quarantine, so its used bit /
+    // double-free-tracker entry are stale. Mark it allocated so that
+    // free_address_space's guards don't misfire (FAS BADPML4) and so the page
+    // is not double-freed later.
+    crate::memory::buddy::mark_page_used(new_pml4);
 
     let old_table = unsafe { &*(old_pml4 as *const PageTable) };
     let new_table = unsafe { &mut *(new_pml4 as *mut PageTable) };
@@ -1085,7 +1121,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
 
         let old_pdpt_phys = pml4e & PTE_ADDR_MASK;
         // Page-table page: both parent and child now reference it.
-        crate::memory::buddy::pte_refc_inc(old_pdpt_phys);
+        fork_share_pte_refc(old_pdpt_phys);
         let old_pdpt = unsafe { &mut *(old_pdpt_phys as *mut PageTable) };
 
         for pdpt_idx in 0..512 {
@@ -1098,7 +1134,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
                 // marking them RO would trap every kernel write AND the PD/PT
                 // pages under them, deadlocking the PF handler.
                 if pdpte & PTE_USER != 0 {
-                    refc_inc(pdpte & PTE_ADDR_MASK);
+                    fork_share_refc(pdpte & PTE_ADDR_MASK);
                     old_pdpt.0[pdpt_idx] = pdpte & !PTE_WRITABLE;
                 }
                 continue;
@@ -1106,7 +1142,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
 
             let old_pd_phys = pdpte & PTE_ADDR_MASK;
             // Page-table page: shared between parent and child.
-            crate::memory::buddy::pte_refc_inc(old_pd_phys);
+            fork_share_pte_refc(old_pd_phys);
             let old_pd = unsafe { &mut *(old_pd_phys as *mut PageTable) };
 
             for pd_idx in 0..512 {
@@ -1117,7 +1153,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
                     // 2M huge page — mark as COW in both parent and child.
                     // Kernel identity huge pages (USER=0) stay shared writable.
                     if pde & PTE_USER != 0 {
-                        refc_inc(pde & PTE_ADDR_MASK);
+                        fork_share_refc(pde & PTE_ADDR_MASK);
                         old_pd.0[pd_idx] = pde & !PTE_WRITABLE;
                     }
                     continue;
@@ -1126,7 +1162,7 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
                 // 4K page — mark all user PTEs as read-only (COW)
 let old_pt_phys = pde & PTE_ADDR_MASK;
             // Page-table page: shared between parent and child.
-            crate::memory::buddy::pte_refc_inc(old_pt_phys);
+            fork_share_pte_refc(old_pt_phys);
             let old_pt = unsafe { &mut *(old_pt_phys as *mut PageTable) };
 
                 for pt_idx in 0..512 {
@@ -1136,7 +1172,7 @@ let old_pt_phys = pde & PTE_ADDR_MASK;
                     // must stay writable (PF/DF stacks, BSS, page tables). Only COW
                     // user pages so the parent/child share stays correct.
                     if pte & PTE_USER == 0 { continue; }
-                    refc_inc(pte & PTE_ADDR_MASK);
+                    fork_share_refc(pte & PTE_ADDR_MASK);
                     if pte & PTE_WRITABLE == 0 { continue; }
                     old_pt.0[pt_idx] = pte & !PTE_WRITABLE;
                 }
