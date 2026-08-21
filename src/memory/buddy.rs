@@ -41,6 +41,21 @@ fn track_freed_page(addr: u64) -> bool {
     false
 }
 
+fn untrack_freed_page(addr: u64) {
+    let idx = phys_to_idx(addr) as usize;
+    if idx >= MAX_REFC_PAGES { return; }
+    unsafe {
+        for i in 0..FREED_COUNT {
+            if FREED_PAGES[i] == addr {
+                // Remove by swapping with last element
+                FREED_PAGES[i] = FREED_PAGES[FREED_COUNT - 1];
+                FREED_COUNT -= 1;
+                return;
+            }
+        }
+    }
+}
+
 /// Convert a physical address into the base-relative page index used by the
 /// buddy bitmap and page-type arrays (addr >> 12 is NOT the bitmap index
 /// unless the allocator base is 0).
@@ -195,7 +210,11 @@ fn q_log_full() {
 
 fn log_double_free(addr: u64, ctx: &str, order: usize, caller: u64) {
     crate::serial::write_str("\n=== DOUBLE-FREE DETECTED ===\n");
-    crate::serial::write_str("addr=0x");
+    crate::serial::write_str(" base=0x");
+    crate::serial::write_hex(alloc_base());
+    crate::serial::write_str(" pidx=");
+    crate::serial::write_dec(phys_to_idx(addr));
+    crate::serial::write_str(" addr=0x");
     crate::serial::write_hex(addr);
     crate::serial::write_str(" order=");
     crate::serial::write_dec(order as u64);
@@ -206,19 +225,26 @@ fn log_double_free(addr: u64, ctx: &str, order: usize, caller: u64) {
     crate::serial::write_str(" type=");
     crate::serial::write_dec(page_type_get(addr) as u64);
     crate::serial::write_str(" used=");
-    crate::serial::write_dec(used_set((addr >> 12) as u64) as u64);
+    crate::serial::write_dec(used_set(phys_to_idx(addr)) as u64);
     crate::serial::write_str(" cr3=0x");
     crate::serial::write_hex(crate::task::current_task_pml4());
     crate::serial::write_str(" task=");
     crate::serial::write_dec(crate::task::current_task_id());
+    let pidx = phys_to_idx(addr);
+    if (pidx as usize) < DF_MAX_PAGES {
+        crate::serial::write_str(" first_caller=0x");
+        unsafe { crate::serial::write_hex(DF_LAST_CALLER[pidx as usize] as u64); }
+        crate::serial::write_str(" first_order=");
+        unsafe { crate::serial::write_dec(DF_LAST_ORDER[pidx as usize] as u64); }
+    }
     crate::serial::write_str("\n");
 }
 
 // Per-page record of the MOST RECENT free. When a page is freed twice without
 // an intervening alloc (used_clear sees an already-clear bit), the latch fires
 // and dumps the first free site so the DOUBLE-FREE root cause can be found.
-// Sized for up to 256 MiB of RAM (65536 pages); the test rig uses -m 64M.
-const DF_MAX_PAGES: usize = 65536;
+// Sized to cover the test rig (uses -m 512M -> ~130k pages); USED_BMP covers 8 GiB.
+const DF_MAX_PAGES: usize = 1 << 18;
 static mut DF_LAST_CALLER: [u32; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
 static mut DF_LAST_TICK: [u32; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
 static mut DF_LAST_ORDER: [u8; DF_MAX_PAGES] = [0; DF_MAX_PAGES];
@@ -503,6 +529,7 @@ impl BuddyAllocator {
                 }
                 let pidx = self.page_index(addr);
                 used_mark(pidx);
+                crate::memory::buddy::untrack_freed_page(addr);
                 self.free_lists[o] = next;
 
                 for so in (order..o).rev() {
@@ -568,7 +595,6 @@ impl BuddyAllocator {
         used_clear(pidx);
         page_type_set(addr, PAGE_TYPE_FREE);
         df_record(pidx, caller, order);
-        crate::memory::buddy::track_freed_page(addr);
 
         // PTE 页：走引用计数，归零才真正释放（入隔离区）
         if order == 0 && old_type == PAGE_TYPE_PTE {
