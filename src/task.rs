@@ -3626,18 +3626,10 @@ fn sys_fork() -> i64 {
         child_regs.r15 = SYSCALL_CALLEE_REGS[5];
 
         let child = &mut TASKS[child_idx];
-        // Hack: init (pid=1) forks multiple times (shells), but only the first
-        // child (the test program) should run initially. Block extras so they
-        // don't triple-fault on unmapped user code. They'll be woken if they
-        // ever exec.
-        let child_state = if id == 1 {
-            static INIT_FORK_COUNT: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = INIT_FORK_COUNT.fetch_add(1, Ordering::SeqCst);
-            if n == 0 { TaskState::Ready } else { TaskState::Blocked }
-        } else {
-            TaskState::Ready
-        };
+        // All forked children start Ready so they are scheduled and can run
+        // (and exec). Previously init's 2nd+ children were left Blocked, which
+        // permanently prevented the shell from ever starting.
+        let child_state = TaskState::Ready;
         *child = Task {
             id: child_tid,
             tgid: child_tid,
@@ -5374,7 +5366,36 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
             // (busybox ash) can actually change termios, e.g. disable ECHO
             // while doing their own line editing. Without this, the kernel
             // keeps echoing input on the VGA console, duplicating the prompt.
-            TIOCSPGRP | TIOCGPGRP => return 0,
+            //
+            // TIOCGPGRP / TIOCSPGRP: report the foreground process group so
+            // interactive shells (busybox ash) don't stop themselves with
+            // SIGTTIN thinking they are backgrounded. On first query the
+            // foreground group defaults to the caller's own pgrp.
+            TIOCSPGRP | TIOCGPGRP => {
+                if request == TIOCSPGRP {
+                    if arg3 != 0 {
+                        let pg = unsafe { *(arg3 as *const i32) };
+                        crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
+                    }
+                    return 0;
+                } else {
+                    let id = current_task_id();
+                    let tgid = if id == 0 {
+                        0
+                    } else {
+                        unsafe { TASKS[task_idx(id)].tgid as i32 }
+                    };
+                    let mut pg = crate::tty::TTY_DEVICE.get_fg_pgrp();
+                    if pg == 0 {
+                        pg = tgid;
+                        crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
+                    }
+                    if arg3 != 0 {
+                        unsafe { *(arg3 as *mut i32) = pg; }
+                    }
+                    return 0;
+                }
+            }
             _ => {}
         }
     }
