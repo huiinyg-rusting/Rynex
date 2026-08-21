@@ -604,10 +604,20 @@ fn alloc_stack(pages: usize) -> Option<u64> {
 fn free_stack(base: u64, pages: usize) {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let addr = base - pages as u64 * PAGE_SIZE;
+    // Guard against double-free: if the stack block's used bit is already clear,
+    // it was freed earlier (e.g. reap ran twice for the same task, or the slot
+    // was reused). Skip rather than corrupt the buddy free lists.
+    if !crate::memory::buddy::page_is_used(addr) {
+        return;
+    }
+    alloc.free(addr, order_for_pages(pages + 1));
+    // Mark the whole stack block free AFTER the buddy free, so that alloc.free's
+    // `old_type == PAGE_TYPE_FREE` double-free check does not mistake our own
+    // pre-mark for an already-freed page (which caused false DETECTED reports
+    // for the normal alloc→free→alloc-reuse→free lifecycle of a stack block).
     for i in 0..=pages {
         crate::memory::buddy::page_type_set(addr + i as u64 * PAGE_SIZE, crate::memory::buddy::PAGE_TYPE_FREE);
     }
-    alloc.free(addr, order_for_pages(pages + 1));
 }
 
 // ── Task creation ────────────────────────────────────────────────

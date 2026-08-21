@@ -499,15 +499,15 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
             let bar_port = bar_addr as u16;
             
             // Reset device
-            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 0u8, options(nostack, nomem, preserves_flags));
+            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x12) as u16, in("al") 0u8, options(nostack, nomem, preserves_flags));
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Set ACKNOWLEDGE status
-            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 1u8, options(nostack, nomem, preserves_flags));
+            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x12) as u16, in("al") 1u8, options(nostack, nomem, preserves_flags));
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Set DRIVER status
-            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 3u8, options(nostack, nomem, preserves_flags));
+            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x12) as u16, in("al") 3u8, options(nostack, nomem, preserves_flags));
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Read device features
@@ -518,11 +518,14 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
             };
             
             
-            // Acknowledge features
+            // Acknowledge features. Mask off VIRTIO_F_EVENT_IDX (bit 29) so the
+            // device uses the standard virtqueue layout (avail ring has no
+            // used_event tail field), keeping our descriptor-area math in sync.
+            let features = features & !(1u32 << 29);
             core::arch::asm!("out dx, eax", in("dx") (bar_port + 0x04) as u16, in("eax") features, options(nostack, nomem, preserves_flags));
             
             // Set FEATURES_OK status (before queue setup)
-            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 7u8, options(nostack, nomem, preserves_flags));
+            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x12) as u16, in("al") 7u8, options(nostack, nomem, preserves_flags));
             
             // Read config space for capacity from I/O port
             let capacity_port = (bar_addr + 20) as u16;
@@ -548,18 +551,34 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
             
             // Set DRIVER_OK status (after queue setup per virtio spec)
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x0F) as u16, in("al") 15u8, options(nostack, nomem, preserves_flags));
+            core::arch::asm!("out dx, al", in("dx") (bar_port + 0x12) as u16, in("al") 15u8, options(nostack, nomem, preserves_flags));
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             
             // Verify DRIVER_OK was accepted
             let verify_status = {
                 let mut val: u8;
                 core::arch::asm!("in al, dx", 
-                    in("dx") (bar_port + 0x0F) as u16, 
+                    in("dx") (bar_port + 0x12) as u16, 
                     lateout("al") val, 
                     options(nostack, nomem, preserves_flags));
                 val
             };
+            serial::write_str("virtio-blk: DRIVER_OK status = 0x");
+            serial::write_hex(verify_status as u64);
+            serial::write_str("\n");
+            
+            // Read queue address register to verify
+            let qaddr_lo = {
+                let mut val: u32;
+                core::arch::asm!("in eax, dx", 
+                    in("dx") (bar_port + 0x08) as u16, 
+                    lateout("eax") val, 
+                    options(nostack, nomem, preserves_flags));
+                val
+            };
+            serial::write_str("virtio-blk: QueueAddress low = 0x");
+            serial::write_hex(qaddr_lo as u64);
+            serial::write_str("\n");
             
             self.legacy_mode = true;
             self.legacy_bar = bar_addr;
@@ -586,37 +605,33 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
                 return Err("queue size is 0");
             }
             
-            
-            
             let alloc = crate::memory::allocator();
             let queue_size = queue_size as usize;
             
             // For legacy virtio, the entire virtqueue must be a single contiguous region:
             // - Descriptor table: queue_size * 16 bytes
-            // - Avail ring: 6 + queue_size * 2 bytes
-            // - Used ring: 6 + queue_size * 8 bytes
+            // - Avail ring: 4 + queue_size * 2 bytes (4-byte header: flags + idx)
+            // - Used ring: 4 + queue_size * 8 bytes (4-byte header: flags + idx)
             let desc_size = queue_size * 16;
-            let avail_size = 6 + queue_size * 2;
-            let used_size = 6 + queue_size * 8;
-            
-            // Align each section to 16-byte boundary
-            let desc_end = desc_size;
-            let avail_offset = ((desc_end + 15) & !15) as u64;
-            let used_offset = ((avail_offset + 6 + queue_size as u64 * 2 + 15) & !15) as u64;
-            let total_size = (used_offset + 6 + queue_size as u64 * 8) as usize;
-            
-            let pages = (total_size + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
+            let avail_size = 4 + queue_size * 2;
+            let used_size = 4 + queue_size * 8;
+
+            // Legacy virtio layout (single shared region):
+            // - Descriptor table: queue_size * 16 bytes (16-byte aligned)
+            // - Available ring: 4 + queue_size*2 bytes, starts right after desc
+            // - Used ring: MUST be aligned to a page (4096) boundary
+            let avail_offset = desc_size as u64; // desc_size is a multiple of 16
+            let used_offset = (((avail_offset + avail_size as u64) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) as u64;
+            let total_size = used_offset + used_size as u64;
+
+            let pages = ((total_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
             let base_phys = alloc.alloc(pages).ok_or("failed to alloc virtqueue")?;
             core::ptr::write_bytes(base_phys as *mut u8, 0, pages * PAGE_SIZE as usize);
             
             let desc_phys = base_phys;
             let avail_phys = base_phys + avail_offset;
             let used_phys = base_phys + used_offset;
-            
-            
-            
-            core::ptr::write_bytes(base_phys as *mut u8, 0, pages * PAGE_SIZE as usize);
-            
+
             // Initialize avail ring header
             let avail = avail_phys as *mut VirtqAvail;
             (*avail).flags = 0;
@@ -627,8 +642,12 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
             (*used).flags = 0;
             (*used).idx = 0;
             
-            // Write queue address to device (legacy mode: 32-bit only)
-            core::arch::asm!("out dx, eax", in("dx") (self.legacy_bar_port + 0x08) as u16, in("eax") (desc_phys & 0xFFFFFFFF) as u32, options(nostack, nomem, preserves_flags));
+            // Write queue address to device. Legacy virtio QueueAddress register
+            // expects a PFN (physical page frame number), NOT a byte address:
+            // the device computes the descriptor-table physical address as
+            // (value << 12). Pass desc_phys >> 12.
+            let queue_pfn = ((desc_phys >> 12) & 0xFFFFFFFF) as u32;
+            core::arch::asm!("out dx, eax", in("dx") (bar_port + 0x08) as u16, in("eax") queue_pfn, options(nostack, nomem, preserves_flags));
             
             // Store virtqueue info
             self.legacy_desc_phys = desc_phys;
@@ -868,24 +887,24 @@ impl VirtioBlk {
             {
                 let avail = self.legacy_avail_phys as *mut VirtqAvail;
                 let idx = (*avail).idx as usize % self.legacy_queue_size as usize;
-                let ring_ptr = (avail as *mut u8).add(6) as *mut u16; // skip flags (2) + idx (2) + padding (2) = 6
+                let ring_ptr = (avail as *mut u8).add(4) as *mut u16; // skip flags (2) + idx (2) = 4
                 unsafe { *ring_ptr.add(idx) = head; }
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 (*avail).idx = (*avail).idx.wrapping_add(1);
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            
+
             // Kick the queue
             core::arch::asm!("out dx, ax", in("dx") (self.legacy_bar_port + 0x10) as u16, in("ax") 0u16, options(nostack, nomem, preserves_flags));
-            
+
             let mut timeout = 1000000;
             loop {
-                // Debug: read device status and ISR every 10000 iterations
+                // Debug: read device status and ISR every 100000 iterations
                 if timeout % 100000 == 0 {
                     let dev_status = {
                         let mut val: u8;
                         core::arch::asm!("in al, dx", 
-                            in("dx") (self.legacy_bar_port + 0x0F) as u16, 
+                            in("dx") (self.legacy_bar_port + 0x12) as u16, 
                             lateout("al") val, 
                             options(nostack, nomem, preserves_flags));
                         val
@@ -893,15 +912,30 @@ impl VirtioBlk {
                     let isr_status = {
                         let mut val: u8;
                         core::arch::asm!("in al, dx", 
-                            in("dx") (self.legacy_bar_port + 0x10) as u16, 
+                            in("dx") (self.legacy_bar_port + 0x13) as u16, 
                             lateout("al") val, 
                             options(nostack, nomem, preserves_flags));
                         val
                     };
+                    serial::write_str("virtio-blk: poll dev_status=0x");
+                    serial::write_hex(dev_status as u64);
+                    serial::write_str(" isr=0x");
+                    serial::write_hex(isr_status as u64);
+                    serial::write_str(" used_idx=");
+                    unsafe {
+                        let used = self.legacy_used_phys as *mut VirtqUsed;
+                        serial::write_dec((*used).idx as u64);
+                    }
+                    serial::write_str("\n");
                 }
                 
                 if let Some((id, _len)) = self.legacy_get_used() {
                     if id == head {
+                        // For read requests the device wrote the data into the
+                        // kernel page at data_phys; copy it back to the caller buf.
+                        if writable && len > 0 {
+                            core::ptr::copy_nonoverlapping(data_phys as *mut u8, data, len as usize);
+                        }
                         self.legacy_free_desc_chain(head);
                         let alloc = crate::memory::allocator();
                         alloc.free(req_phys, 0);
@@ -967,7 +1001,7 @@ impl VirtioBlk {
             }
             let ring_idx = (self.legacy_last_used_idx % self.legacy_queue_size) as usize;
             // Used ring: 6 bytes header (flags:2, idx:2, padding:2) + 8 bytes per element
-            let ring_ptr = (used as *mut u8).add(6) as *mut VirtqUsedElem;
+            let ring_ptr = (used as *mut u8).add(4) as *mut VirtqUsedElem;
             let elem = unsafe { &*ring_ptr.add(ring_idx) };
             self.legacy_last_used_idx = self.legacy_last_used_idx.wrapping_add(1);
             Some((elem.id as u16, elem.len))
