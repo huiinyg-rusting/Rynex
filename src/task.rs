@@ -398,9 +398,12 @@ impl RunQueue {
 
 static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
 static mut RUNQUEUE: RunQueue = RunQueue::new();
+// Serializes all runqueue mutations. IRQ-safe so the timer ISR and syscalls can
+// both touch the runqueue without corrupting the linked lists / bitmap.
+static RUNQUEUE_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
 static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
-static NEXT_TID: AtomicU64 = AtomicU64::new(1);
-// Whether pid 1 has been handed out (to init). Guarded by NEXT_TID logic.
+// Whether pid 1 (slot 0) has been handed out (to init), so it can't be aliased.
+// The actual slot accounting is done by PID_BITMAP.
 static INIT_TASK_ASSIGNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // Task slot of the init task, passed across the boot-time stack switch.
 static mut BOOT_INIT_SLOT: usize = 0;
@@ -480,7 +483,68 @@ pub fn current_task_regs_rsp() -> u64 {
 }
 
 fn task_idx(id: u64) -> usize {
-    (id % MAX_TASKS as u64) as usize
+    // pid == slot (boot/idle is pid 0 → slot 0, init is pid 1 → slot 1, ...).
+    // Pids are handed out from a 64-bit bitmap, so they are always < MAX_TASKS
+    // and never alias task slots (the old `id % MAX_TASKS` rollover is gone).
+    if id as usize >= MAX_TASKS { 0 } else { id as usize }
+}
+
+// ── PID allocation ────────────────────────────────────────────────────────────
+// Bitmap of occupied task slots. Bit 0 is pre-set (pid 0 = boot/idle task).
+// A pid is exactly its slot index, so pids never alias. Allocated with a
+// lock-free CAS loop (SMP-safe).
+static PID_BITMAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn alloc_pid_from(min_slot: u64) -> Option<u64> {
+    if min_slot >= MAX_TASKS as u64 {
+        return None;
+    }
+    let mut bm = PID_BITMAP.load(Ordering::SeqCst);
+    loop {
+        let shifted = bm >> min_slot;
+        let bit = if shifted == u64::MAX {
+            MAX_TASKS as u32
+        } else {
+            min_slot as u32 + shifted.trailing_ones()
+        };
+        if bit >= MAX_TASKS as u32 {
+            return None;
+        }
+        let mask = 1u64 << bit;
+        match PID_BITMAP.compare_exchange(bm, bm | mask, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Some(bit as u64),
+            Err(x) => bm = x,
+        }
+    }
+}
+
+fn alloc_pid_specific(slot: u64) -> bool {
+    if slot >= MAX_TASKS as u64 {
+        return false;
+    }
+    let mask = 1u64 << slot;
+    let mut bm = PID_BITMAP.load(Ordering::SeqCst);
+    loop {
+        if bm & mask != 0 {
+            return false;
+        }
+        match PID_BITMAP.compare_exchange(bm, bm | mask, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(x) => bm = x,
+        }
+    }
+}
+
+// Boot/idle task (pid 0) occupies slot 0; kernel tasks start at slot 2 so they
+// never collide with init (pid 1, slot 1). User forks/clones take the next free slot.
+fn alloc_kernel_pid() -> Option<u64> { alloc_pid_from(2) }
+fn alloc_user_pid() -> Option<u64> { alloc_pid_from(1) }
+
+fn free_pid(pid: u64) {
+    if pid == 0 || pid as usize >= MAX_TASKS {
+        return;
+    }
+    PID_BITMAP.fetch_and(!(1u64 << pid), Ordering::SeqCst);
 }
 
 pub fn current_task() -> Option<&'static mut Task> {
@@ -497,6 +561,7 @@ pub fn task_by_id(id: u64) -> Option<&'static mut Task> {
 // ── Runqueue operations ──────────────────────────────────────────
 
 fn enqueue_task(tid: u64, prio: u8) {
+    let _g = RUNQUEUE_LOCK.lock();
     unsafe {
         let rq = &mut RUNQUEUE;
         let idx = task_idx(tid);
@@ -517,6 +582,7 @@ fn enqueue_task(tid: u64, prio: u8) {
 }
 
 fn dequeue_task() -> Option<u64> {
+    let _g = RUNQUEUE_LOCK.lock();
     unsafe {
         let rq = &mut RUNQUEUE;
         if rq.bitmap == 0 {
@@ -537,6 +603,7 @@ fn dequeue_task() -> Option<u64> {
 }
 
 fn remove_from_runqueue(tid: u64) -> bool {
+    let _g = RUNQUEUE_LOCK.lock();
     unsafe {
         let rq = &mut RUNQUEUE;
         let idx = task_idx(tid);
@@ -590,7 +657,7 @@ fn order_for_pages(pages: usize) -> usize {
     order
 }
 
-fn alloc_stack(pages: usize) -> Option<u64> {
+pub fn alloc_stack(pages: usize) -> Option<u64> {
     let alloc = unsafe { &mut *crate::memory::allocator() };
     let order = order_for_pages(pages + 1);
     alloc.alloc(order).map(|p| {
@@ -631,12 +698,9 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32, comm: &[u8]) -> Option<u64
     // whether to run as the single-instance init). Kernel tasks use pids from
     // a low band (2,3,...) that never collides with init's pid 1; task_idx is
     // id % 64, so pids must stay below 64 to avoid aliasing task slots.
-    let tid = loop {
-        let t = NEXT_TID.load(Ordering::SeqCst);
-        let bump = if t < 2 { 2 } else { t };
-        if NEXT_TID.compare_exchange(t, bump + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            break bump;
-        }
+    let tid = match alloc_kernel_pid() {
+        Some(t) => t,
+        None => return None,
     };
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
 
@@ -688,12 +752,23 @@ pub fn create_user_task(entry: u64, pml4: u64, user_stack_top: u64) -> Option<u6
 pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i32) -> Option<u64> {
     // The first user task (init) must be pid 1: busybox init checks
     // getpid()==1 to decide whether to run as the single-instance init.
-    let tid = if !INIT_TASK_ASSIGNED.swap(true, Ordering::SeqCst) {
-        // First user task gets pid 1; ensure NEXT_TID reflects it.
-        NEXT_TID.store(2, Ordering::SeqCst);
-        1
+    let tid = if !INIT_TASK_ASSIGNED.load(Ordering::SeqCst) {
+        // The first user task must be pid 1 (busybox init checks getpid()==1),
+        // which is slot 1 in the pid==slot bitmap (slot 0 is the boot/idle task).
+        if alloc_pid_specific(1) {
+            INIT_TASK_ASSIGNED.store(true, Ordering::SeqCst);
+            1u64
+        } else {
+            match alloc_user_pid() {
+                Some(t) => t,
+                None => return None,
+            }
+        }
     } else {
-        NEXT_TID.fetch_add(1, Ordering::SeqCst)
+        match alloc_user_pid() {
+            Some(t) => t,
+            None => return None,
+        }
     };
     serial::write_str("TASK: create_user_task_prio entry\n");
     let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)?;
@@ -834,6 +909,11 @@ pub fn init_scheduler() {
         crate::klog::s("SCHED: initialized (priority runqueue)\n");
         crate::klog::end();
     }
+}
+
+pub fn mark_cpu_online(_apic_id: u32) {
+    // Per-CPU online tracking can be expanded later (e.g., per-CPU runqueues)
+    // For now, just acknowledge the AP is alive.
 }
 
 pub fn schedule() {
@@ -3139,6 +3219,7 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                         crate::paging::free_address_space(child_pml4, addr_private);
                     }
                     TASKS[i] = Task::empty();
+                    free_pid(child_id);
                     return child_id as i64;
                 }
             }
@@ -3567,21 +3648,11 @@ fn sys_fork() -> i64 {
     if id == 0 { return -EINVAL; }
 
     unsafe {
-        let mut child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-        let mut child_idx = task_idx(child_tid);
-
-        // Ensure slot is free: permanent kernel tasks (e.g. ping server, tid 2)
-        // occupy low slots, so scan forward to the first free one.
-        for _ in 0..MAX_TASKS {
-            if TASKS[child_idx].id == 0 || TASKS[child_idx].state == TaskState::Empty {
-                break;
-            }
-            child_tid += 1;
-            child_idx = task_idx(child_tid);
-        }
-        if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
-            return -ENOMEM;
-        }
+        let child_tid = match alloc_user_pid() {
+            Some(t) => t,
+            None => return -ENOMEM,
+        };
+        let child_idx = task_idx(child_tid);
 
         // Clone parent's fd table so the child inherits stdin/stdout/stderr
         let parent_fds = crate::vfs::get_fd_table();
@@ -3594,7 +3665,10 @@ fn sys_fork() -> i64 {
         let parent = &TASKS[parent_idx];
         let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
             Some(s) => s,
-            None => return -ENOMEM,
+            None => {
+                free_pid(child_tid);
+                return -ENOMEM;
+            }
         };
 
         // Clone PML4 with COW
@@ -3602,6 +3676,7 @@ fn sys_fork() -> i64 {
             Some(p) => p,
             None => {
                 free_stack(kernel_stack, KERNEL_STACK_PAGES);
+                free_pid(child_tid);
                 return -ENOMEM;
             }
         };
@@ -3716,19 +3791,11 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
     serial::write_str("\n");
 
     unsafe {
-        let mut child_tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-        let mut child_idx = task_idx(child_tid);
-
-        for _ in 0..MAX_TASKS {
-            if TASKS[child_idx].id == 0 || TASKS[child_idx].state == TaskState::Empty {
-                break;
-            }
-            child_tid += 1;
-            child_idx = task_idx(child_tid);
-        }
-        if TASKS[child_idx].id != 0 && TASKS[child_idx].state != TaskState::Empty {
-            return -ENOMEM;
-        }
+        let child_tid = match alloc_user_pid() {
+            Some(t) => t,
+            None => return -ENOMEM,
+        };
+        let child_idx = task_idx(child_tid);
 
         // Clone parent's fd table so the child inherits stdin/stdout/stderr
         let parent_fds = crate::vfs::get_fd_table();
@@ -5042,6 +5109,15 @@ fn sys_rt_sigaction(sig: i32, act: u64, oldact: u64) -> i64 {
                 return -EFAULT;
             }
             let ka = core::ptr::read_volatile(act as *const KSigAction);
+            // The handler/restorer run in user mode; reject kernel addresses to
+            // prevent a #GP / stray execution (SIG_DFL=0 and SIG_IGN=1 are valid
+            // sentinels and also pass the user-range check).
+            if !crate::paging::is_user_addr(ka.handler) {
+                return -EFAULT;
+            }
+            if !crate::paging::is_user_addr(ka.restorer) {
+                return -EFAULT;
+            }
             TASKS[idx].sig_handlers[sigi] = SignalAction {
                 handler: ka.handler,
                 flags: ka.flags,

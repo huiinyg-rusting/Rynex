@@ -64,8 +64,15 @@ fn apply_rela_relocations(data: &[u8], load_addr: u64, pml4: u64, max_end: u64) 
     let mut found_dynamic = false;
 
     for i in 0..phnum {
+        let base = match phoff.checked_add(i * phentsize) {
+            Some(b) => b,
+            None => break,
+        };
+        if base + core::mem::size_of::<Elf64ProgramHeader>() > data.len() {
+            break;
+        }
         let phdr = unsafe {
-            let p = data.as_ptr().add(phoff + i * phentsize) as *const Elf64ProgramHeader;
+            let p = data.as_ptr().add(base) as *const Elf64ProgramHeader;
             &*p
         };
         if phdr.type_ == PT_DYNAMIC {
@@ -241,7 +248,19 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
     let phentsize = hdr.phentsize as usize;
     let phnum = hdr.phnum as usize;
 
-    if phoff + phentsize * phnum > data.len() {
+    // Harden against a malicious/truncated header: bound phnum and use checked
+    // arithmetic so phoff + phentsize*phnum can't wrap or read past the file.
+    if phnum == 0 || phnum > 0x10000 {
+        return Err("PHdr count out of bounds");
+    }
+    let ph_table_size = match phentsize.checked_mul(phnum) {
+        Some(s) => s,
+        None => return Err("PHdr size overflow"),
+    };
+    if phoff
+        .checked_add(ph_table_size)
+        .map_or(true, |end| end > data.len())
+    {
         return Err("PHdr out of bounds");
     }
 

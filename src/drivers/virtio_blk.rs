@@ -244,7 +244,7 @@ impl VirtQueue {
         unsafe {
             core::arch::asm!(
                 "mov dx, {0}",
-                "mov eax, {1}",
+                "mov ax, {1}",
                 "out dx, ax",
                 in(reg) self.notify_base as u16,
                 in(reg) 0u16,
