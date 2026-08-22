@@ -1,5 +1,11 @@
 use core::ptr;
 use core::sync::atomic::Ordering;
+use crate::spinlock::RawSpin;
+
+/// Global lock serializing all buddy operations. Every entry point that touches
+/// the free lists / global tracking arrays takes this lock; internal helpers
+/// (`*_nolock`) must only be called with it already held.
+static BUDDY_LOCK: RawSpin = RawSpin::new();
 
 const MAGIC: u32 = 0xDEADBEEF;
 const AUDIT_PERIOD: u64 = 8;
@@ -75,6 +81,7 @@ fn phys_to_idx(phys: u64) -> u64 {
 /// `free_address_space`'s guards don't misfire (FAS BADPML4) and so the page is
 /// not double-freed later.
 pub fn mark_page_used(phys: u64) {
+    let _g = BUDDY_LOCK.lock();
     let pidx = phys_to_idx(phys);
     if pidx != u64::MAX {
         used_mark(pidx);
@@ -524,6 +531,11 @@ impl BuddyAllocator {
     }
 
     pub fn alloc(&mut self, order: usize) -> Option<u64> {
+        let _g = BUDDY_LOCK.lock();
+        self.alloc_nolock(order)
+    }
+
+    fn alloc_nolock(&mut self, order: usize) -> Option<u64> {
         for o in order..=MAX_ORDER {
             let block = self.free_lists[o];
             if !block.is_null() {
@@ -571,6 +583,7 @@ impl BuddyAllocator {
     /// Allocate a zeroed page (order 0) for page tables, guaranteeing clean PTEs.
     /// First tries to reclaim from quarantine (FIFO), otherwise allocates fresh.
     pub fn alloc_zeroed_page(&mut self) -> Option<u64> {
+        let _g = BUDDY_LOCK.lock();
         // Try to reclaim from quarantine first (breaks free→realloc cycle)
         if let Some(addr) = q_pop() {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
@@ -583,7 +596,7 @@ impl BuddyAllocator {
             return Some(addr);
         }
         // Fallback: fresh allocation
-        self.alloc(0).map(|addr| {
+        self.alloc_nolock(0).map(|addr| {
             unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize); }
             page_type_set(addr, PAGE_TYPE_PTE);
             pte_refc_inc(addr);
@@ -592,6 +605,7 @@ impl BuddyAllocator {
     }
 
     pub fn free(&mut self, addr: u64, order: usize) {
+        let _g = BUDDY_LOCK.lock();
         // Global double-free detection at allocator level
         if crate::memory::buddy::track_freed_page(addr) {
             return; // Double-free detected, silently return
@@ -627,6 +641,7 @@ impl BuddyAllocator {
     }
 
     pub fn mark_allocated(&mut self, start: u64, size: u64) {
+        let _g = BUDDY_LOCK.lock();
         let mut addr = start;
         let end = start + size;
         while addr < end {
@@ -724,6 +739,19 @@ impl BuddyAllocator {
         }
     }
 
+    /// Reserve a page to prevent it from being allocated. The page must already be allocated
+    /// (i.e., removed from free lists and marked as used). This is used to pin pages
+    /// for specific purposes like AP stacks before they are actually used.
+    pub fn reserve_page(&mut self, addr: u64) {
+        if !self.is_managed(addr) { return; }
+        // Ensure the page is marked as used and not on free lists
+        let pidx = self.page_index(addr);
+        used_mark(pidx);
+        page_type_set(addr, PAGE_TYPE_DATA);
+        // Reserve it so it won't be freed accidentally
+        self.reserve(addr);
+    }
+
     /// Remove a page from the reserved list so it can be freed or reallocated.
     /// Returns true if the page was found and removed.
     pub fn unreserve(&mut self, addr: u64) -> bool {
@@ -742,6 +770,7 @@ impl BuddyAllocator {
     }
 
     pub fn free_reserved(&mut self, addr: u64, order: usize) -> bool {
+        let _g = BUDDY_LOCK.lock();
         if self.unreserve(addr) {
             let pidx = self.page_index(addr);
             let caller = core::intrinsics::return_address() as u64;

@@ -8,14 +8,28 @@ struct Gdtr {
 }
 
 #[repr(C, packed)]
-struct TaskStateSegment {
-    reserved1: u32,
-    rsp: [u64; 3],
-    reserved2: u64,
-    ist: [u64; 7],
-    reserved3: u64,
-    reserved4: u16,
-    io_map_base: u16,
+pub struct TaskStateSegment {
+    pub reserved1: u32,
+    pub rsp: [u64; 3],
+    pub reserved2: u64,
+    pub ist: [u64; 7],
+    pub reserved3: u64,
+    pub reserved4: u16,
+    pub io_map_base: u16,
+}
+
+impl TaskStateSegment {
+    pub const fn new() -> Self {
+        TaskStateSegment {
+            reserved1: 0,
+            rsp: [0; 3],
+            reserved2: 0,
+            ist: [0; 7],
+            reserved3: 0,
+            reserved4: 0,
+            io_map_base: 0,
+        }
+    }
 }
 
 fn make_tss_descriptor(addr: u64, limit: u32) -> (u64, u64) {
@@ -125,6 +139,61 @@ pub fn init() {
             out("rax") _,
             out("rcx") _,
             out("r8") _,
+            options(nostack)
+        );
+    }
+}
+
+pub const KERNEL_CODE: u64 = 0x00209A0000000000;
+pub const KERNEL_DATA: u64 = 0x0000920000000000;
+pub const USER_DATA: u64 = 0x0000F20000000000;
+pub const USER_CODE: u64 = 0x0020FA0000000000;
+
+pub fn setup_percpu_gdt(gdt: &mut [u64; 7], tss: &mut TaskStateSegment, ist_stacks: [u64; 4]) {
+    tss.ist[0] = ist_stacks[0];
+    tss.ist[1] = ist_stacks[1];
+    tss.ist[2] = ist_stacks[2];
+    tss.ist[3] = ist_stacks[3];
+
+    gdt[0] = 0;
+    gdt[1] = KERNEL_CODE;
+    gdt[2] = KERNEL_DATA;
+    gdt[3] = USER_DATA;
+    gdt[4] = USER_CODE;
+    let (tsk_low, tsk_high) = make_tss_descriptor(tss as *mut _ as u64, size_of::<TaskStateSegment>() as u32 - 1);
+    gdt[5] = tsk_low;
+    gdt[6] = tsk_high;
+}
+
+pub fn load_percpu_gdt(gdt: &[u64; 7]) {
+    let gdtr = Gdtr {
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
+        base: gdt as *const _ as u64,
+    };
+    unsafe {
+        core::arch::asm!(
+            "lgdt [{0}]",
+            in(reg) &gdtr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "mov rax, 0x10",
+            "push 0x08",
+            "lea rcx, [rip + 2f]",
+            "push rcx",
+            "retfq",
+            "2:",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            "xor edx, edx",
+            "mov fs, dx",
+            "mov gs, dx",
+            "mov ax, 0x28",
+            "ltr ax",
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
             options(nostack)
         );
     }

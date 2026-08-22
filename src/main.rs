@@ -8,7 +8,7 @@
 #![feature(core_intrinsics)]
 
 extern crate alloc;
-mod paging;
+pub mod paging;
 mod vga;
 mod serial;
 mod klog;
@@ -23,6 +23,9 @@ mod pit;
 mod ipc;
 mod elf;
 mod spinlock;
+mod apic;
+mod percpu;
+mod smp;
 mod vfs_core;
 mod vfs;
 mod keyboard;
@@ -47,6 +50,16 @@ pub static MULTIBOOT_INFO: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     MULTIBOOT_INFO.store(_info as u64, Ordering::SeqCst);
+
+    // Early serial test
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 'E'",
+            "out dx, al",
+            options(nostack, nomem, preserves_flags)
+        );
+    }
 
     serial::init();
     // Console log level. DEBUG traces (SYS>, [RSM:], mmap VMA/MMAP/CTX, execve
@@ -95,13 +108,15 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
         serial::write_str("KBD: OK\n");
     }
 
-    pit::init(100);
+pit::init(100);
     vga::write_str("PIT: OK\n");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("PIT: OK\n");
     };
 
-memory::init(_info);
+    serial::write_str("DEBUG: about to init memory\n");
+    memory::init(_info);
+    serial::write_str("DEBUG: memory init done\n");
     // Enable SSE (required by libc/musl which uses SSE instructions)
     unsafe {
         let mut cr4: u64;
@@ -264,6 +279,19 @@ memory::init(_info);
     crate::services::register(b"proc", services::proc_handler);
 
     task::init_scheduler();
+
+    // Initialize APs (multicore)
+    serial::write_str("DEBUG: about to init LAPIC\n");
+    unsafe {
+        crate::apic::init_lapic();
+    }
+    serial::write_str("DEBUG: LAPIC init done\n");
+    // 开启中断，否则 init_aps 里的 wait_ms 依赖的 PIT TICKS 不递增会永久自旋
+    unsafe { core::arch::asm!("sti", options(nostack)); }
+    unsafe {
+        crate::smp::init_aps(crate::smp::ap_entry as u64);
+    }
+    serial::write_str("DEBUG: SMP init done\n");
 
     task::boot_userland();
 

@@ -38,12 +38,14 @@
 
 ## 严重 / P0
 
-### [CONFIRMED] PID 槽位别名（提权）
-- 位置：`src/task.rs:482` `task_idx(id)=id%MAX_TASKS`；`NEXT_TID` 单调递增
-  （`:634,:696,:3570`）。`MAX_TASKS=64`。
+### [FIXED] PID 槽位别名（提权）
+- 位置：`src/task.rs` `task_idx(id)=id%MAX_TASKS`；`NEXT_TID` 单调递增。`MAX_TASKS=64`。
 - 现象：PID 越过 64 后 `task_idx` 取模回绕，PID 65 映射到 slot 1（init）。
   runit 反复重启 dummy 会使 PID 持续增长 → 最终别名 init 槽位，造成任务混淆/提权。
-- 修复：改为基于 64 位槽位位图的 PID 分配（pid=slot+1，回收复用），`task_idx=pid-1`。
+- 修复：改为基于 64 位槽位位图的 PID 分配（pid==slot，boot=0/init=1/kernel>=2，
+  `alloc_kernel_pid`/`alloc_user_pid`/`alloc_pid_specific`，waitpid 回收 `free_pid`）。
+  **注意**：初版误把 init 放在 slot 0（与 boot 任务同槽），导致 `TASKS[0]` 被覆盖、内核在
+  首次切到 init 后挂死；现改为 boot 占 slot 0、init 占 slot 1，已验证 `make run-gui` 进入 ash 正常。
 
 ### [CONFIRMED] 信号处理 handler 未校验地址
 - 位置：`src/task.rs:5024 sys_rt_sigaction` 校验了 `act` 指针落在用户空间，但未校验

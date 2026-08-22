@@ -569,7 +569,15 @@ pub fn init() {
         core::arch::asm!("mov {}, cr3", out(reg) old_pml4);
         let old_pt = &*(old_pml4 as *const PageTable);
         pml4.0 = old_pt.0;
+        
+        // Switch to new PML4 before mapping LAPIC
+        core::arch::asm!("mov cr3, {}", in(reg) PT_MGR.kernel_pml4, options(nostack, nomem));
     }
+    // Map trampoline page (0x7000) - required for AP startup
+    map_trampoline_page();
+    
+    // Map LAPIC region (0xFEE00000, 4KB) - required for xAPIC access
+    map_lapic_region();
     crate::serial::write_str("PAGING: init done\n");
     // Dump first few PML4 entries  
     let pml4_addr = kernel_pml4();
@@ -600,6 +608,154 @@ pub fn init() {
             }
         }
     }
+}
+
+// Map the trampoline page (physical 0x7000) and stack pages (0x8000-0xC000) in kernel page tables.
+// Maps BOTH the high canonical address (0xFFFF_8000_0000_7000) and the low identity address (0x7000),
+// because the AP trampoline runs with CS.base=0 in long mode and uses absolute low addresses.
+fn map_trampoline_page() {
+    const TRAMPOLINE_PHYS: u64 = 0x7000;
+    const STACK_PHYS: u64 = 0x8000;
+    const TRAMPOLINE_VIRT: u64 = 0xFFFF_8000_0000_7000; // Kernel direct map
+    const STACK_VIRT: u64 = 0xFFFF_8000_0000_8000; // Kernel direct map
+    // Map with: Present | Writable | Global | No-Execute
+    const FLAGS: u64 = 0x83; // P | W | G | NX (bit 63)
+
+    let pml4 = crate::paging::KERNEL_PML4.load(core::sync::atomic::Ordering::Relaxed) as *mut crate::paging::PageTable;
+    if pml4.is_null() {
+        return;
+    }
+
+    // Map a single 4KB page at `virt` -> `phys` in the kernel PML4 (get-or-allocate page tables).
+    fn map_one(pml4: *mut crate::paging::PageTable, virt: u64, phys: u64) {
+        let v = [
+            ((virt >> 39) & 0x1FF) as usize,
+            ((virt >> 30) & 0x1FF) as usize,
+            ((virt >> 21) & 0x1FF) as usize,
+            ((virt >> 12) & 0x1FF) as usize,
+        ];
+        let alloc_pt = || -> u64 {
+            let alloc = unsafe { &mut *crate::memory::allocator() };
+            match alloc.alloc_zeroed_page() {
+                Some(p) => p,
+                None => 0,
+            }
+        };
+        // PML4
+        let e = unsafe { (*pml4).0[v[0]] };
+        let pdpt = if e & 1 != 0 {
+            (e & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+        } else {
+            let p = alloc_pt();
+            if p == 0 { return; }
+            unsafe { (*pml4).0[v[0]] = p | 3; }
+            p as *mut crate::paging::PageTable
+        };
+        // PDPT
+        let e = unsafe { (*pdpt).0[v[1]] };
+        let pd = if e & 1 != 0 {
+            (e & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+        } else {
+            let p = alloc_pt();
+            if p == 0 { return; }
+            unsafe { (*pdpt).0[v[1]] = p | 3; }
+            p as *mut crate::paging::PageTable
+        };
+        // PD
+        let e = unsafe { (*pd).0[v[2]] };
+        let pt = if e & 1 != 0 {
+            (e & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+        } else {
+            let p = alloc_pt();
+            if p == 0 { return; }
+            unsafe { (*pd).0[v[2]] = p | 3; }
+            p as *mut crate::paging::PageTable
+        };
+        // PT
+        unsafe { (*pt).0[v[3]] = phys | FLAGS; }
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)); }
+    }
+
+    // Trampoline: high + identity (low) address
+    map_one(pml4, TRAMPOLINE_VIRT, TRAMPOLINE_PHYS);
+    map_one(pml4, TRAMPOLINE_PHYS, TRAMPOLINE_PHYS);
+    // Stack: high + identity (low) address, 4 pages (0x8000-0xC000)
+    for i in 0..4u64 {
+        let phys = STACK_PHYS + i * 0x1000;
+        map_one(pml4, STACK_VIRT + i * 0x1000, phys);
+        map_one(pml4, phys, phys);
+    }
+}
+
+// Map the LAPIC region (0xFEE00000, 4KB) in kernel page tables
+fn map_lapic_region() {
+    const LAPIC_PHYS: u64 = 0xFEE00000;
+    const LAPIC_VIRT: u64 = 0xFFFF_8000_FEE0_0000; // Kernel direct map
+    // Map with: Present | Writable | Global | No-Execute
+    let flags = 0x83; // P | W | G | NX (bit 63)
+    
+    let vpn = [
+        ((LAPIC_VIRT >> 39) & 0x1FF) as usize,
+        ((LAPIC_VIRT >> 30) & 0x1FF) as usize,
+        ((LAPIC_VIRT >> 21) & 0x1FF) as usize,
+        ((LAPIC_VIRT >> 12) & 0x1FF) as usize,
+    ];
+
+    let pml4 = crate::paging::KERNEL_PML4.load(core::sync::atomic::Ordering::Relaxed) as *mut crate::paging::PageTable;
+    if pml4.is_null() {
+        return;
+    }
+
+    // PML4
+    let pml4e = unsafe { (*pml4).0[vpn[0]] };
+    let pdpt = if pml4e & 1 != 0 {
+        (pml4e & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+    } else {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let new_pt = match alloc.alloc_zeroed_page() {
+            Some(p) => p,
+            None => return,
+        };
+        unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+        unsafe { (*pml4).0[vpn[0]] = new_pt | 3; } // P | W
+        new_pt as *mut crate::paging::PageTable
+    };
+
+    // PDPT
+    let pdpte = unsafe { (*pdpt).0[vpn[1]] };
+    let pd = if pdpte & 1 != 0 {
+        (pdpte & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+    } else {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let new_pt = match alloc.alloc_zeroed_page() {
+            Some(p) => p,
+            None => return,
+        };
+        unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+        unsafe { (*pdpt).0[vpn[1]] = new_pt | 3; }
+        new_pt as *mut crate::paging::PageTable
+    };
+
+    // PD
+    let pde = unsafe { (*pd).0[vpn[2]] };
+    let pt = if pde & 1 != 0 {
+        (pde & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
+    } else {
+        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let new_pt = match alloc.alloc_zeroed_page() {
+            Some(p) => p,
+            None => return,
+        };
+        unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+        unsafe { (*pd).0[vpn[2]] = new_pt | 3; }
+        new_pt as *mut crate::paging::PageTable
+    };
+
+    // PT
+    unsafe { (*pt).0[vpn[3]] = LAPIC_PHYS | flags; }
+    
+    // Flush TLB for the new mapping
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) LAPIC_VIRT, options(nostack, preserves_flags)); }
 }
 
 pub fn get_pte_in(pml4: u64, virt: u64) -> Option<&'static mut u64> {

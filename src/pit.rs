@@ -31,3 +31,19 @@ pub fn init(freq: u32) {
         );
     }
 }
+
+pub fn wait_us(us: u32) {
+    let start = TICKS.load(Ordering::Relaxed);
+    let target = start + ((us as u64 * 100) / 1000).max(1);
+    while TICKS.load(Ordering::Relaxed) < target {
+        core::hint::spin_loop();
+    }
+}
+
+pub fn wait_ms(ms: u32) {
+    wait_us(ms * 1000);
+}
+
+pub fn mask_all() {
+    // PIT channel 0 already runs; nothing to mask here (PIC handles IRQ0).
+}
