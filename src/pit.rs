@@ -32,9 +32,13 @@ pub fn init(freq: u32) {
     }
 }
 
+// PIT channel 0 is initialized at 100 Hz, so one tick = 10000 µs. The delay is
+// therefore us/10000 ticks. (Previously the formula used us*100/1000, which is a
+// 1000x overestimate, making every wait_ms wait ~1000x too long — the SMP INIT/SIPI
+// sequence alone took ~13 s instead of ~40 ms.)
 pub fn wait_us(us: u32) {
     let start = TICKS.load(Ordering::Relaxed);
-    let target = start + ((us as u64 * 100) / 1000).max(1);
+    let target = start + ((us as u64) / 10000).max(1);
     while TICKS.load(Ordering::Relaxed) < target {
         core::hint::spin_loop();
     }
