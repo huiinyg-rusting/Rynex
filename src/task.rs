@@ -788,10 +788,17 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32, comm: &[u8]) -> Option<u64
 }
 
 pub fn create_user_task(entry: u64, pml4: u64, user_stack_top: u64) -> Option<u64> {
-    create_user_task_prio(entry, pml4, user_stack_top, PRIORITY_DEFAULT_NICE)
+    create_user_task_on_cpu(entry, pml4, user_stack_top, PRIORITY_DEFAULT_NICE, pick_home_cpu())
 }
 
+/// Create a user task pinned to a specific home CPU (init must be cpu 0: the
+/// boot switch runs it on the BSP, and a running task's cpu must equal the CPU
+/// physically running it). Other user tasks spread via pick_home_cpu().
 pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i32) -> Option<u64> {
+    create_user_task_on_cpu(entry, pml4, user_stack_top, nice, pick_home_cpu())
+}
+
+pub fn create_user_task_on_cpu(entry: u64, pml4: u64, user_stack_top: u64, nice: i32, cpu: u8) -> Option<u64> {
     // The first user task (init) must be pid 1: busybox init checks
     // getpid()==1 to decide whether to run as the single-instance init.
     let tid = if !INIT_TASK_ASSIGNED.load(Ordering::SeqCst) {
@@ -901,13 +908,13 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
-    // User tasks stay on the BSP (CPU 0) for now. The per-CPU syscall stack
-    // (syscall_entry indexes SYSCALL_STACK_TOPS by LAPIC id) is in place, but
-    // the AP lacks preemptive scheduling and a wakeup scan (both run only on
-    // the BSP PIT), so a user task parked/blocked on the AP would starve. Kernel
-    // tasks still run on APs. Once AP preemption+wakeups land, switch this to
-    // pick_home_cpu().
-    task.cpu = 0;
+    // User tasks may be pinned to a specific home CPU (init -> cpu 0) or spread
+    // across online CPUs (BSP + APs), now that each CPU has its own per-CPU
+    // runqueue, syscall stack (SYSCALL_STACK_TOPS by LAPIC id) and a timer that
+    // wakes blocked tasks. The AP cooperatively schedules via schedule()/yield_now
+    // (no PREEMPT_SCRATCH preemption), so user tasks must yield/block rather than
+    // busy-spin to share the AP, same as kernel tasks.
+    task.cpu = cpu;
     task.static_prio = nice_to_prio(nice);
     task.normal_prio = task.static_prio;
     task.prio = task.static_prio;
@@ -1089,8 +1096,12 @@ pub extern "C" fn ap_demo_entry() -> ! {
         len += 1;
     }
     crate::serial::write_str(core::str::from_utf8(&buf[..len]).unwrap());
+    // Cooperatively yield instead of parking forever: the AP now also runs user
+    // tasks (spread to CPU 1), which would otherwise starve behind this parked
+    // kernel task. At max-nice (lowest priority) the demo only runs when the AP
+    // is otherwise idle, and yields immediately so real tasks are never blocked.
     loop {
-        unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); }
+        yield_now();
     }
 }
 
@@ -1732,6 +1743,36 @@ pub extern "C" fn inc_ticks() {
 #[no_mangle]
 static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Serializes the shared-TASKS wakeup scan so the BSP PIT timer and the AP LAPIC
+// timer cannot both wake/enqueue the same sleeping task (or swap its state
+// concurrently). Lock order: this -> RUNQUEUE_LOCK[cpu].
+static TIMER_WAKE_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
+
+/// Wake sleeping user tasks whose time-based wakeup tick has arrived. May be run
+/// by either CPU's timer; guarded by TIMER_WAKE_LOCK against the BSP running the
+/// same scan concurrently. The woken task is enqueued onto its home-CPU runqueue
+/// (so an AP-blocked user task with cpu=1 lands on RUNQUEUE[1] for the AP to run).
+pub fn wakeup_expired_sleepers() {
+    let _g = TIMER_WAKE_LOCK.lock();
+    let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].state == TaskState::Blocked
+                && TASKS[i].wakeup_tick > 0
+                && TASKS[i].wakeup_tick <= now
+                && TASKS[i].id != 0
+            {
+                TASKS[i].state = TaskState::Ready;
+                TASKS[i].wakeup_tick = 0;
+                // Resume on the live regs saved by the last context_switch; do NOT
+                // stamp the zeroed saved_user_regs snapshot (would clobber r15).
+                let _ = TASKS[i].saved_user_regs.take();
+                enqueue_task(TASKS[i].id, TASKS[i].prio);
+            }
+        }
+    }
+}
+
 pub extern "C" fn timer_schedule() -> u64 {
     // Per-CPU EOI: the BSP re-arms the PIC (PIT IRQ0), the AP re-arms its own
     // LAPIC timer (both land on vector 0x20).
@@ -1756,27 +1797,8 @@ pub extern "C" fn timer_schedule() -> u64 {
         }
     }
 
-    // Wake up sleeping tasks whose wakeup tick has arrived
-    let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if TASKS[i].state == TaskState::Blocked
-                && TASKS[i].wakeup_tick > 0
-                && TASKS[i].wakeup_tick <= now
-                && TASKS[i].id != 0
-            {
-                TASKS[i].state = TaskState::Ready;
-                TASKS[i].wakeup_tick = 0;
-                // Resume on the live regs saved by the last context_switch; do NOT
-                // stamp the zeroed saved_user_regs snapshot (would clobber r15).
-                let _ = TASKS[i].saved_user_regs.take();
-                enqueue_task(TASKS[i].id, TASKS[i].prio);
-                // serial::write_str("WAKEUP tid=");
-                // serial::write_dec(TASKS[i].id);
-                // serial::write_str("\n");
-            }
-        }
-    }
+    // Wake up sleeping tasks whose wakeup tick has arrived (shared, race-safe).
+    wakeup_expired_sleepers();
 
     let current = cur_task().load(Ordering::SeqCst);
     if current == 0 {
@@ -3944,7 +3966,11 @@ fn sys_fork() -> i64 {
             kernel_stack,
             user_stack: parent.user_stack,
             pml4: child_pml4,
-            cpu: parent.cpu,
+            // Spread forked/cloned children across online CPUs so user tasks can
+            // run on the AP. The child's fork/clone-return regs (SYSCALL_USER_*)
+            // were already copied into child_regs, so running on another CPU is
+            // safe. Init itself stays pinned to cpu 0.
+            cpu: pick_home_cpu(),
             static_prio: parent.static_prio,
             normal_prio: parent.normal_prio,
             prio: parent.prio,
@@ -4132,7 +4158,11 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             kernel_stack,
             user_stack: child_stack,
             pml4: child_pml4,
-            cpu: parent.cpu,
+            // Spread forked/cloned children across online CPUs so user tasks can
+            // run on the AP. The child's fork/clone-return regs (SYSCALL_USER_*)
+            // were already copied into child_regs, so running on another CPU is
+            // safe. Init itself stays pinned to cpu 0.
+            cpu: pick_home_cpu(),
             static_prio: parent.static_prio,
             normal_prio: parent.normal_prio,
             prio: parent.prio,
@@ -6640,7 +6670,7 @@ pub fn boot_userland() {
                         match crate::elf::load_elf(mod_data) {
                             Ok(elf_info) => {
                                 serial::write_str("TASK: load_elf OK, calling create_user_task\n");
-                                if let Some(tid) = create_user_task(elf_info.entry, elf_info.pml4, elf_info.stack_top) {
+                                if let Some(tid) = create_user_task_on_cpu(elf_info.entry, elf_info.pml4, elf_info.stack_top, PRIORITY_DEFAULT_NICE, 0) {
                                     init_tid = tid;
                                     serial::write_str("TASK: init created tid=");
                                     serial::write_dec(init_tid);
@@ -6651,7 +6681,7 @@ pub fn boot_userland() {
                                         let idx = task_idx(tid);
                                         let name = b"init";
                                         let len = core::cmp::min(name.len(), 15);
-                                        for i in 0..len { TASKS[idx].comm[i] = name[i]; }
+                                        TASKS[idx].comm[..len].copy_from_slice(&name[..len]);
                                         TASKS[idx].comm[len] = 0;
                                     }
                                 } else {
