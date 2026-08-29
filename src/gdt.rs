@@ -71,23 +71,36 @@ static mut TSS: TaskStateSegment = TaskStateSegment {
 /// A shared syscall stack is unsafe: a task suspended mid-syscall (e.g. blocked
 /// in waitpid) would have its saved return frame clobbered by another task's
 /// deeper syscalls (e.g. execve's 4KB argv_buf) running on the same stack.
+///
+/// syscall_entry (reached via SYSCALL/SWAPGS) must use the syscall stack of the
+/// CPU it is running on, so it reads SYSCALL_STACK_TOPS indexed by LAPIC id
+/// rather than this single global. Index 0 = BSP; index i = APIC/cpu i.
 #[no_mangle]
 pub static mut CURRENT_SYSCALL_STACK_TOP: u64 = 0;
 
+/// Per-CPU syscall-stack tops indexed by LAPIC id (== cpu index). Kept in sync
+/// with the TSS.rsp[0] each CPU installs as its syscall target: set_tss_rsp0
+/// records the current task's kernel stack here on every context switch, so
+/// syscall_entry on any CPU picks up the stack of the task it is running.
+#[no_mangle]
+pub static mut SYSCALL_STACK_TOPS: [u64; crate::percpu::MAX_CPUS] = [0; crate::percpu::MAX_CPUS];
+
 pub fn set_tss_rsp0(rsp0: u64) {
-    // Per-CPU: this may run on the AP as well as the BSP. The BSP keeps the
-    // shared TSS + per-task syscall-stack global (used by user syscalls). The
-    // AP runs kernel tasks only (its syscall stack is per-CPU), so it patches
-    // only its own per-CPU TSS[0]. APIC id == cpu index for the dense ids on
-    // QEMU (0,1).
+    // Per-CPU: may run on the AP as well as the BSP. Every CPU installs the
+    // current task's kernel stack into its own per-CPU TSS.rsp[0] (the HW stack
+    // for an interrupt entry) and into SYSCALL_STACK_TOPS[cpu] for syscall_entry.
     let cpu = crate::task::current_cpu();
+    unsafe {
+        crate::percpu::percpu(cpu as u32).tss.rsp[0] = rsp0;
+        SYSCALL_STACK_TOPS[cpu as usize] = rsp0;
+    }
     if cpu == 0 {
+        // Keep the legacy global in sync for any readers (diagnostics). The
+        // BSP also uses the shared TSS for its hardware interrupt stack.
         unsafe {
             TSS.rsp[0] = rsp0;
             CURRENT_SYSCALL_STACK_TOP = rsp0;
         }
-    } else {
-        unsafe { crate::percpu::percpu(cpu as u32).tss.rsp[0] = rsp0; }
     }
 }
 
