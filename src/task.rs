@@ -901,9 +901,12 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
-    // User tasks stay on the BSP (CPU 0): their syscalls run on the shared
-    // per-task syscall stack (CURRENT_SYSCALL_STACK_TOP), which is only valid
-    // on one CPU. Kernel tasks may run on APs.
+    // User tasks stay on the BSP (CPU 0) for now. The per-CPU syscall stack
+    // (syscall_entry indexes SYSCALL_STACK_TOPS by LAPIC id) is in place, but
+    // the AP lacks preemptive scheduling and a wakeup scan (both run only on
+    // the BSP PIT), so a user task parked/blocked on the AP would starve. Kernel
+    // tasks still run on APs. Once AP preemption+wakeups land, switch this to
+    // pick_home_cpu().
     task.cpu = 0;
     task.static_prio = nice_to_prio(nice);
     task.normal_prio = task.static_prio;

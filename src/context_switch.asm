@@ -7,7 +7,7 @@
 .extern SYSCALL_USER_RSP
 .extern SYSCALL_USER_RFLAGS
 .extern SYSCALL_USER_FS_BASE
-.extern CURRENT_SYSCALL_STACK_TOP
+.extern SYSCALL_STACK_TOPS
 .extern SYSCALL_CALLEE_REGS
 .extern check_deliver_signal
 
@@ -23,8 +23,25 @@ syscall_entry:
     push r8               // Save arg5 (R8) on user stack
     push r9               // Save arg6 (R9) on user stack
     mov r10, rsp          // r10 = user RSP (pointing to 3 saved args)
-    mov rsp, [rip + CURRENT_SYSCALL_STACK_TOP]   // per-task kernel stack
-    
+    // Save the syscall number (rax) and return RIP (rcx) on the user stack so
+    // the per-CPU syscall-stack lookup below may clobber them. After switching
+    // to the kernel stack we reload rax (syscall number) and rcx (ret RIP).
+    push rax
+    push rcx
+    // Per-CPU syscall stack: index SYSCALL_STACK_TOPS by LAPIC id (= CPU). Each
+    // CPU records the current task's kernel stack in set_tss_rsp0, so a user
+    // task running on any CPU gets its correct kernel stack for the syscall.
+    movabs rax, 0xFFFF8000FEE00020   // LAPIC Local ID register
+    mov eax, [rax]
+    shr eax, 24                      // eax = APIC id == CPU index (0,1)
+    lea rcx, [rip + SYSCALL_STACK_TOPS]
+    mov rax, [rcx + rax*8]           // rax = this CPU's task syscall stack top
+    mov rsp, rax
+    mov rax, [r10 - 8]               // restore syscall number
+    mov rcx, [r10 - 16]              // restore return RIP (rcx)
+    // r10 still points at the 3 saved args ([r10]=r9,[+8]=r8,[+16]=r10) as the
+    // rest of the entry path expects.
+
     push rbx
     push rbp
     push r12
