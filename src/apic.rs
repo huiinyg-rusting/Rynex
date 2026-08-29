@@ -46,23 +46,48 @@ pub unsafe fn eoi() {
 }
 
 pub unsafe fn init_timer() {
+    calibrate_once();
+    let per_ms = TICKS_PER_MS.load(Ordering::SeqCst);
+    write_reg(0x380, per_ms);
+    write_reg(0x320, (1 << 17) | 0x20);
+}
+
+/// Measure the LAPIC timer rate and store the per-ms count in the global
+/// TICKS_PER_MS. Does NOT start/arm the local LAPIC timer (the BSP quite
+/// deliberately does not arm it — it uses the shared PIT). The AP arms its own
+/// timer via init_ap_timer after this calibration has run.
+pub unsafe fn calibrate_once() {
     if TIMER_CALIBRATED.load(Ordering::SeqCst) {
         return;
     }
     write_reg(0x3E0, 0x3);
     write_reg(0x380, 0xFFFF_FFFF);
-    write_reg(0x320, (1 << 17) | 0x20);
     crate::pit::wait_ms(10);
     let cur = read_reg(0x390);
     let elapsed = 0xFFFF_FFFFu32.wrapping_sub(cur);
     let per_ms = (elapsed / 10).max(1);
     TICKS_PER_MS.store(per_ms, Ordering::SeqCst);
-    write_reg(0x380, per_ms);
     TIMER_CALIBRATED.store(true, Ordering::SeqCst);
 }
 
 pub fn ticks_per_ms() -> u32 {
     TICKS_PER_MS.load(Ordering::SeqCst)
+}
+
+/// Program an AP's LAPIC timer as a periodic ~100Hz preemption/wakeup source on
+/// the timer vector (0x20), matching the BSP's shared PIT rate. Calibration is
+/// global (done once on the BSP); every LAPIC shares the same bus speed, so we
+/// reuse TICKS_PER_MS. The BSP does NOT use this (it uses the PIT).
+pub unsafe fn init_ap_timer() {
+    let per_ms = TICKS_PER_MS.load(Ordering::SeqCst);
+    if per_ms == 0 {
+        return;
+    }
+    // ~100Hz => 10ms interval.
+    let count = per_ms * 10;
+    write_reg(0x3E0, 0x3);                    // divide by 1
+    write_reg(0x380, count);                   // initial count
+    write_reg(0x320, (1 << 17) | 0x20);        // periodic, unmasked, vector 0x20
 }
 
 pub unsafe fn send_ipi(apic_id: u32, delivery_mode: u32, vector: u32, level: u32, trigger: u32) {

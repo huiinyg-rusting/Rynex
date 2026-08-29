@@ -1580,14 +1580,24 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
 
 #[no_mangle]
 pub extern "C" fn inc_ticks() {
-    crate::pit::TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Only the BSP owns the global PIT clock. The AP's LAPIC timer also drives
+    // this handler but must NOT advance the shared TICKS (would double-count).
+    if current_cpu() == 0 {
+        crate::pit::TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
 static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub extern "C" fn timer_schedule() -> u64 {
-    crate::pic::send_eoi(0);
+    // Per-CPU EOI: the BSP re-arms the PIC (PIT IRQ0), the AP re-arms its own
+    // LAPIC timer (both land on vector 0x20).
+    if current_cpu() == 0 {
+        crate::pic::send_eoi(0);
+    } else {
+        unsafe { crate::apic::eoi(); }
+    }
     // Poll UART for serial input and feed into keyboard buffer.
     while let Some(c) = crate::serial::read_byte_nonblocking() {
         // Filter: only accept printable ASCII and common control chars.

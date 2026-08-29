@@ -288,6 +288,10 @@ pit::init(100);
     serial::write_str("DEBUG: LAPIC init done\n");
     // 开启中断，否则 init_aps 里的 wait_ms 依赖的 PIT TICKS 不递增会永久自旋
     unsafe { core::arch::asm!("sti", options(nostack)); }
+    // Calibrate the LAPIC timer rate (stores TICKS_PER_MS globally) so APs can
+    // arm their own per-CPU LAPIC timers. Must run with interrupts enabled (PIT
+    // clock) but does NOT arm the BSP's LAPIC timer (BSP keeps the PIT).
+    unsafe { crate::apic::calibrate_once(); }
     unsafe {
         crate::smp::init_aps(crate::smp::ap_entry as u64);
     }
