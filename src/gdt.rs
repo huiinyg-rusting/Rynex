@@ -75,8 +75,20 @@ static mut TSS: TaskStateSegment = TaskStateSegment {
 pub static mut CURRENT_SYSCALL_STACK_TOP: u64 = 0;
 
 pub fn set_tss_rsp0(rsp0: u64) {
-    unsafe { TSS.rsp[0] = rsp0; }
-    unsafe { CURRENT_SYSCALL_STACK_TOP = rsp0; }
+    // Per-CPU: this may run on the AP as well as the BSP. The BSP keeps the
+    // shared TSS + per-task syscall-stack global (used by user syscalls). The
+    // AP runs kernel tasks only (its syscall stack is per-CPU), so it patches
+    // only its own per-CPU TSS[0]. APIC id == cpu index for the dense ids on
+    // QEMU (0,1).
+    let cpu = crate::task::current_cpu();
+    if cpu == 0 {
+        unsafe {
+            TSS.rsp[0] = rsp0;
+            CURRENT_SYSCALL_STACK_TOP = rsp0;
+        }
+    } else {
+        unsafe { crate::percpu::percpu(cpu as u32).tss.rsp[0] = rsp0; }
+    }
 }
 
 pub fn get_tss_rsp0() -> u64 {
