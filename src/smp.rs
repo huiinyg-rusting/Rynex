@@ -139,10 +139,9 @@ pub extern "C" fn ap_entry(apic_id: u32) -> ! {
     crate::serial::write_hex(apic_id as u64);
     crate::serial::write_str(" online\n");
 
-    // 3. Idle. This kernel uses a shared PIC/PIT (global IRQ0) for ticking and a
-    // single-CPU global scheduler, neither of which is SMP-safe yet. The AP stays
-    // online but interrupt-disabled and halted until per-CPU scheduling lands.
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); }
-    }
+    // 3. Begin per-CPU scheduling: register this AP's idle kernel task as its
+    // current, arm its LAPIC timer (per-CPU preemption/wakeup), enable
+    // interrupts, and loop schedule() to drain its own runqueue. APs run kernel
+    // tasks (user syscalls stay on the BSP).
+    crate::task::ap_begin_scheduling(apic_id);
 }

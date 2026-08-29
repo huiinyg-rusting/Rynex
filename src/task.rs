@@ -407,10 +407,6 @@ static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
 // APIC IDs above the physical count simply stay unwired. Each CPU has its OWN current
 // task, runqueue, and runqueue lock (per-CPU scheduling).
 pub const MAX_CPUS: usize = 2;
-// When true, newly created tasks are spread across all online CPUs. Currently
-// false because the AP idles with interrupts disabled; the AP scheduler idle
-// loop must be wired up first (see pick_home_cpu).
-const SPREAD_TASKS_TO_AP: bool = false;
 static mut RUNQUEUE: [RunQueue; MAX_CPUS] = [const { RunQueue::new() }; MAX_CPUS];
 // Serializes all runqueue mutations. IRQ-safe so the timer ISR and syscalls can
 // both touch the runqueue without corrupting the linked lists / bitmap. One lock per CPU.
@@ -905,7 +901,10 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
-    task.cpu = pick_home_cpu();
+    // User tasks stay on the BSP (CPU 0): their syscalls run on the shared
+    // per-task syscall stack (CURRENT_SYSCALL_STACK_TOP), which is only valid
+    // on one CPU. Kernel tasks may run on APs.
+    task.cpu = 0;
     task.static_prio = nice_to_prio(nice);
     task.normal_prio = task.static_prio;
     task.prio = task.static_prio;
@@ -971,22 +970,162 @@ pub fn mark_cpu_online(_apic_id: u32) {
     }
 }
 
-// Pick a home CPU for a newly created task. Prefer the BSP (0) unless an AP
-// is online, in which case spread load across online CPUs round-robin. This
-// runs at task-creation time and need not be lock-free-precise.
+// Pick a home CPU for a newly created KERNEL task, spreading across all online
+// CPUs once an AP is up. User tasks bypass this (they're pinned to the BSP).
 fn pick_home_cpu() -> u8 {
-    // Until the AP's scheduler idle loop is wired up (it currently idles with
-    // interrupts disabled), route everything to the BSP so no task is stranded
-    // on an AP that never runs it. Flip to spreading once the AP can schedule.
-    if !SPREAD_TASKS_TO_AP {
-        return 0;
-    }
-    let online = ONLINE_CPUS.load(Ordering::SeqCst).max(1);
-    if online <= 1 {
+    // ONLINE_CPUS counts APs beyond the BSP, so total schedulable CPUs is +1.
+    let ap_count = ONLINE_CPUS.load(Ordering::SeqCst);
+    let total = (ap_count + 1).min(MAX_CPUS as u64);
+    if total <= 1 {
         return 0;
     }
     let turn = HOME_CPU_ROUND.fetch_add(1, Ordering::SeqCst);
-    ((turn % online as u64) as usize % MAX_CPUS) as u8
+    (turn % total) as u8
+}
+
+// ── Per-CPU (AP) scheduling idle loop ────────────────────────────
+// The AP has its own per-CPU runqueue + CURRENT_TASK and a standing idle kernel
+// task. Its LAPIC timer preempts/wakes it (per-CPU EOI), and it repeatedly
+// calls schedule() to drain its own queue. APs only run kernel tasks (user
+// syscalls need the shared syscall-stack global, which is BSP-only for now).
+
+// Kernel entry for the AP's idle task: loop scheduling, halting when idle.
+// The first schedule() context-switches to a queued kernel task (saving this
+// ambient context as the idle task's saved context); later resumption returns
+// here.
+pub extern "C" fn ap_idle_entry() -> ! {
+    loop {
+        // Only call schedule() when our own runqueue has work: schedule()'s
+        // blocking-idle path halts on the BSP's PIT vector (0x20), which never
+        // fires here. When there is work, schedule() context-switches us to it.
+        if unsafe { RUNQUEUE[current_cpu()].bitmap != 0 } {
+            schedule();
+        }
+        // Idle until the dedicated AP LAPIC timer (0x21) wakes us to poll again.
+        unsafe { core::arch::asm!("sti; hlt; cli", options(nostack, nomem, preserves_flags)); }
+    }
+}
+
+// Called from ap_entry (running on the AP's kernel stack, IRQs off): create the
+// AP's standing idle task, register it as this CPU's current, install its
+// TSS.rsp0, arm the per-CPU LAPIC timer, then enter the schedule idle loop.
+pub fn ap_begin_scheduling(apic_id: u32) -> ! {
+    let tid = {
+        let tid = match alloc_kernel_pid() {
+            Some(t) => t,
+            None => core::panic!("AP idle task: no pid"),
+        };
+        let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)
+            .expect("AP idle task stack");
+        let task = unsafe { &mut TASKS[task_idx(tid)] };
+        task.id = tid;
+        task.tgid = tid;
+        task.state = TaskState::Running;
+        task.kernel_stack = kernel_stack;
+        task.user_stack = 0;
+        task.pml4 = pt_mgr().kernel_pml4();
+        // APIC id == cpu index for the dense ids on QEMU (0,1).
+        task.cpu = cpu_index_of(apic_id) as u8;
+        task.static_prio = nice_to_prio(19);
+        task.normal_prio = task.static_prio;
+        task.prio = task.static_prio;
+        task.time_slice = initial_time_slice(task.prio);
+        task.in_syscall = false;
+        task.regs = Registers::new_kernel(ap_idle_entry as u64, kernel_stack);
+        tid
+    };
+
+    cur_task().store(tid, Ordering::SeqCst);
+    unsafe { TASKS[task_idx(tid)].state = TaskState::Running; }
+    crate::gdt::set_tss_rsp0(unsafe { TASKS[task_idx(tid)].kernel_stack });
+    pt_mgr().switch_to(unsafe { TASKS[task_idx(tid)].pml4 });
+
+    unsafe {
+        // IDTR is per-CPU: the AP must load the shared IDT itself.
+        crate::idt::load_current();
+        // The BSP branches on init_lapic(); the AP must software-enable its own
+        // LAPIC (SVR bit 8) here, otherwise QEMU never delivers its timer IRQ.
+        crate::apic::init_lapic();
+        // Dedicated AP timer vector: pure EOI+wakeup handler.
+        crate::idt::register_irq(0x21, crate::interrupts::ap_timer_irq as u64);
+        crate::apic::init_ap_timer();
+        core::arch::asm!("sti", options(nostack));
+    }
+
+    if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
+        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+        crate::klog::s("SCHED: AP idletask tid=");
+        crate::klog::dec(tid);
+        crate::klog::s(" on cpu ");
+        crate::klog::dec(current_cpu() as u64);
+        crate::klog::s("\n");
+        crate::klog::end();
+    }
+
+    ap_idle_entry()
+}
+
+// Proof that a kernel task can run on an AP from its own per-CPU runqueue:
+// log which CPU we're on, then sit parked. Spawned once the AP is online.
+pub extern "C" fn ap_demo_entry() -> ! {
+    let cpu = current_cpu();
+    let mut buf = [0u8; 96];
+    let mut len = 0;
+    for c in b"SMP: kernel demo task running on CPU ".iter() {
+        buf[len] = *c;
+        len += 1;
+    }
+    if cpu >= 10 {
+        buf[len] = b'0' + (cpu / 10) as u8;
+        len += 1;
+    }
+    buf[len] = b'0' + (cpu % 10) as u8;
+    len += 1;
+    for c in b" (proof of per-CPU AP scheduling)\n".iter() {
+        buf[len] = *c;
+        len += 1;
+    }
+    crate::serial::write_str(core::str::from_utf8(&buf[..len]).unwrap());
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); }
+    }
+}
+
+// Spawn a kernel task pinned to every AP past the BSP, proving each AP drains
+// its own runqueue. QEMU's single AP is CPU 1.
+pub fn spawn_ap_demo_tasks() {
+    let n = ONLINE_CPUS.load(Ordering::SeqCst);
+    for c in 1..=n.min((MAX_CPUS - 1) as u64) {
+        if let Some(tid) =
+            create_kernel_task_prio(ap_demo_entry as u64, PRIORITY_DEFAULT_NICE, b"apdemo")
+        {
+            let idx = task_idx(tid);
+            unsafe {
+                // remove_from_runqueue uses task.cpu to find the queue, so drop
+                // the task from its current (BSP) queue BEFORE repointing cpu to
+                // the AP; then enqueue routes to the AP's queue only.
+                remove_from_runqueue(tid);
+                TASKS[idx].cpu = c as u8;
+                enqueue_task(tid, TASKS[idx].prio);
+            }
+            crate::serial::write_str("SMP: apdemo tid=");
+            crate::serial::write_dec(tid);
+            crate::serial::write_str(" routed to cpu ");
+            crate::serial::write_dec(c);
+            crate::serial::write_str("\n");
+            if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
+                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+                crate::klog::s("SCHED: spawned apdemo tid=");
+                crate::klog::dec(tid);
+                crate::klog::s(" -> cpu ");
+                crate::klog::dec(c);
+                crate::klog::s("\n");
+                crate::klog::end();
+            }
+        } else {
+            crate::serial::write_str("SMP: apdemo creation FAILED\n");
+        }
+    }
 }
 
 pub fn schedule() {
@@ -1597,6 +1736,12 @@ pub extern "C" fn timer_schedule() -> u64 {
         crate::pic::send_eoi(0);
     } else {
         unsafe { crate::apic::eoi(); }
+        // AP: this is a pure per-CPU tick whose only job is to wake the AP out
+        // of its idle hlt so its own schedule() loop can re-drain its runqueue.
+        // Everything below (serial/keyboard polling and the global wakeup scan
+        // over the shared TASKS array) would RACE with the BSP creating and
+        // transitioning user tasks, so the AP must not touch it.
+        return 0;
     }
     // Poll UART for serial input and feed into keyboard buffer.
     while let Some(c) = crate::serial::read_byte_nonblocking() {
@@ -6392,6 +6537,10 @@ fn create_applet_links() {
 
 pub fn boot_userland() {
     unsafe { core::arch::asm!("cli"); }
+
+    // The AP is already online (init_aps ran before us). Drop a proof kernel
+    // task onto each AP's runqueue so it demonstrably runs on its own CPU.
+    spawn_ap_demo_tasks();
 
     // Initialize TTY devices FIRST (before creating any user tasks)
     crate::tty::init();

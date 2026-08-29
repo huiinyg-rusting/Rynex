@@ -47,6 +47,13 @@ pub fn init() {
     idt.load();
 }
 
+/// Reload the (shared) IDT into the current CPU's IDTR. The BSP loads it once in
+/// init(); each AP must load it into its own per-CPU IDTR before enabling
+/// interrupts, since IDTR is a per-CPU register.
+pub unsafe fn load_current() {
+    (unsafe { &IDT }).load();
+}
+
 pub fn register_irq(vector: u8, handler_addr: u64) {
     unsafe {
         IDT[vector].set_handler_addr(x86_64::VirtAddr::new(handler_addr));
