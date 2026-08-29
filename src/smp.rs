@@ -1,6 +1,5 @@
 use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
-use crate::task::{alloc_stack, KERNEL_STACK_PAGES};
 use crate::paging::{KERNEL_BASE, KERNEL_PML4};
 
 // Auto-generated trampoline binary (4KB page at physical 0x7000)
@@ -30,9 +29,6 @@ pub unsafe fn detect_cpus() -> Vec<u32> {
 pub unsafe fn init_aps(ap_entry_fn: u64) {
     let cpus = detect_cpus();
     let bsp_id = crate::apic::bsp_apic_id();
-    
-use crate::task::{alloc_stack, KERNEL_STACK_PAGES};
-use crate::paging::KERNEL_BASE;
     
     // Fixed trampoline at physical 0x7000 (SIPI vector 0x07 = 0x7000 / 4096)
     const TRAMPOLINE_PHYS: u64 = 0x7000;
@@ -64,6 +60,22 @@ use crate::paging::KERNEL_BASE;
     crate::serial::write_hex(ap_entry_fn);
     crate::serial::write_str("\n");
     
+    // Pre-allocate a dedicated bootstrap stack page per AP (8 pages) and store the
+    // stack top at trampoline 0x208 + apic_id*8 so the AP can switch to it in long mode.
+    // NOTE: kernel stacks are addressed by their raw physical address, which is
+    // identity-mapped in the low 1GB (bootloader identity map preserved in paging::init).
+    for &apic_id in &cpus {
+        if apic_id == bsp_id { continue; }
+        let phys = crate::task::alloc_stack(8).expect("AP bootstrap stack alloc failed");
+        crate::serial::write_str("SMP: AP ");
+        crate::serial::write_hex(apic_id as u64);
+        crate::serial::write_str(" bootstrap stack top=0x");
+        crate::serial::write_hex(phys);
+        crate::serial::write_str("\n");
+        let slot = (KERNEL_BASE + TRAMPOLINE_PHYS + 0x208 + (apic_id as u64) * 8) as *mut u64;
+        unsafe { core::ptr::write_volatile(slot, phys); }
+    }
+    
     for &apic_id in &cpus {
         if apic_id == bsp_id { continue; }
         
@@ -92,83 +104,45 @@ use crate::paging::KERNEL_BASE;
     crate::serial::write_str("SMP: all APs started\n");
 }
 
-#[inline(never)]
-unsafe fn e9(c: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") 0xE9u16,
-        in("al") c,
-        options(nostack, preserves_flags)
-    );
-}
-
 #[no_mangle]
 pub extern "C" fn ap_entry(apic_id: u32) -> ! {
-    unsafe { e9(b'a'); }
-    // Early debug - write directly to serial port
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 'A'",
-            "out dx, al",
-            "mov al, 'P'",
-            "out dx, al",
-            "mov al, ' '",
-            "out dx, al",
-            in("eax") apic_id,
-            options(nostack, preserves_flags)
-        );
-    }
-    
-    // 1. Set up per-CPU GDT/TSS/IST stacks
+    // 1. Set up per-CPU GDT/TSS/IST stacks.
+    // Kernel stacks are addressed by raw physical address (identity-mapped in low 1GB).
     let pc = crate::percpu::percpu(apic_id);
     pc.apic_id = apic_id;
-    unsafe { e9(b'b'); }
-    
-    // Allocate kernel stack + 4 IST stacks
-    let kernel_stack_phys = crate::task::alloc_stack(crate::task::KERNEL_STACK_PAGES)
+
+    let kernel_stack = crate::task::alloc_stack(crate::task::KERNEL_STACK_PAGES)
         .expect("AP kernel stack alloc failed");
-    let kernel_stack = KERNEL_BASE + kernel_stack_phys;
     pc.kernel_stack = kernel_stack;
-    
-    let ist_df_phys = crate::task::alloc_stack(1).expect("AP DF stack");
-    let ist_timer_phys = crate::task::alloc_stack(1).expect("AP timer stack");
-    let ist_syscall_phys = crate::task::alloc_stack(1).expect("AP syscall stack");
-    let ist_pf_phys = crate::task::alloc_stack(1).expect("AP PF stack");
-    
+
+    let ist_df = crate::task::alloc_stack(1).expect("AP DF stack");
+    let ist_timer = crate::task::alloc_stack(1).expect("AP timer stack");
+    let ist_syscall = crate::task::alloc_stack(1).expect("AP syscall stack");
+    let ist_pf = crate::task::alloc_stack(1).expect("AP PF stack");
+
     let ist_stacks = [
-        KERNEL_BASE + ist_df_phys + 4096,
-        KERNEL_BASE + ist_timer_phys + 4096,
-        KERNEL_BASE + ist_syscall_phys + 4096,
-        KERNEL_BASE + ist_pf_phys + 4096,
+        ist_df + 4096,
+        ist_timer + 4096,
+        ist_syscall + 4096,
+        ist_pf + 4096,
     ];
-    
+
     pc.tss.rsp[0] = kernel_stack;
-    
-    // Setup per-CPU GDT
+
+    // Setup and load this AP's per-CPU GDT/TSS.
     crate::gdt::setup_percpu_gdt(&mut pc.gdt, &mut pc.tss, ist_stacks);
     crate::gdt::load_percpu_gdt(&pc.gdt);
-    unsafe { e9(b'c'); }
-    
-    // 2. Initialize LAPIC timer
-    unsafe { crate::apic::init_timer(); }
-    unsafe { e9(b'd'); }
-    
-    // 3. Enable interrupts
-    unsafe { core::arch::asm!("sti", options(nostack)); }
-    unsafe { e9(b'e'); }
-    
-    // 4. Mark this CPU online
+
+    // 2. Mark this CPU online.
     crate::task::mark_cpu_online(apic_id);
-    unsafe { e9(b'f'); }
-    
     crate::serial::write_str("AP ");
     crate::serial::write_hex(apic_id as u64);
     crate::serial::write_str(" online\n");
-    unsafe { e9(b'o'); }
-    
-    // 5. Enter idle loop
+
+    // 3. Idle. This kernel uses a shared PIC/PIT (global IRQ0) for ticking and a
+    // single-CPU global scheduler, neither of which is SMP-safe yet. The AP stays
+    // online but interrupt-disabled and halted until per-CPU scheduling lands.
     loop {
-        crate::task::yield_now_force();
+        unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)); }
     }
 }

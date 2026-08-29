@@ -8,6 +8,7 @@
  *   0x100-0x127: GDT (5 descriptors × 8 = 40 bytes)
  *   0x1F8: ap_entry_ptr (8 bytes, patched at runtime)
  *   0x200: ap_pml4_phys (8 bytes, patched at runtime)
+ *   0x208: per-AP bootstrap stack top, indexed by apic_id (8 bytes each, patched at runtime)
  *   0x300: GDTR pseudo-descriptor (6 bytes)
  */
 
@@ -186,13 +187,20 @@ long_mode_entry:
     movb $0x45, %al
     outb %al, $0xE9
 
-    /* Call ap_entry via address at physical 0x71F8 (offset 0x1F8 from trampoline start) */
-    movq 0x71F8, %rax
+    /* Switch to this AP's dedicated bootstrap stack.
+     * BSP stored stack top (virtual) at trampoline 0x208 + apic_id*8.
+     * Virtual: 0xFFFF_8000_0000_7208 + apic_id*8 (trampoline page direct-map). */
+    movabsq $0xFFFF800000007208, %rbx
+    movq (%rbx,%rdi,8), %rsp
 
-    /* Debug '9' - about to call ap_entry */
+    /* Debug '9' - about to call ap_entry (do this BEFORE clobbering RAX with the ptr) */
     movb $0x39, %al
     outb %al, $0xE9
 
+    /* Call ap_entry via address at physical 0x71F8 (offset 0x1F8 from trampoline start).
+     * Note: the '9' marker above uses %al, so it MUST run before we load RAX with the
+     * target pointer, otherwise the marker clobbers the low byte of the call target. */
+    movq 0x71F8, %rax
     call *%rax
 
     cli
