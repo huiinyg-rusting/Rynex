@@ -1,10 +1,14 @@
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
-// AP LAPIC timer (vector 0x21): pure per-CPU wakeup tick. All it does is EOI so
-// the next periodic tick can fire and re-arm itself; the AP's idle loop decides
-// whether to schedule. It does not touch the shared global scheduler state.
+// AP LAPIC timer (vector 0x21): wakes the AP and services its per-CPU needs.
+// It EOIs, then wakes any sleeping tasks whose time-based wakeup has arrived so
+// user/kernel tasks blocked on the AP resume (the BSP PIT timer does the same,
+// serialized by TIMER_WAKE_LOCK). It deliberately does NOT do the serial/keyboard
+// poll or the global preempt (PREEMPT_SCRATCH is a single global, so AP and BSP
+// must not preempt concurrently) — the AP cooperatively schedules via schedule().
 pub extern "x86-interrupt" fn ap_timer_irq(_frame: InterruptStackFrame) {
     unsafe { crate::apic::eoi(); }
+    crate::task::wakeup_expired_sleepers();
 }
 
 fn halt() -> ! {
