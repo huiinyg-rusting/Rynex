@@ -252,6 +252,8 @@ fn log_double_free(addr: u64, ctx: &str, order: usize, caller: u64) {
     crate::serial::write_hex(crate::task::current_task_pml4());
     crate::serial::write_str(" task=");
     crate::serial::write_dec(crate::task::current_task_id());
+    crate::serial::write_str(" refc=");
+    crate::serial::write_dec(crate::paging::refc_of(addr) as u64);
     let pidx = phys_to_idx(addr);
     if (pidx as usize) < DF_MAX_PAGES {
         crate::serial::write_str(" first_caller=0x");
@@ -305,6 +307,8 @@ fn df_latch(pidx: u64, caller: u64, order: usize) {
         crate::serial::write_hex(crate::task::current_task_pml4());
         crate::serial::write_str(" task=");
         crate::serial::write_dec(crate::task::current_task_id());
+        crate::serial::write_str(" refc=");
+        crate::serial::write_dec(crate::paging::refc_of(pidx << 12) as u64);
         crate::serial::write_str("\n");
     }
 }

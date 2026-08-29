@@ -65,6 +65,19 @@ fn refc_dec(phys: u64) {
     }
 }
 
+/// Diagnostic accessor for the buddy double-free capture points: report the
+/// current COW/refcount value of a physical data page (0 = not shared; the page
+/// would be freed outright on teardown). Lets the on-trigger DOUBLE-FREE log
+/// confirm whether a shared leaf's refcount had already dropped to 0.
+pub fn refc_of(phys: u64) -> u8 {
+    let i = refc_idx(phys);
+    if i < MAX_REFC_PAGES {
+        unsafe { PAGE_REFC[i] }
+    } else {
+        0
+    }
+}
+
 /// Record a new COW reference to a shared page at fork time, accounting for the
 /// parent's pre-existing ownership. A page with refc==0 is exclusively owned by
 /// the parent but its reference was never recorded (allocations don't bump the
