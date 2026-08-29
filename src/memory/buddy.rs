@@ -686,7 +686,7 @@ impl BuddyAllocator {
         for o in 0..=MAX_ORDER {
             let mut curr = self.free_lists[o];
             while !curr.is_null() {
-                total += (1u64 << o) * (4096 / 4096);
+                total += 1u64 << o;
                 unsafe { curr = (*curr).next; }
             }
         }

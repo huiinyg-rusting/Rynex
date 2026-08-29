@@ -61,7 +61,7 @@ pub fn init() {
     match result {
         Ok(mf) => {
             mf.flush();
-            let mut m = mapper();
+            let m = mapper();
             let t = m.translate(vaddr);
             use x86_64::structures::paging::mapper::TranslateResult;
             match t {

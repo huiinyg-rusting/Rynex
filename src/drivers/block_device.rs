@@ -41,7 +41,7 @@ pub fn block_read(block: u64) -> Option<*mut u8> {
         return None;
     }
     
-    let blk_size = BLOCK_SIZE.load(Ordering::SeqCst);
+    let _blk_size = BLOCK_SIZE.load(Ordering::SeqCst);
     if block >= TOTAL_BLOCKS.load(Ordering::SeqCst) {
         return None;
     }

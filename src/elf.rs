@@ -309,7 +309,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                             // 1G huge page — no PD to walk
                             continue;
                         }
-                        let pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
+                        let _pd_addr = pdpt.0[i] & crate::paging::PTE_ADDR_MASK;
                         // PD entries (2MB identity hugepages) stay NON-USER so user
                         // mode cannot access VA==phys (which would alias buddy-allocated
                         // pages with their identity VA and corrupt heap/LDSO memory).

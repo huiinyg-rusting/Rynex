@@ -256,7 +256,7 @@ unsafe impl GlobalAlloc for GlobalBuddyAllocator {
         );
         
         let order = {
-            let size = layout.size();
+            let _size = layout.size();
             let mut o = 0;
             while (4096 << o) < layout.size() && o < 10 {
                 o += 1;
@@ -270,10 +270,10 @@ unsafe impl GlobalAlloc for GlobalBuddyAllocator {
     
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size();
-        let size = (size + 4095) & !4095;
+        let _size = (size + 4095) & !4095;
         let order = {
             let size = layout.size();
-            let size = (size + 4095) & !4095;
+            let _size = (size + 4095) & !4095;
             let mut o = 0;
             while (4096 << o) < layout.size() && o < 10 {
                 o += 1;

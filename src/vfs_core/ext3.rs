@@ -313,7 +313,7 @@ impl Ext3Fs {
             let gd_per_block = self.block_size / core::mem::size_of::<Ext3GroupDesc>() as u64;
             let gd_blocks = ((self.group_count as u64) + gd_per_block - 1) / gd_per_block;
 
-            let gd_alloc_blocks = gd_blocks * self.block_size;
+            let _gd_alloc_blocks = gd_blocks * self.block_size;
             self.groups = (read_block)(gd_block).ok_or("can't read group desc")? as *mut Ext3GroupDesc;
             self.group_count_alloc = self.group_count;
 
@@ -406,7 +406,7 @@ impl Ext3Fs {
 
     pub fn alloc_block(&self) -> Result<u64, &'static str> {
         unsafe {
-            let alloc = &mut *allocator();
+            let _alloc = &mut *allocator();
             for g in 0..self.group_count as u64 {
                 let gd = self.get_group(g as u32);
                 if gd.is_null() { continue; }

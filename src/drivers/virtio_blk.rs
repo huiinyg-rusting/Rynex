@@ -8,7 +8,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use crate::memory::buddy::PAGE_SIZE;
-use crate::memory::allocator;
 use crate::serial;
 use crate::task;
 
@@ -370,8 +369,8 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
                     let aligned_ptr = cap_ptr & !3;
                     let cap_dword = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, aligned_ptr);
                     let vndr_id = ((cap_dword >> 24) & 0xFF) as u8;
-                    let cap_id_check = (cap_dword & 0xFF) as u8;
-                    let cap_next_check = ((cap_dword >> 8) & 0xFF) as u8;
+                    let _cap_id_check = (cap_dword & 0xFF) as u8;
+                    let _cap_next_check = ((cap_dword >> 8) & 0xFF) as u8;
                     
                     if vndr_id == 0x02 { // VIRTIO_PCI_CAP_VENDOR_SPECIFIC
                         let dword1 = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 4) as u8);
@@ -495,7 +494,7 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
             serial::write_str(if is_io { "I/O" } else { "memory" });
             serial::write_str(")\n");
             
-            let bar_ptr = bar_addr as *mut u8;
+            let _bar_ptr = bar_addr as *mut u8;
             let bar_port = bar_addr as u16;
             
             // Reset device
@@ -828,7 +827,7 @@ impl VirtioBlk {
 
     fn legacy_submit_req(&mut self, type_: u32, sector: u64, data: *mut u8, len: u32, writable: bool) -> Result<u32, i64> {
         unsafe {
-            let bar_port = self.legacy_bar_port;
+            let _bar_port = self.legacy_bar_port;
             
             let alloc = crate::memory::allocator();
             let req_phys = alloc.alloc(0).ok_or(-1)?;
