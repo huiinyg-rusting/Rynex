@@ -83,11 +83,12 @@ pub unsafe fn init_ap_timer() {
     if per_ms == 0 {
         return;
     }
-    // ~100Hz => 10ms interval.
+    // ~100Hz => 10ms interval. Vector 0x21 = dedicated AP timer vector (its
+    // handler is ap_timer_irq: EOI + return). Vector 0x20 is the BSP's PIT.
     let count = per_ms * 10;
     write_reg(0x3E0, 0x3);                    // divide by 1
     write_reg(0x380, count);                   // initial count
-    write_reg(0x320, (1 << 17) | 0x20);        // periodic, unmasked, vector 0x20
+    write_reg(0x320, (1 << 17) | 0x21);        // periodic, unmasked, vector 0x21
 }
 
 pub unsafe fn send_ipi(apic_id: u32, delivery_mode: u32, vector: u32, level: u32, trigger: u32) {

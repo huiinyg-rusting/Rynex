@@ -1,5 +1,12 @@
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
+// AP LAPIC timer (vector 0x21): pure per-CPU wakeup tick. All it does is EOI so
+// the next periodic tick can fire and re-arm itself; the AP's idle loop decides
+// whether to schedule. It does not touch the shared global scheduler state.
+pub extern "x86-interrupt" fn ap_timer_irq(_frame: InterruptStackFrame) {
+    unsafe { crate::apic::eoi(); }
+}
+
 fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
