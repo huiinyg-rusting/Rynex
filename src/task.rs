@@ -68,21 +68,21 @@ static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Track if current CPU is in a syscall (to prevent context switches during syscalls)
 pub fn in_syscall_enter() {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id != 0 {
         unsafe { TASKS[task_idx(id)].in_syscall = true; }
     }
 }
 
 pub fn in_syscall_exit() {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id != 0 {
         unsafe { TASKS[task_idx(id)].in_syscall = false; }
     }
 }
 
 pub fn in_syscall() -> bool {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return false; }
     unsafe { TASKS[task_idx(id)].in_syscall }
 }
@@ -120,7 +120,7 @@ pub fn proc_entry(idx: usize) -> Option<ProcEntry> {
 /// Set the running task's short command name (for /proc/<pid>/stat). Truncates
 /// to 15 chars + NUL, Linux-compatible.
 pub fn set_current_comm(name: &[u8]) {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
     let idx = task_idx(id);
     let len = core::cmp::min(name.len(), 15);
@@ -250,6 +250,10 @@ pub struct Task {
     pub user_stack: u64,
     pub pml4: u64,
 
+    // SMP: the CPU this task is allowed to / expected to run on (home CPU).
+    // All runqueue operations and the scheduler pick this task only on this CPU.
+    pub cpu: u8,
+
     // Linux task_struct scheduling fields
     pub static_prio: u8,
     pub normal_prio: u8,
@@ -343,6 +347,7 @@ impl Task {
             kernel_stack: 0,
             user_stack: 0,
             pml4: 0,
+            cpu: 0,
             static_prio: PRIORITY_DEFAULT,
             normal_prio: PRIORITY_DEFAULT,
             prio: PRIORITY_DEFAULT,
@@ -397,11 +402,47 @@ impl RunQueue {
 }
 
 static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
-static mut RUNQUEUE: RunQueue = RunQueue::new();
+
+// SMP: maximum number of logical CPUs the scheduler is built for. The BSP is CPU 0;
+// APIC IDs above the physical count simply stay unwired. Each CPU has its OWN current
+// task, runqueue, and runqueue lock (per-CPU scheduling).
+pub const MAX_CPUS: usize = 2;
+// When true, newly created tasks are spread across all online CPUs. Currently
+// false because the AP idles with interrupts disabled; the AP scheduler idle
+// loop must be wired up first (see pick_home_cpu).
+const SPREAD_TASKS_TO_AP: bool = false;
+static mut RUNQUEUE: [RunQueue; MAX_CPUS] = [const { RunQueue::new() }; MAX_CPUS];
 // Serializes all runqueue mutations. IRQ-safe so the timer ISR and syscalls can
-// both touch the runqueue without corrupting the linked lists / bitmap.
-static RUNQUEUE_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
-static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
+// both touch the runqueue without corrupting the linked lists / bitmap. One lock per CPU.
+static RUNQUEUE_LOCK: [crate::spinlock::RawSpin; MAX_CPUS] =
+    [const { crate::spinlock::RawSpin::new() }; MAX_CPUS];
+static CURRENT_TASK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+// Number of CPUs online beyond the BSP (BSP=CPU0 is always online, uncounted).
+static ONLINE_CPUS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+// Round-robin counter for spreading newly-created tasks across online CPUs.
+static HOME_CPU_ROUND: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+// Map an APIC id to a compact CPU index (0,1,...). APIC ids are dense (0,1) on
+// QEMU; using the raw id would not be sparse-safe, so index by position to stay
+// within MAX_CPUS. Inline-fast path first: APIC ids here are 0..MAX_CPUS-1.
+fn cpu_index_of(apic_id: u32) -> usize {
+    (apic_id as usize) % MAX_CPUS
+}
+
+// The index of the CPU currently executing. Reads the local APIC id via MMIO.
+// Kept out of the ultra-hot path; scheduler / timer are ~100Hz.
+#[inline(always)]
+pub fn current_cpu() -> usize {
+    cpu_index_of(unsafe { crate::apic::read_reg(0x20) >> 24 })
+}
+
+#[inline(always)]
+fn cur_task() -> &'static AtomicU64 {
+    unsafe { &CURRENT_TASK[current_cpu()] }
+}
 // Whether pid 1 (slot 0) has been handed out (to init), so it can't be aliased.
 // The actual slot accounting is done by PID_BITMAP.
 static INIT_TASK_ASSIGNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -462,7 +503,7 @@ static mut PREEMPT_SCRATCH: [u64; 3] = [0; 3];
 pub static KERNEL_EH_FRAME_HDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn current_task_id() -> u64 {
-    CURRENT_TASK.load(Ordering::SeqCst)
+    cur_task().load(Ordering::SeqCst)
 }
 
 pub fn task_kernel_stack_by_id(id: u64) -> u64 {
@@ -471,13 +512,13 @@ pub fn task_kernel_stack_by_id(id: u64) -> u64 {
 }
 
 pub fn current_task_regs_rip() -> u64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].regs.rip }
 }
 
 pub fn current_task_regs_rsp() -> u64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].regs.rsp }
 }
@@ -548,7 +589,7 @@ fn free_pid(pid: u64) {
 }
 
 pub fn current_task() -> Option<&'static mut Task> {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return None; }
     unsafe { Some(&mut TASKS[task_idx(id)]) }
 }
@@ -561,9 +602,11 @@ pub fn task_by_id(id: u64) -> Option<&'static mut Task> {
 // ── Runqueue operations ──────────────────────────────────────────
 
 fn enqueue_task(tid: u64, prio: u8) {
-    let _g = RUNQUEUE_LOCK.lock();
+    // Enqueue onto the task's home CPU runqueue (affinity).
+    let cpu = unsafe { TASKS[task_idx(tid)].cpu } as usize;
+    let _g = RUNQUEUE_LOCK[cpu].lock();
     unsafe {
-        let rq = &mut RUNQUEUE;
+        let rq = &mut RUNQUEUE[cpu];
         let idx = task_idx(tid);
         TASKS[idx].runqueue_next = None;
 
@@ -582,9 +625,10 @@ fn enqueue_task(tid: u64, prio: u8) {
 }
 
 fn dequeue_task() -> Option<u64> {
-    let _g = RUNQUEUE_LOCK.lock();
+    let cpu = current_cpu();
+    let _g = RUNQUEUE_LOCK[cpu].lock();
     unsafe {
-        let rq = &mut RUNQUEUE;
+        let rq = &mut RUNQUEUE[cpu];
         if rq.bitmap == 0 {
             return None;
         }
@@ -603,9 +647,10 @@ fn dequeue_task() -> Option<u64> {
 }
 
 fn remove_from_runqueue(tid: u64) -> bool {
-    let _g = RUNQUEUE_LOCK.lock();
+    let cpu = unsafe { TASKS[task_idx(tid)].cpu } as usize;
+    let _g = RUNQUEUE_LOCK[cpu].lock();
     unsafe {
-        let rq = &mut RUNQUEUE;
+        let rq = &mut RUNQUEUE[cpu];
         let idx = task_idx(tid);
         let prio = TASKS[idx].prio as usize;
 
@@ -636,7 +681,7 @@ fn remove_from_runqueue(tid: u64) -> bool {
 }
 
 fn requeue_current() {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
     unsafe {
         let idx = task_idx(id);
@@ -712,6 +757,7 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32, comm: &[u8]) -> Option<u64
     task.kernel_stack = kernel_stack;
     task.user_stack = 0;
     task.pml4 = pt_mgr().kernel_pml4();
+    task.cpu = pick_home_cpu();
     task.static_prio = nice_to_prio(nice);
     task.normal_prio = task.static_prio;
     task.prio = task.static_prio;
@@ -859,6 +905,7 @@ pub fn create_user_task_prio(entry: u64, pml4: u64, user_stack_top: u64, nice: i
     task.kernel_stack = kernel_stack;
     task.user_stack = user_stack_top;
     task.pml4 = pml4;
+    task.cpu = pick_home_cpu();
     task.static_prio = nice_to_prio(nice);
     task.normal_prio = task.static_prio;
     task.prio = task.static_prio;
@@ -912,8 +959,34 @@ pub fn init_scheduler() {
 }
 
 pub fn mark_cpu_online(_apic_id: u32) {
-    // Per-CPU online tracking can be expanded later (e.g., per-CPU runqueues)
-    // For now, just acknowledge the AP is alive.
+    let n = ONLINE_CPUS.fetch_add(1, Ordering::SeqCst);
+    if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
+        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+        crate::klog::s("SCHED: mark_cpu_online apic=0x");
+        crate::klog::hex(_apic_id as u64);
+        crate::klog::s(" now_online=");
+        crate::klog::dec((n + 1) as u64);
+        crate::klog::s("\n");
+        crate::klog::end();
+    }
+}
+
+// Pick a home CPU for a newly created task. Prefer the BSP (0) unless an AP
+// is online, in which case spread load across online CPUs round-robin. This
+// runs at task-creation time and need not be lock-free-precise.
+fn pick_home_cpu() -> u8 {
+    // Until the AP's scheduler idle loop is wired up (it currently idles with
+    // interrupts disabled), route everything to the BSP so no task is stranded
+    // on an AP that never runs it. Flip to spreading once the AP can schedule.
+    if !SPREAD_TASKS_TO_AP {
+        return 0;
+    }
+    let online = ONLINE_CPUS.load(Ordering::SeqCst).max(1);
+    if online <= 1 {
+        return 0;
+    }
+    let turn = HOME_CPU_ROUND.fetch_add(1, Ordering::SeqCst);
+    ((turn % online as u64) as usize % MAX_CPUS) as u8
 }
 
 pub fn schedule() {
@@ -937,7 +1010,7 @@ fn schedule_inner(force: bool) {
         return;
     }
 
-    let current = CURRENT_TASK.load(Ordering::SeqCst);
+    let current = cur_task().load(Ordering::SeqCst);
 
     // Pick a different task. If the highest-priority task IS current,
     // remove it from the queue and look for another one.
@@ -1013,7 +1086,7 @@ fn schedule_inner(force: bool) {
 
     unsafe { crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack); }
 
-    let old = CURRENT_TASK.swap(next_id, Ordering::SeqCst);
+    let old = cur_task().swap(next_id, Ordering::SeqCst);
 
     unsafe {
         TASKS[new_idx].state = TaskState::Running;
@@ -1068,7 +1141,7 @@ fn schedule_inner(force: bool) {
 }
 
 pub fn yield_now() {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
     unsafe {
@@ -1087,7 +1160,7 @@ pub fn yield_now() {
 }
 
 pub fn yield_now_force() {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
     unsafe {
@@ -1102,7 +1175,7 @@ pub fn yield_now_force() {
 }
 
 pub fn exit_task(code: i32) {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
     unsafe {
@@ -1311,7 +1384,7 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
 #[no_mangle]
 pub extern "C" fn save_interrupt_context(frame: *mut u64) {
     unsafe {
-        let current = CURRENT_TASK.load(Ordering::SeqCst);
+        let current = cur_task().load(Ordering::SeqCst);
         if current == 0 {
             return;
         }
@@ -1547,7 +1620,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         }
     }
 
-    let current = CURRENT_TASK.load(Ordering::SeqCst);
+    let current = cur_task().load(Ordering::SeqCst);
     if current == 0 {
         return 0;
     }
@@ -1620,7 +1693,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
-        CURRENT_TASK.store(next_id, Ordering::SeqCst);
+        cur_task().store(next_id, Ordering::SeqCst);
         unsafe { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
         crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack);
@@ -1926,7 +1999,7 @@ pub extern "C" fn syscall_handler(
     arg4: u64, arg5: u64, arg6: u64
 ) -> i64 {
     in_syscall_enter();
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if syscall_num == SYS_execve && arg2 != 0 {
         // Check if executing busybox
         let filename_bytes = unsafe { core::slice::from_raw_parts(arg1 as *const u8, 64) };
@@ -1992,10 +2065,10 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_lseek => sys_lseek(arg1 as u32, arg2 as i64, arg3 as i32),
         SYS_readv => sys_readv(arg1 as u32, arg2 as u64, arg3 as i32),
         SYS_writev => sys_writev(arg1 as u32, arg2 as u64, arg3 as i32),
-        SYS_gettid => CURRENT_TASK.load(Ordering::SeqCst) as i64,
+        SYS_gettid => cur_task().load(Ordering::SeqCst) as i64,
         SYS_tkill => sys_tkill(arg1 as i64, arg2 as i32),
         SYS_sched_getaffinity => 0,
-        SYS_set_tid_address => CURRENT_TASK.load(Ordering::SeqCst) as i64,
+        SYS_set_tid_address => cur_task().load(Ordering::SeqCst) as i64,
         SYS_clock_gettime => sys_clock_gettime(arg1 as u64, arg2 as *mut u8),
         SYS_clock_nanosleep => sys_clock_nanosleep(arg1 as u64, arg2 as u32, arg3 as *const u64, arg4 as *mut u64),
         SYS_exit_group => sys_exit(arg1 as i32),
@@ -2084,7 +2157,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
     // Trace every syscall into the klog ring buffer (FAC_SYSCALL, DEBUG).
     // Only mirrored to serial when console level >= DEBUG, so the crash tail
     // shows the exact syscall sequence that led to a fault.
-    let current = CURRENT_TASK.load(Ordering::SeqCst);
+    let current = cur_task().load(Ordering::SeqCst);
     crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SYSCALL);
     crate::klog::s("sc=");
     crate::klog::dec(syscall_num);
@@ -2121,7 +2194,7 @@ fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> i64 {
 }
 
 fn sys_exit(status: i32) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     serial::write_str("SYS_EXIT: task ");
     serial::write_dec(id as u64);
     serial::write_str(" status=");
@@ -2133,7 +2206,7 @@ fn sys_exit(status: i32) -> i64 {
     serial::write_str("\n");
     exit_task(status);
     // If no other task to schedule, halt
-    let id2 = CURRENT_TASK.load(Ordering::SeqCst);
+    let id2 = cur_task().load(Ordering::SeqCst);
     if id2 == 0 || unsafe { TASKS[task_idx(id2)].state } == TaskState::Zombie {
         serial::write_str("SYS_EXIT: no more tasks, halting\n");
         unsafe { core::arch::asm!("cli; hlt", options(noreturn)); }
@@ -2498,7 +2571,7 @@ fn vma_clear_pml4(pml4: u64) {
 /// `size` is rounded up to pages. Returns the user virtual address or a negated
 /// errno. The mapping is marked uncached via PTE_NO_CACHE where available.
 fn sys_phys_map(phys: u64, size: u64) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     if phys == 0 || size == 0 || size > 0x1_0000_0000 {
         return -EINVAL;
@@ -2573,7 +2646,7 @@ let size = ((size + 0xFFF) & !0xFFF) as u64;
 /// (user_vaddr, phys_addr) packed: phys in high 32 bits, vaddr in low 48.
 fn sys_dma_alloc(_pages: usize) -> i64 {
     let pages = if _pages == 0 { 1 } else { _pages.min(8) };
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     let idx = unsafe { task_idx(id) };
 
@@ -2651,7 +2724,7 @@ fn sys_dma_free(packed: u64) -> i64 {
     if vaddr == 0 || phys == 0 {
         return -EINVAL;
     }
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     let idx = unsafe { task_idx(id) };
     let pml4 = unsafe { TASKS[idx].pml4 };
@@ -2873,7 +2946,7 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
         return -EAGAIN;
     }
 
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     // Relative timeout (Linux FUTEX_WAIT): parse {tv_sec, tv_nsec} timespec,
@@ -2990,7 +3063,7 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
 /// `futex_wake` (or a spurious timer wake). Returns true if we were woken.
 /// Intended for the IPC mailbox send/recv loops.
 pub fn block_on_futex(uaddr: *const u32) -> bool {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return false; }
     remove_from_runqueue(id);
     unsafe {
@@ -3013,7 +3086,7 @@ pub fn block_on_futex(uaddr: *const u32) -> bool {
 }
 
 fn futex_lock_pi(uaddr: *const u32) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     unsafe {
@@ -3080,7 +3153,7 @@ fn futex_lock_pi(uaddr: *const u32) -> i64 {
 }
 
 fn futex_unlock_pi(uaddr: *const u32) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     unsafe {
@@ -3426,7 +3499,7 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         return -ENOSYS; // Shared mmap not yet supported
     }
 
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
@@ -3514,7 +3587,7 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
 }
 
 fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
@@ -3576,7 +3649,7 @@ unsafe fn munmap_page_in_use(page: u64, _self_idx: usize) -> bool {
 
 fn sys_munmap(addr: u64, len: usize) -> i64 {
     if len == 0 { return -EINVAL; }
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     let start = addr & !(PAGE_SIZE_4K - 1);
@@ -3644,7 +3717,7 @@ pub static mut SYSCALL_USER_RFLAGS: u64 = 0;
 pub static mut SYSCALL_USER_FS_BASE: u64 = 0;
 
 fn sys_fork() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     unsafe {
@@ -3713,6 +3786,7 @@ fn sys_fork() -> i64 {
             kernel_stack,
             user_stack: parent.user_stack,
             pml4: child_pml4,
+            cpu: parent.cpu,
             static_prio: parent.static_prio,
             normal_prio: parent.normal_prio,
             prio: parent.prio,
@@ -3777,7 +3851,7 @@ fn sys_fork() -> i64 {
 
 fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
              child_tidptr: *mut u64, tls: u64, func: u64) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     serial::write_str("sys_clone: parent=");
@@ -3900,6 +3974,7 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             kernel_stack,
             user_stack: child_stack,
             pml4: child_pml4,
+            cpu: parent.cpu,
             static_prio: parent.static_prio,
             normal_prio: parent.normal_prio,
             prio: parent.prio,
@@ -3990,7 +4065,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
         crate::klog::log(crate::klog::LOG_DEBUG, crate::klog::FAC_EXEC, "sys_execve called");
     }
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     if pathname.is_null() {
@@ -4534,36 +4609,36 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
 // ── Get PID / PPID ───────────────────────────────────────────────
 
 fn sys_getuid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].uid as i64 }
 }
 
 fn sys_getgid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].gid as i64 }
 }
 
 fn sys_geteuid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].euid as i64 }
 }
 
 fn sys_getegid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].egid as i64 }
 }
 
 fn sys_getpid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     id as i64
 }
 
 fn sys_getppid() -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe {
         match TASKS[task_idx(id)].parent {
@@ -4576,7 +4651,7 @@ fn sys_getppid() -> i64 {
 fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     match code {
         ARCH_SET_FS => {
-            let id = CURRENT_TASK.load(Ordering::SeqCst);
+            let id = cur_task().load(Ordering::SeqCst);
             if id == 0 { return -EINVAL; }
             unsafe {
                 let idx = task_idx(id);
@@ -4595,7 +4670,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
             0
         }
         ARCH_GET_FS => {
-            let id = CURRENT_TASK.load(Ordering::SeqCst);
+            let id = cur_task().load(Ordering::SeqCst);
             if id == 0 { return -EINVAL; }
             unsafe {
                 let idx = task_idx(id);
@@ -4611,7 +4686,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
 }
 
 fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     serial::write_str("sys_prctl: task ");
     serial::write_dec(id);
     serial::write_str(" option=");
@@ -4667,7 +4742,7 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
 // ── Sleep ─────────────────────────────────────────────────────────
 
 fn sys_sleep(ticks: u64) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     let now = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
@@ -4698,7 +4773,7 @@ fn sys_sleep(ticks: u64) -> i64 {
 // ── Brk ───────────────────────────────────────────────────────────
 
 fn sys_brk(addr: u64) -> i64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
     unsafe {
@@ -6023,7 +6098,7 @@ fn cstr_from_ptr(ptr: *const u8) -> &'static [u8] {
 }
 
 pub fn current_task_pml4() -> u64 {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
     unsafe { TASKS[task_idx(id)].pml4 }
 }
@@ -6055,7 +6130,7 @@ pub fn sanitize_task_pml4s() {
 /// identical. We scan every task sharing `pml4` rather than only the current
 /// task's copy, so a mapping registered by a sibling is visible here.
 pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
-    let id = CURRENT_TASK.load(Ordering::SeqCst);
+    let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return false; }
     unsafe {
         // The pool is keyed by pml4, so a VMA registered by any CLONE_VM
@@ -6475,11 +6550,12 @@ pub fn boot_userland() {
     task0.kernel_stack = alloc_stack(KERNEL_STACK_PAGES).expect("task0 stack");
     task0.regs = Registers::new_kernel(continue_after_schedule as u64, task0.kernel_stack);
     task0.pml4 = pt_mgr().kernel_pml4();
+    task0.cpu = 0;
     task0.static_prio = nice_to_prio(19);
     task0.normal_prio = task0.static_prio;
     task0.prio = task0.static_prio;
     task0.in_syscall = false;
-    CURRENT_TASK.store(0, Ordering::SeqCst);
+    cur_task().store(0, Ordering::SeqCst);
     unsafe { CURRENT_TASK_ID = 0; TASKS_PTR = TASKS.as_mut_ptr(); }
 
     // Dequeue init task so it's not in the runqueue twice.
@@ -6497,7 +6573,7 @@ pub fn boot_userland() {
         new_task.prio = nice_to_prio(-10);
         new_task.time_slice = initial_time_slice(nice_to_prio(-10));
     }
-    CURRENT_TASK.store(init_tid, Ordering::SeqCst);
+    cur_task().store(init_tid, Ordering::SeqCst);
     unsafe { CURRENT_TASK_ID = init_tid; }
     unsafe { BOOT_INIT_SLOT = init_slot; }
 
