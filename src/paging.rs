@@ -840,7 +840,7 @@ pub fn is_user_addr(addr: u64) -> bool {
 
 /// Copy user page mappings from `src_pml4` to `dst_pml4`
 pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str> {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let _alloc = unsafe { &mut *crate::memory::allocator() };
     let src = unsafe { &*(src_pml4 as *const PageTable) };
     let dst = unsafe { &mut *(dst_pml4 as *mut PageTable) };
     for pml4_idx in 0..256 {

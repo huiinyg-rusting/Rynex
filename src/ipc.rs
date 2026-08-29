@@ -15,9 +15,7 @@
 //! All message buffers live in pages allocated from the buddy allocator, so
 //! payloads are never copied twice and never touch user address spaces.
 
-use core::sync::atomic::Ordering;
 
-use crate::task::TaskState;
 
 pub const MAX_PORTS: usize = 32;
 pub const PORT_SLOTS: usize = 64;

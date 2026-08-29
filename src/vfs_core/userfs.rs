@@ -114,7 +114,7 @@ impl super::VnodeOps for UserFs {
     fn readdir(&self, dir_ino: u64, offset: u64, _buf: &mut [super::Dirent]) -> Result<usize, &'static str> {
         // Directory listing is returned as NUL-separated names in the payload;
         // the user-space service owns the format.
-        let (result, out) = do_call(OP_READDIR, dir_ino, offset, 0, 0, b"", b"").map_err(|_| "userfs readdir")?;
+        let (result, _out) = do_call(OP_READDIR, dir_ino, offset, 0, 0, b"", b"").map_err(|_| "userfs readdir")?;
         if result < 0 {
             return Err("userfs readdir");
         }
@@ -154,7 +154,7 @@ impl super::VnodeOps for UserFs {
     }
 
     fn stat(&self, ino: u64) -> Result<super::Stat, &'static str> {
-        let (result, out) = do_call(OP_STAT, ino, 0, 0, 0, b"", b"").map_err(|_| "userfs stat")?;
+        let (result, _out) = do_call(OP_STAT, ino, 0, 0, 0, b"", b"").map_err(|_| "userfs stat")?;
         if result < 0 {
             return Err("userfs stat");
         }

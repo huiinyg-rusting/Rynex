@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 use core::mem::MaybeUninit;
 
 pub const MAX_CPUS: usize = 256;

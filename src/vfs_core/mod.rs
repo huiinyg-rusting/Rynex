@@ -326,7 +326,7 @@ impl MountTableInner {
             let mp = &self.mounts[i].mount_point[..self.mounts[i].mp_len];
             if path.len() < mp.len() { continue; }
             if &path[..mp.len()] == mp {
-                let after_mp = if path.len() == mp.len() {
+                let _after_mp = if path.len() == mp.len() {
                     0
                 } else if mp.len() == 1 && mp[0] == b'/' {
                     path.len() - 1
@@ -558,7 +558,7 @@ pub fn vnode_get(id: u16) -> Option<&'static Vnode> {
 
 #[allow(invalid_reference_casting)]
 pub fn vnode_get_mut(id: u16) -> Option<&'static mut Vnode> {
-    let mut vt = VNODE_TABLE.lock();
+    let vt = VNODE_TABLE.lock();
     let v = vt.get(id)?;
     let ptr = v as *const Vnode as *mut Vnode;
     unsafe { Some(&mut *ptr) }
@@ -573,7 +573,7 @@ pub fn dispatch(msg: &mut VfsMessage) -> i64 {
         VfsOp::Open => {
             match path_to_vnode(&msg.path_buf[..msg.path_len]) {
                 Ok(vn_id) => msg.result = vn_id as i64,
-                Err(e) => msg.result = -1,
+                Err(_e) => msg.result = -1,
             }
         }
         VfsOp::Read => {
@@ -752,7 +752,7 @@ pub fn dispatch(msg: &mut VfsMessage) -> i64 {
                 Some(v) => v,
                 None => { msg.result = -1; return -1; }
             };
-            let st = match vnode.ops.stat(vnode.ino) {
+            let _st = match vnode.ops.stat(vnode.ino) {
                 Ok(s) => s,
                 Err(_) => { msg.result = -1; return -1; }
             };

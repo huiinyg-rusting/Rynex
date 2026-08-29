@@ -102,7 +102,7 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     // Initialize keyboard BEFORE timer so UART input during boot isn't lost
     keyboard::init();
     let kbd_vec = pic::IRQ_BASE + 1;
-    idt::register_irq(kbd_vec, keyboard::keyboard_interrupt_handler as u64);
+    idt::register_irq(kbd_vec, keyboard::keyboard_interrupt_handler as *const () as u64);
     vga::write_str("KBD: OK\n");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("KBD: OK\n");
@@ -181,8 +181,8 @@ pit::init(100);
         core::arch::asm!(
             "mov ecx, 0xC0000082",
             "wrmsr",
-            in("eax") (syscall_entry as u64 & 0xFFFFFFFF) as u32,
-            in("edx") (syscall_entry as u64 >> 32) as u32,
+            in("eax") (syscall_entry as *const () as u64 & 0xFFFFFFFF) as u32,
+            in("edx") (syscall_entry as *const () as u64 >> 32) as u32,
             options(nostack, preserves_flags)
         );
         // FMASK: flags to clear on syscall (clear IF)
@@ -194,7 +194,7 @@ pit::init(100);
             options(nostack, preserves_flags)
         );
         // Enable SCE bit (bit 0) in EFER
-        let mut efer2 = efer | 1;
+        let efer2 = efer | 1;
         let efer2_low = efer2 as u32;
         let efer2_high = (efer2 >> 32) as u32;
         core::arch::asm!(
@@ -293,7 +293,7 @@ pit::init(100);
     // clock) but does NOT arm the BSP's LAPIC timer (BSP keeps the PIT).
     unsafe { crate::apic::calibrate_once(); }
     unsafe {
-        crate::smp::init_aps(crate::smp::ap_entry as u64);
+        crate::smp::init_aps(crate::smp::ap_entry as *const () as u64);
     }
     serial::write_str("DEBUG: SMP init done\n");
 

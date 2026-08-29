@@ -2,7 +2,6 @@ use crate::serial;
 use crate::memory;
 use crate::spinlock::Mutex;
 use super::types::*;
-use super::xattr;
 use super::VnodeOps;
 
 pub const MAX_INODES: usize = 256;

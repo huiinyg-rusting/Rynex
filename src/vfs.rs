@@ -1,6 +1,5 @@
 use crate::serial;
 use crate::vfs_core::ramfs;
-use crate::vfs_core::VnodeOps;
 use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 pub const MAX_INODES: usize = 256;
@@ -188,7 +187,7 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
                 // IPC bridge so reads/writes forward to the FS service.
                 crate::vfs_core::path_to_vnode(norm).ok()? as u16
             } else {
-                let mode = crate::vfs_core::types::S_IFREG
+                let _mode = crate::vfs_core::types::S_IFREG
                     | crate::vfs_core::types::S_IRUSR
                     | crate::vfs_core::types::S_IWUSR
                     | crate::vfs_core::types::S_IRGRP

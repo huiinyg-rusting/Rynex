@@ -1041,7 +1041,7 @@ pub fn ap_begin_scheduling(apic_id: u32) -> ! {
         task.prio = task.static_prio;
         task.time_slice = initial_time_slice(task.prio);
         task.in_syscall = false;
-        task.regs = Registers::new_kernel(ap_idle_entry as u64, kernel_stack);
+        task.regs = Registers::new_kernel(ap_idle_entry as *const () as u64, kernel_stack);
         tid
     };
 
@@ -1057,7 +1057,7 @@ pub fn ap_begin_scheduling(apic_id: u32) -> ! {
         // LAPIC (SVR bit 8) here, otherwise QEMU never delivers its timer IRQ.
         crate::apic::init_lapic();
         // Dedicated AP timer vector: pure EOI+wakeup handler.
-        crate::idt::register_irq(0x21, crate::interrupts::ap_timer_irq as u64);
+        crate::idt::register_irq(0x21, crate::interrupts::ap_timer_irq as *const () as u64);
         crate::apic::init_ap_timer();
         core::arch::asm!("sti", options(nostack));
     }
@@ -1111,7 +1111,7 @@ pub fn spawn_ap_demo_tasks() {
     let n = ONLINE_CPUS.load(Ordering::SeqCst);
     for c in 1..=n.min((MAX_CPUS - 1) as u64) {
         if let Some(tid) =
-            create_kernel_task_prio(ap_demo_entry as u64, PRIORITY_DEFAULT_NICE, b"apdemo")
+            create_kernel_task_prio(ap_demo_entry as *const () as u64, PRIORITY_DEFAULT_NICE, b"apdemo")
         {
             let idx = task_idx(tid);
             unsafe {
@@ -1979,7 +1979,7 @@ fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
             PREEMPT_SCRATCH[0] = regs.rax;
             PREEMPT_SCRATCH[1] = regs.rdx;
             PREEMPT_SCRATCH[2] = regs.rip;
-            *base.add(15) = preempt_trampoline as u64;
+            *base.add(15) = preempt_trampoline as *const () as u64;
         }
         base as u64
     }
@@ -2785,7 +2785,7 @@ let size = ((size + 0xFFF) & !0xFFF) as u64;
         return -ENOMEM;
     }
 
-    let mut flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_WRITABLE
+    let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_WRITABLE
         | crate::paging::PTE_CACHE_DISABLE;
     let mut off = 0u64;
     while off < size {
@@ -3196,7 +3196,7 @@ pub fn futex_wait(uaddr: *const u32, val: u32, timeout: *const u64) -> i64 {
         let idx = task_idx(id);
         if TASKS[idx].futex_deadline != 0 {
             TASKS[idx].futex_deadline = 0;
-            let now = crate::pit::TICKS.load(Ordering::Relaxed);
+            let _now = crate::pit::TICKS.load(Ordering::Relaxed);
             return -ETIMEDOUT;
         }
     }
@@ -3783,7 +3783,7 @@ fn sys_mprotect(addr: u64, len: usize, prot: i32) -> i64 {
         let idx = task_idx(id);
         let pml4 = TASKS[idx].pml4;
         let start = addr & !0xFFF;
-        let end = ((addr + len as u64 + 0xFFF) & !0xFFF);
+        let end = (addr + len as u64 + 0xFFF) & !0xFFF;
         let mut pte_flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER;
         if (prot & 2) != 0 { pte_flags |= crate::paging::PTE_WRITABLE; }
         if (prot & 4) == 0 { pte_flags |= crate::paging::PTE_NO_EXECUTE; }
@@ -4381,7 +4381,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     // Load interpreter at a PIC base into the same PML4
                     match crate::elf::load_elf_at(interp_buf, INTERP_BASE, Some(info.pml4)) {
                         Ok(ii) => interp_info = Some(ii),
-                        Err(e) => {
+                        Err(_e) => {
                             alloc.free(buffer_phys, elford);
                             alloc.free(interp_phys, interp_ord);
                         crate::klog::log(crate::klog::LOG_ERR, crate::klog::FAC_EXEC, "interp load failed");
@@ -4630,8 +4630,8 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     // Zero the entire TLS page first
                     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
 
-                    let tls_base = USER_TLS_VADDR;
-                    let tid = id; // current task id is the new thread's tid
+                    let _tls_base = USER_TLS_VADDR;
+                    let _tid = id; // current task id is the new thread's tid
 
                     // Map the TLS page FIRST so we can write to virtual addresses
                     let tls_flags = crate::paging::PTE_PRESENT
@@ -4873,7 +4873,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     }
 }
 
-fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     serial::write_str("sys_prctl: task ");
     serial::write_dec(id);
@@ -4989,7 +4989,7 @@ fn sys_brk(addr: u64) -> i64 {
 
         // Ensure a brk VMA exists for this address space (the pool is keyed
         // by pml4, so CLONE_VM siblings automatically share it).
-        let mut brk_vma = vma_find(pml4, brk_start);
+        let brk_vma = vma_find(pml4, brk_start);
         if brk_vma.is_none() {
             vma_register(
                 pml4,
@@ -5628,7 +5628,7 @@ fn sys_sigaltstack(ss: u64, old_ss: u64) -> i64 {
     // stack_t layout: { ss_sp:u64, ss_flags:u32, _pad:u32, ss_size:u64 }
     let id = current_task_id();
     if id == 0 { return -EINVAL; }
-    let idx = task_idx(id);
+    let _idx = task_idx(id);
     unsafe {
         // Keep a simple static altstack mirror for the kernel task state.
         static mut ALTSTACK_SP: u64 = 0;
@@ -6074,7 +6074,7 @@ fn sys_setrlimit(_resource: u32, buf: *mut u8) -> i64 {
     0
 }
 
-fn sys_mknod(pathname: *const u8, mode: u32, _dev: u64) -> i64 {
+fn sys_mknod(pathname: *const u8, _mode: u32, _dev: u64) -> i64 {
     if pathname.is_null() { return -EFAULT; }
     let name = unsafe { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
@@ -6390,7 +6390,7 @@ pub fn user_range_valid(addr: u64, len: usize, want_write: bool) -> bool {
     true
 }
 
-fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
+fn sys_poll(fds: u64, nfds: u64, _timeout: i32) -> i64 {
     if fds == 0 || nfds == 0 {
         return -EFAULT;
     }
@@ -6414,7 +6414,7 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
         let mut revents = 0i16;
         
         // Check if fd is valid
-        let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+        let _inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
             Some(f) => f,
             None => {
                 revents = POLLNVAL;
@@ -6740,7 +6740,7 @@ pub fn boot_userland() {
     task0.id = 0;
     task0.state = TaskState::Running;
     task0.kernel_stack = alloc_stack(KERNEL_STACK_PAGES).expect("task0 stack");
-    task0.regs = Registers::new_kernel(continue_after_schedule as u64, task0.kernel_stack);
+    task0.regs = Registers::new_kernel(continue_after_schedule as *const () as u64, task0.kernel_stack);
     task0.pml4 = pt_mgr().kernel_pml4();
     task0.cpu = 0;
     task0.static_prio = nice_to_prio(19);
