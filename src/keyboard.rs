@@ -165,6 +165,11 @@ static mut SHIFT: bool = false;
 static mut CAPSLOCK: bool = false;
 static mut CTRL: bool = false;
 static mut EXTENDED: bool = false;
+// Scancode set 2 (translation OFF) prefixes a release with 0xF0 followed by the
+// make code. With translation enabled (set 1) breaks use bit 7 and 0xF0 never
+// appears, so this flag is inert there; it makes the handler correct for either
+// mode (robust to a controller that isn't translating despite our command byte).
+static mut BREAK_PENDING: bool = false;
 
 const E0_UP: u16 = 0x48;
 const E0_DOWN: u16 = 0x50;
@@ -219,6 +224,26 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
     let status = inb(KEYBOARD_STATUS);
     if status & 1 != 0 {
         let sc = inb(KEYBOARD_DATA);
+
+        // 0xF0 prefix (scancode set 2 break). If pending, the next byte is the
+        // release code — ignore it but reset our modifier state for it.
+        if sc == 0xF0 {
+            unsafe { BREAK_PENDING = true; }
+            crate::pic::send_eoi(1);
+            return;
+        }
+        if unsafe { BREAK_PENDING } {
+            unsafe { BREAK_PENDING = false; }
+            // Mark the (already released) key's modifier bit cleared.
+            match sc & 0x7F {
+                0x2A | 0x36 => unsafe { SHIFT = false; },
+                0x1D => unsafe { CTRL = false; },
+                _ => {}
+            }
+            crate::pic::send_eoi(1);
+            return;
+        }
+
         let released = sc & 0x80 != 0;
         let make = sc & 0x7F;
 
