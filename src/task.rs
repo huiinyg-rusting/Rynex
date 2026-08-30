@@ -437,7 +437,7 @@ pub fn current_cpu() -> usize {
 
 #[inline(always)]
 fn cur_task() -> &'static AtomicU64 {
-    { &CURRENT_TASK[current_cpu()] }
+    &CURRENT_TASK[current_cpu()]
 }
 // Whether pid 1 (slot 0) has been handed out (to init), so it can't be aliased.
 // The actual slot accounting is done by PID_BITMAP.
@@ -1620,7 +1620,7 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
                 crate::klog::s("[BADKERNELRIP] task=");
                 crate::klog::dec(current);
                 crate::klog::s(" kstack=0x");
-                crate::klog::hex({ TASKS[idx].kernel_stack });
+                crate::klog::hex(TASKS[idx].kernel_stack);
                 crate::klog::s(" rip=0x");
                 crate::klog::hex(rip);
                 crate::klog::s(" frame[0]=0x");
@@ -1642,31 +1642,31 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
                     crate::klog::s("\n");
                 }
                 crate::klog::s("  +8=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 8) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 8) as *const u64));
                 crate::klog::s(" +10=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x10) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x10) as *const u64));
                 crate::klog::s(" +18=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x18) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x18) as *const u64));
                 crate::klog::s(" +20=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x20) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x20) as *const u64));
                 crate::klog::s("\n  +28=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x28) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x28) as *const u64));
                 crate::klog::s(" +30=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x30) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x30) as *const u64));
                 crate::klog::s(" +38=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x38) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x38) as *const u64));
                 crate::klog::s(" +40=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x40) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x40) as *const u64));
                 crate::klog::s("\n  +48=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x48) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x48) as *const u64));
                 crate::klog::s(" +50=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x50) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x50) as *const u64));
                 crate::klog::s(" +58=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x58) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x58) as *const u64));
                 crate::klog::s(" +60=0x");
-                crate::klog::hex({ core::ptr::read_volatile((stk + 0x60) as *const u64) });
+                crate::klog::hex(core::ptr::read_volatile((stk + 0x60) as *const u64));
                 crate::klog::s("\n  scc_top=0x");
-                crate::klog::hex({ crate::gdt::CURRENT_SYSCALL_STACK_TOP });
+                crate::klog::hex(crate::gdt::CURRENT_SYSCALL_STACK_TOP);
                 crate::klog::s("\n  tasks:");
                 for ti in 0..MAX_TASKS {
                     let t = &TASKS[ti];
@@ -2429,7 +2429,7 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
 }
 
 fn sys_get_ticks() -> i64 {
-    { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64 }
+    crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64
 }
 
 fn sys_rynex_yield() -> i64 {
@@ -5859,7 +5859,7 @@ fn sys_chdir(path: *const u8) -> i64 {
 
 // ── Getdents64 ─────────────────────────────────────────────────────
 
-#[repr(packed)]
+#[repr(C, packed)]
 struct LinuxDirent64 {
     d_ino: u64,
     d_off: u64,

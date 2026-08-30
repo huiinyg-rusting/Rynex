@@ -17,7 +17,7 @@ fn main() {
         .args(["--64", "asm/ap_trampoline.S", "-o", &trampoline_obj])
         .status()
         .expect("failed to assemble ap_trampoline.S");
-    println!("cargo:warning=as status={:?}", status);
+    eprintln!("as status={:?}", status);
     
     // Extract .ap_trampoline section as raw binary
     let raw_bin = format!("{}/ap_trampoline_raw.bin", out_dir);
@@ -30,10 +30,10 @@ fn main() {
         ])
         .status()
         .expect("failed to objcopy trampoline to binary");
-    println!("cargo:warning=objcopy status={:?}", status);
+    eprintln!("objcopy status={:?}", status);
     
     let raw_data = fs::read(&raw_bin).expect("failed to read trampoline binary");
-    println!("cargo:warning=raw trampoline size: {}", raw_data.len());
+    eprintln!("raw trampoline size: {}", raw_data.len());
     
     // Build 4KB page with fixed layout:
     // 0x000-0x0FF: trampoline code (first 256 bytes of .ap_trampoline section)
@@ -78,7 +78,7 @@ fn main() {
     page[gdtr_offset + 5] = ((gdt_phys_base >> 24) & 0xFF) as u8;
     
     page.truncate(4096);
-    println!("cargo:warning=final trampoline page size: {}", page.len());
+    eprintln!("final trampoline page size: {}", page.len());
     
     fs::write(&trampoline_bin, &page).expect("failed to write trampoline binary");
     
@@ -97,6 +97,6 @@ fn main() {
     rs_content.push_str(&format!("pub const AP_TRAMPOLINE_LEN: usize = {};\n", page.len()));
     
     fs::write(&trampoline_rs, &rs_content).expect("failed to write trampoline.rs");
-    println!("cargo:warning=generated trampoline.rs with {} bytes", page.len());
+    eprintln!("generated trampoline.rs with {} bytes", page.len());
     println!("cargo:rerun-if-changed=asm/ap_trampoline.S");
 }

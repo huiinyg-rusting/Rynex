@@ -649,10 +649,7 @@ fn map_trampoline_page() {
         ];
         let alloc_pt = || -> u64 {
             let alloc = { &mut *crate::memory::allocator() };
-            match alloc.alloc_zeroed_page() {
-                Some(p) => p,
-                None => 0,
-            }
+            alloc.alloc_zeroed_page().unwrap_or(0)
         };
         // PML4
         let e = unsafe { (*pml4).0[v[0]] };

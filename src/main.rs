@@ -2,10 +2,8 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
-#![feature(allocator_api)]
-#![feature(panic_info_message)]
-#![feature(naked_functions)]
 #![feature(core_intrinsics)]
+#![allow(internal_features)]
 
 extern crate alloc;
 pub mod paging;

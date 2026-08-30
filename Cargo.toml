@@ -18,9 +18,16 @@ codegen-units = 1
 # - non_upper_case_globals: syscall constants follow Linux names (SYS_read, ...).
 # - fn_to_numeric_cast: function pointers are taken as physical addresses.
 # - needless_range_loop: index-style loops match the surrounding code style.
+# - dead_code: deliberate WIP/API surface not yet wired up (ext3, xattr, ipc
+#   ports, vfs fd tables, procfs, tty/termios, multiboot2 tags, ...).
+# - unused_assignments / unused_variables: defensive writes and asm outputs
+#   (cmpxchg scratch, visited_* tracking) that the compiler can't see used.
 [lints.rust]
 static_mut_refs = "allow"
 non_upper_case_globals = "allow"
+dead_code = "allow"
+unused_assignments = "allow"
+unused_variables = "allow"
 
 [lints.clippy]
 # Deliberate kernel patterns (function-pointer addresses, index-style loops).
