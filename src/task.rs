@@ -1789,10 +1789,15 @@ pub extern "C" fn timer_schedule() -> u64 {
     }
     // Poll UART for serial input and feed into keyboard buffer.
     while let Some(c) = crate::serial::read_byte_nonblocking() {
-        // Filter: only accept printable ASCII and common control chars.
+        // Filter: accept printable ASCII and common control chars.
         // ESC (0x1B) is accepted so terminal line-editing (arrow keys, etc.)
         // receives the full ESC [ A sequences instead of losing the ESC byte.
-        if c >= 0x20 && c <= 0x7E || c == 0x1B || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F {
+        // ISIG control chars (^C=0x03 SIGINT, ^\=0x1C SIGQUIT, ^Z=0x1A SIGTSTP)
+        // and line-edit chars (^D=0x04 VEOF, ^U=0x15 VKILL) are passed through so
+        // TtyDevice::push_input can turn them into signals / handle them; if we
+        // dropped them here Ctrl+C would never reach the TTY over a serial console.
+        let isig_char = c == 0x03 || c == 0x1C || c == 0x1A || c == 0x04 || c == 0x15;
+        if c >= 0x20 && c <= 0x7E || c == 0x1B || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F || isig_char {
             crate::keyboard::push_char(c);
         }
     }
@@ -5259,14 +5264,21 @@ fn kill_task_zombie(idx: usize, code: i32) {
 
 /// Deliver a signal to the current foreground process group (used by TTY ISIG
 /// handling for Ctrl+C → SIGINT). Exposed so the TTY driver can request it.
+///
+/// Targets the TTY's stored foreground process group (set by the shell via
+/// TIOCSPGRP) so the signal reaches the actual foreground job even if a
+/// background task happens to be running when the key is pressed; falls back to
+/// the current task's own group when the TTY has no foreground group recorded.
 pub fn signal_foreground_group(sig: i32) {
     let current = current_task_id();
     if current == 0 { return; }
+    let fg = crate::tty::TTY_DEVICE.get_fg_pgrp() as u64;
+    let cur_pg = unsafe { TASKS[task_idx(current)].tgid };
+    let target = if fg > 0 { fg } else { cur_pg };
     unsafe {
-        let cur_pg = TASKS[task_idx(current)].tgid;
         for i in 0..MAX_TASKS {
             if TASKS[i].id == 0 { continue; }
-            if TASKS[i].tgid == cur_pg || cur_pg == 0 {
+            if TASKS[i].tgid == target || target == 0 {
                 sig_deliver_to_task(i, sig);
             }
         }
