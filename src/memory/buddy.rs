@@ -17,17 +17,25 @@ const MAX_RESERVED: usize = 2048;
 static mut BUDDY_AUDIT_COUNTER: u64 = 0;
 static mut AUDIT_ACTIVE: bool = false;
 
-// Global free tracking to catch double-free at allocator level
-const FREED_PAGES_CAP: usize = 1 << 16; // 65536 pages
-static mut FREED_PAGES: [u64; FREED_PAGES_CAP] = [0; FREED_PAGES_CAP];
-static mut FREED_COUNT: usize = 0;
+// Global free tracking to catch double-free at allocator level.
+// O(1) per-page bitmap instead of a linear scan: set a bit when a page is
+// freed, clear it when the page is reallocated. A second free while the bit is
+// still set is a genuine allocator double-free. Sized for 8 GiB (2^21 pages).
+// (Previously a 65536-entry linear-scan list made every free O(n) — a DoS.)
+const FREED_BMP_WORDS: usize = (1 << 21) / 64; // 32768 words = 256 KiB
+static mut FREED_BMP: [u64; FREED_BMP_WORDS] = [0; FREED_BMP_WORDS];
+
+#[inline(always)]
+fn freed_bit(addr: u64) -> Option<(usize, u64)> {
+    let idx = phys_to_idx(addr) as usize;
+    if idx >= (1 << 21) { return None; }
+    Some((idx >> 6, 1u64 << (idx & 63)))
+}
 
 fn track_freed_page(addr: u64) -> bool {
-    let idx = phys_to_idx(addr) as usize;
-    if idx >= MAX_REFC_PAGES { return false; }
-    unsafe {
-        for i in 0..FREED_COUNT {
-            if FREED_PAGES[i] == addr {
+    match freed_bit(addr) {
+        Some((w, b)) => unsafe {
+            if FREED_BMP[w] & b != 0 {
                 // Double-free detected at allocator level
                 let caller = core::intrinsics::return_address() as u64;
                 crate::serial::write_str("\n=== ALLOCATOR DOUBLE-FREE ===\n");
@@ -38,27 +46,16 @@ fn track_freed_page(addr: u64) -> bool {
                 crate::serial::write_str("\n");
                 return true;
             }
-        }
-        if FREED_COUNT < FREED_PAGES_CAP {
-            FREED_PAGES[FREED_COUNT] = addr;
-            FREED_COUNT += 1;
-        }
+            FREED_BMP[w] |= b;
+            false
+        },
+        None => false,
     }
-    false
 }
 
 fn untrack_freed_page(addr: u64) {
-    let idx = phys_to_idx(addr) as usize;
-    if idx >= MAX_REFC_PAGES { return; }
-    unsafe {
-        for i in 0..FREED_COUNT {
-            if FREED_PAGES[i] == addr {
-                // Remove by swapping with last element
-                FREED_PAGES[i] = FREED_PAGES[FREED_COUNT - 1];
-                FREED_COUNT -= 1;
-                return;
-            }
-        }
+    if let Some((w, b)) = freed_bit(addr) {
+        unsafe { FREED_BMP[w] &= !b; }
     }
 }
 
@@ -632,7 +629,7 @@ impl BuddyAllocator {
         // This handles the mallocng meta page which is reserved to prevent buddy
         // from reusing it during its lifetime, but must be freed when the task exits.
         if self.is_reserved(addr) {
-            self.unreserve(addr);
+            self.unreserve_nolock(addr);
         }
         let pidx = self.page_index(addr);
         let caller = core::intrinsics::return_address() as u64;
@@ -664,6 +661,11 @@ impl BuddyAllocator {
 
     pub fn mark_allocated(&mut self, start: u64, size: u64) {
         let _g = BUDDY_LOCK.lock();
+        self.mark_allocated_nolock(start, size);
+    }
+
+    /// Lock-free body of `mark_allocated`; caller must hold BUDDY_LOCK.
+    fn mark_allocated_nolock(&mut self, start: u64, size: u64) {
         let mut addr = start;
         let end = start + size;
         while addr < end {
@@ -739,6 +741,12 @@ impl BuddyAllocator {
     }
 
     pub fn reserve(&mut self, addr: u64) {
+        let _g = BUDDY_LOCK.lock();
+        self.reserve_nolock(addr);
+    }
+
+    /// Lock-free body of `reserve`; caller must hold BUDDY_LOCK.
+    fn reserve_nolock(&mut self, addr: u64) {
         // Idempotent: the same page may be reserved multiple times (e.g. the
         // mallocng meta page shared across fork COW copies).
         for i in 0..self.reserved_count {
@@ -751,7 +759,7 @@ impl BuddyAllocator {
             self.reserved_count += 1;
             // Also ensure it's not in free lists and mark it used so a later
             // used_clear (via free/free_reserved) won't report a false DOUBLE-FREE.
-            self.mark_allocated(addr, PAGE_SIZE);
+            self.mark_allocated_nolock(addr, PAGE_SIZE);
             let pidx = self.page_index(addr);
             if used_set(pidx) {
                 // If it was already marked used, it was genuinely in use; keep as is.
@@ -765,18 +773,25 @@ impl BuddyAllocator {
     /// (i.e., removed from free lists and marked as used). This is used to pin pages
     /// for specific purposes like AP stacks before they are actually used.
     pub fn reserve_page(&mut self, addr: u64) {
+        let _g = BUDDY_LOCK.lock();
         if !self.is_managed(addr) { return; }
         // Ensure the page is marked as used and not on free lists
         let pidx = self.page_index(addr);
         used_mark(pidx);
         page_type_set(addr, PAGE_TYPE_DATA);
         // Reserve it so it won't be freed accidentally
-        self.reserve(addr);
+        self.reserve_nolock(addr);
     }
 
     /// Remove a page from the reserved list so it can be freed or reallocated.
     /// Returns true if the page was found and removed.
     pub fn unreserve(&mut self, addr: u64) -> bool {
+        let _g = BUDDY_LOCK.lock();
+        self.unreserve_nolock(addr)
+    }
+
+    /// Lock-free body of `unreserve`; caller must hold BUDDY_LOCK.
+    fn unreserve_nolock(&mut self, addr: u64) -> bool {
         for i in 0..self.reserved_count {
             if self.reserved[i] == addr {
                 // Remove by shifting remaining elements
@@ -793,7 +808,7 @@ impl BuddyAllocator {
 
     pub fn free_reserved(&mut self, addr: u64, order: usize) -> bool {
         let _g = BUDDY_LOCK.lock();
-        if self.unreserve(addr) {
+        if self.unreserve_nolock(addr) {
             let pidx = self.page_index(addr);
             let caller = core::intrinsics::return_address() as u64;
             let old_type = page_type_get(addr);
