@@ -233,7 +233,12 @@ impl PageTableManager {
     }
 
     pub fn map_into(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
-        let vpn = [
+    // NOTE: map_into is a low-level "write this leaf PTE" primitive. It must
+    // NOT reject non-buddy phys (sys_phys_map maps arbitrary driver/MMIO phys)
+    // nor already-mapped pages (mprotect re-maps with new flags). Validation
+    // of phys range / virtual range belongs at the syscall layer (see
+    // sys_phys_map and the user_range_valid checks), not here. See bugl.
+    let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
             ((virt >> 21) & 0x1FF) as usize,
