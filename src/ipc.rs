@@ -69,14 +69,14 @@ static mut PORTS: [Port; MAX_PORTS] = [Port::empty(); MAX_PORTS];
 static mut NEXT_PORT_ID: u64 = 1;
 
 fn alloc_page() -> Option<u64> {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let phys = alloc.alloc(0)?;
     unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
     Some(phys)
 }
 
 fn free_page(phys: u64) {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     alloc.free(phys, 0);
 }
 
@@ -240,7 +240,7 @@ fn ipc_call_impl(
 
         if free_slot {
             // Wake one blocked receiver, then wait for the reply.
-            unsafe { crate::task::futex_wake(msg_page as *const u32, 1); }
+            { crate::task::futex_wake(msg_page as *const u32, 1); }
             break;
         }
         if !crate::task::block_on_futex(msg_page as *const u32) {
@@ -303,7 +303,7 @@ pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
     slot.len = n as u32;
     slot.done = true;
     let wake = &raw const slot.wake as *const u32;
-    unsafe { crate::task::futex_wake(wake, 1); }
+    { crate::task::futex_wake(wake, 1); }
     n as i64
 }
 
@@ -406,7 +406,7 @@ pub fn ipc_send(port_id: u64, buf: *const u8, len: usize, msg_type: u32) -> i64 
 
         if free_slot {
             // Wake one blocked receiver.
-            unsafe { crate::task::futex_wake(msg_page as *const u32, 1); }
+            { crate::task::futex_wake(msg_page as *const u32, 1); }
             return 0;
         }
 
@@ -435,7 +435,7 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
                 port.count -= 1;
                 // Wake one blocked sender.
                 let ws = &raw const port.wake_send as *const u32;
-                unsafe { crate::task::futex_wake(ws, 1); }
+                { crate::task::futex_wake(ws, 1); }
                 break pg;
             }
         }
@@ -496,7 +496,7 @@ fn ipc_peek_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
         port.head = (idx + 1) % PORT_SLOTS;
         port.count -= 1;
         let ws = &raw const port.wake_send as *const u32;
-        unsafe { crate::task::futex_wake(ws, 1); }
+        { crate::task::futex_wake(ws, 1); }
         pg
     };
 
@@ -557,7 +557,7 @@ fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
                 port.head = (idx + 1) % PORT_SLOTS;
                 port.count -= 1;
                 let ws = &raw const port.wake_send as *const u32;
-                unsafe { crate::task::futex_wake(ws, 1); }
+                { crate::task::futex_wake(ws, 1); }
                 break pg;
             }
         }
@@ -605,7 +605,7 @@ pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
         port.count -= 1;
         // Wake one blocked sender.
         let ws = &raw const port.wake_send as *const u32;
-        unsafe { crate::task::futex_wake(ws, 1); }
+        { crate::task::futex_wake(ws, 1); }
         pg
     };
 

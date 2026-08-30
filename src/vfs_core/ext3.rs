@@ -428,7 +428,7 @@ impl Ext3Fs {
                                 }
                                 let abs_block = self.block_group_start(g as u32) + block_in_group;
                                 *bm.add(byte_off) |= 1 << bit;
-                                self.write_block(bitmap_block, unsafe {
+                                self.write_block(bitmap_block, {
                                     core::slice::from_raw_parts(bm, bm_bytes)
                                 });
                                 (*gd).free_blocks_count_lo -= 1;
