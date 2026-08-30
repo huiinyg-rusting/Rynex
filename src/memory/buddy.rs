@@ -181,14 +181,19 @@ static mut QUARANTINE_HEAD: usize = 0;
 static mut QUARANTINE_COUNT: usize = 0;
 static mut QUARANTINE_FULL_COUNT: u64 = 0;
 
-fn q_push(addr: u64) {
+/// Returns true if the page was queued in the quarantine; false if the
+/// quarantine is full. When false, the caller must return the page to the
+/// buddy allocator (free_one) instead of dropping it, otherwise the page is
+/// leaked (it is neither in the quarantine nor reusable).
+fn q_push(addr: u64) -> bool {
     unsafe {
         if QUARANTINE_COUNT < QUARANTINE_CAP {
             QUARANTINE[QUARANTINE_HEAD] = addr;
             QUARANTINE_HEAD = (QUARANTINE_HEAD + 1) % QUARANTINE_CAP;
             QUARANTINE_COUNT += 1;
+            true
         } else {
-            // 隔离区满：记录并丢弃（直接丢弃该页，不回收）
+            // 隔离区满：记录，并让调用方把该页归还 buddy（避免静默泄漏物理页）。
             QUARANTINE_FULL_COUNT += 1;
             if QUARANTINE_FULL_COUNT <= 10 || QUARANTINE_FULL_COUNT % 100 == 0 {
                 q_log_full();
@@ -200,6 +205,7 @@ fn q_push(addr: u64) {
                 crate::serial::write_dec(QUARANTINE_CAP as u64);
                 crate::serial::write_str("\n");
             }
+            false
         }
     }
 }
@@ -643,7 +649,12 @@ impl BuddyAllocator {
         // PTE 页：走引用计数，归零才真正释放（入隔离区）
         if order == 0 && old_type == PAGE_TYPE_PTE {
             if pte_refc_dec(addr) {
-                q_push(addr);
+                // Quarantine a PTE page to break the free→realloc cycle. If the
+                // quarantine is full, return the page to the buddy allocator
+                // instead of dropping it (bug 16: silent physical-page leak).
+                if !q_push(addr) {
+                    self.free_one(addr, 0);
+                }
             }
         } else {
             self.free_one(addr, order as u8);
@@ -796,7 +807,9 @@ impl BuddyAllocator {
             df_record(pidx, caller, order);
             if order == 0 && old_type == PAGE_TYPE_PTE {
                 if pte_refc_dec(addr) {
-                    q_push(addr);
+                    if !q_push(addr) {
+                        self.free_one(addr, 0);
+                    }
                 }
             } else {
                 self.free_one(addr, order as u8);
