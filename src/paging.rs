@@ -1,5 +1,7 @@
 use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
+use crate::spinlock::RawSpin;
+
 pub const PAGE_SIZE_4K: u64 = 4096;
 pub const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
 pub const PAGE_SIZE_1G: u64 = 1024 * 1024 * 1024;
@@ -20,6 +22,19 @@ pub const PTE_NO_EXECUTE: u64 = 1 << 63;
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+
+// ── COW synchronization ─────────────────────────────────────────────
+// The COW refcounts (PAGE_REFC for data pages, buddy::PTE_REFC for page-table
+// pages) are non-atomic check-then-act arrays. Under SMP, fork (cow_fork_pml4)
+// and a concurrent page fault (cow_walk_pte / cow_remap_in) can race on the
+// same physical page: both may re-read a refcount before either updates it,
+// corrupting the count and either leaking a shared page or freeing one still
+// in use (double free / COW corruption). A single exclusive irq-safe spin lock
+// serializes the entire COW critical section (fork's page-table sharing walk
+// AND the fault's copy/remap) so refcount check-then-act is atomic across CPUs.
+// Lock ordering: always COW_LOCK -> BUDDY_LOCK (no path takes BUDDY_LOCK then
+// COW_LOCK), so no deadlock.
+static COW_LOCK: RawSpin = RawSpin::new();
 
 // ── COW reference counting ────────────────────────────────────────
 // Each 4K user leaf shared between a parent and its fork children gets a
@@ -1251,6 +1266,9 @@ let mut pdpt_user = false;
 // read-only (COW) in both parent and child. 2M/1G huge pages (kernel identity
 // map) stay shared writable.
 pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
+    // Serialize the entire COW page-table sharing walk against concurrent page
+    // faults (bug 14). See COW_LOCK above.
+    let _cow = COW_LOCK.lock();
     let alloc = { &mut *crate::memory::allocator() };
     let new_pml4 = alloc.alloc_zeroed_page()?;
     unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
@@ -1421,6 +1439,9 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
 }
 
 pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
+    // Serialize against fork's page-table sharing and other faults on the same
+    // physical page so the COW refcount check-then-act is atomic (bug 14).
+    let _cow = COW_LOCK.lock();
     let pte = match cow_walk_pte(pml4, virt) {
         Some(p) => p,
         None => return false,
