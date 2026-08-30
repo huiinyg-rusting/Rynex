@@ -172,7 +172,7 @@ impl PageTableManager {
     }
 
     fn alloc_page_table(&mut self) -> Option<u64> {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         // Page-table pages are tracked as PTE pages and must go through the
         // quarantine/refcount lifecycle used by all PT/PD/PT/PML4 allocations.
         alloc.alloc_zeroed_page()
@@ -333,7 +333,7 @@ impl PageTableManager {
     }
 
     fn alloc_page() -> Result<u64, &'static str> {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         // Intermediate paging structures are page-table pages, not generic data.
         alloc.alloc_zeroed_page().ok_or("OOM")
     }
@@ -357,7 +357,7 @@ impl PageTableManager {
         let pdpt = if pml4e & PTE_PRESENT != 0 {
             (pml4e & PTE_ADDR_MASK) as *mut PageTable
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PDPT")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pml4e_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
@@ -370,7 +370,7 @@ impl PageTableManager {
         let pd = if pdpte & PTE_PRESENT != 0 {
             (pdpte & PTE_ADDR_MASK) as *mut PageTable
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PD")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pdpte_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
@@ -383,7 +383,7 @@ impl PageTableManager {
         let pt = if pde & PTE_PRESENT != 0 {
             (pde & PTE_ADDR_MASK) as *mut PageTable
         } else {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             let new_pt = alloc.alloc_zeroed_page().ok_or("OOM: PT")?;
             unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
             let pde_val = new_pt | PTE_PRESENT | PTE_WRITABLE;
@@ -573,7 +573,7 @@ pub fn init() {
         let alloc = &mut *crate::memory::allocator();
         PT_MGR.kernel_pml4 = alloc.alloc_zeroed_page().unwrap();
         KERNEL_PML4.store(PT_MGR.kernel_pml4, Ordering::SeqCst);
-        let pml4 = unsafe { &mut *(PT_MGR.kernel_pml4 as *mut PageTable) };
+        let pml4 = { &mut *(PT_MGR.kernel_pml4 as *mut PageTable) };
         pml4.clear();
 
         // Preserve the bootloader identity mapping (0-1GB) so the kernel
@@ -648,7 +648,7 @@ fn map_trampoline_page() {
             ((virt >> 12) & 0x1FF) as usize,
         ];
         let alloc_pt = || -> u64 {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             match alloc.alloc_zeroed_page() {
                 Some(p) => p,
                 None => 0,
@@ -724,7 +724,7 @@ fn map_lapic_region() {
     let pdpt = if pml4e & 1 != 0 {
         (pml4e & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
     } else {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         let new_pt = match alloc.alloc_zeroed_page() {
             Some(p) => p,
             None => return,
@@ -739,7 +739,7 @@ fn map_lapic_region() {
     let pd = if pdpte & 1 != 0 {
         (pdpte & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
     } else {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         let new_pt = match alloc.alloc_zeroed_page() {
             Some(p) => p,
             None => return,
@@ -754,7 +754,7 @@ fn map_lapic_region() {
     let pt = if pde & 1 != 0 {
         (pde & 0xFFFF_FFFF_FFFF_F000) as *mut crate::paging::PageTable
     } else {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         let new_pt = match alloc.alloc_zeroed_page() {
             Some(p) => p,
             None => return,
@@ -840,7 +840,7 @@ pub fn is_user_addr(addr: u64) -> bool {
 
 /// Copy user page mappings from `src_pml4` to `dst_pml4`
 pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str> {
-    let _alloc = unsafe { &mut *crate::memory::allocator() };
+    let _alloc = { &mut *crate::memory::allocator() };
     let src = unsafe { &*(src_pml4 as *const PageTable) };
     let dst = unsafe { &mut *(dst_pml4 as *mut PageTable) };
     for pml4_idx in 0..256 {
@@ -905,7 +905,7 @@ pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str>
 // parent). Kernel half (PML4 entries 256..512) and kernel-identity huge pages
 // are never touched.
 pub fn free_address_space(pml4: u64, free_ro: bool) {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let base = crate::memory::buddy::alloc_base();
     let end = base + crate::memory::buddy::alloc_pages() * crate::memory::buddy::PAGE_SIZE;
     // Guard against walking a bogus pml4: it must be a real allocated page
@@ -1254,7 +1254,7 @@ let mut pdpt_user = false;
 // read-only (COW) in both parent and child. 2M/1G huge pages (kernel identity
 // map) stay shared writable.
 pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let new_pml4 = alloc.alloc_zeroed_page()?;
     unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
     // The page may have been reclaimed from the quarantine, so its used bit /
@@ -1371,7 +1371,7 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
         ((virt >> 21) & 0x1FF) as usize,
         ((virt >> 12) & 0x1FF) as usize,
     ];
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
 
     // PML4 is always private (each task owns its own).
     let pml4_tbl = unsafe { &mut *(pml4 as *mut PageTable) };
@@ -1435,7 +1435,7 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
      let old_phys = *pte & PTE_ADDR_MASK;
      let flags = *pte & !PTE_ADDR_MASK;
  
-     let alloc = unsafe { &mut *crate::memory::allocator() };
+     let alloc = { &mut *crate::memory::allocator() };
 
     // The mallocng meta page must always have a private physical page reserved
     // (it may be aliased via the identity map and must never be handed out by
@@ -1546,7 +1546,7 @@ pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
 pub fn test() {
     let mgr = pt_mgr();
 
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let p = alloc.alloc_zeroed_page().expect("OOM");
     mgr.map_page(0x4000_0000, p, PTE_PRESENT | PTE_WRITABLE).expect("map failed");
 

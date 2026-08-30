@@ -48,14 +48,14 @@ pub fn block_read(block: u64) -> Option<*mut u8> {
     
     // Allocate a buffer for this block
     // In a real implementation, we'd use a buffer cache
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let phys = alloc.alloc(0)?;
     
     let count = (BLOCK_SIZE.load(Ordering::SeqCst) / 512) as u32;
     match virtio_blk::virtio_blk_read(block * count as u64, phys as *mut u8, count) {
         Ok(_) => Some(phys as *mut u8),
         Err(_) => {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             alloc.free(phys, 0);
             None
         }

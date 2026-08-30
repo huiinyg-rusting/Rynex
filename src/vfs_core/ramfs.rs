@@ -113,7 +113,7 @@ fn free_inode_blocks(inode: &mut RamInode) {
     for i in 0..inode.block_count {
         let ptr = inode.blocks[i];
         if !ptr.is_null() {
-            unsafe { memory::allocator().free(ptr as u64, 0); }
+            { memory::allocator().free(ptr as u64, 0); }
             inode.blocks[i] = core::ptr::null_mut();
         }
     }
@@ -430,7 +430,7 @@ impl VnodeOps for RamFs {
         let new_blocks = ((size + RAMFS_BLOCK as u64 - 1) / RAMFS_BLOCK as u64) as usize;
         for i in new_blocks..inode.block_count {
             if !inode.blocks[i].is_null() {
-                unsafe { memory::allocator().free(inode.blocks[i] as u64, 0); }
+                { memory::allocator().free(inode.blocks[i] as u64, 0); }
                 inode.blocks[i] = core::ptr::null_mut();
             }
         }

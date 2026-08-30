@@ -437,7 +437,7 @@ pub fn current_cpu() -> usize {
 
 #[inline(always)]
 fn cur_task() -> &'static AtomicU64 {
-    unsafe { &CURRENT_TASK[current_cpu()] }
+    { &CURRENT_TASK[current_cpu()] }
 }
 // Whether pid 1 (slot 0) has been handed out (to init), so it can't be aliased.
 // The actual slot accounting is done by PID_BITMAP.
@@ -699,7 +699,7 @@ fn order_for_pages(pages: usize) -> usize {
 }
 
 pub fn alloc_stack(pages: usize) -> Option<u64> {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let order = order_for_pages(pages + 1);
     alloc.alloc(order).map(|p| {
         for i in 0..=pages {
@@ -710,7 +710,7 @@ pub fn alloc_stack(pages: usize) -> Option<u64> {
 }
 
 fn free_stack(base: u64, pages: usize) {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let addr = base - pages as u64 * PAGE_SIZE;
     // Guard against double-free: if the stack block's used bit is already clear,
     // it was freed earlier (e.g. reap ran twice for the same task, or the slot
@@ -824,7 +824,7 @@ pub fn create_user_task_on_cpu(entry: u64, pml4: u64, user_stack_top: u64, nice:
     serial::write_str("TASK: alloc_stack done\n");
 
     // Set up TLS/TCB page for musl. Initialize full TCB per musl's pthread struct.
-    let tls_phys = unsafe { &mut *crate::memory::allocator() }.alloc(0)?;
+    let tls_phys = { &mut *crate::memory::allocator() }.alloc(0)?;
     serial::write_str("TASK: tls_phys alloc done\n");
     unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
 
@@ -1220,10 +1220,10 @@ fn schedule_inner(force: bool) {
             // Preempted: mark Ready and requeue
             unsafe { TASKS[cur_idx].state = TaskState::Ready; }
             let prio = unsafe { TASKS[cur_idx].prio };
-            unsafe { enqueue_task(current, prio); }
+            { enqueue_task(current, prio); }
         } else if state == TaskState::Ready {
             let prio = unsafe { TASKS[cur_idx].prio };
-            unsafe { enqueue_task(current, prio); }
+            { enqueue_task(current, prio); }
         }
     }
 
@@ -1620,7 +1620,7 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
                 crate::klog::s("[BADKERNELRIP] task=");
                 crate::klog::dec(current);
                 crate::klog::s(" kstack=0x");
-                crate::klog::hex(unsafe { TASKS[idx].kernel_stack });
+                crate::klog::hex({ TASKS[idx].kernel_stack });
                 crate::klog::s(" rip=0x");
                 crate::klog::hex(rip);
                 crate::klog::s(" frame[0]=0x");
@@ -1636,37 +1636,37 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
                     crate::klog::s("  [");
                     crate::klog::hex(j);
                     crate::klog::s("]=0x");
-                    unsafe {
+                    {
                         crate::klog::hex(core::ptr::read_volatile((stk - 8 * j) as *const u64));
                     }
                     crate::klog::s("\n");
                 }
                 crate::klog::s("  +8=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 8) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 8) as *const u64) });
                 crate::klog::s(" +10=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x10) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x10) as *const u64) });
                 crate::klog::s(" +18=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x18) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x18) as *const u64) });
                 crate::klog::s(" +20=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x20) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x20) as *const u64) });
                 crate::klog::s("\n  +28=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x28) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x28) as *const u64) });
                 crate::klog::s(" +30=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x30) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x30) as *const u64) });
                 crate::klog::s(" +38=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x38) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x38) as *const u64) });
                 crate::klog::s(" +40=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x40) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x40) as *const u64) });
                 crate::klog::s("\n  +48=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x48) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x48) as *const u64) });
                 crate::klog::s(" +50=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x50) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x50) as *const u64) });
                 crate::klog::s(" +58=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x58) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x58) as *const u64) });
                 crate::klog::s(" +60=0x");
-                crate::klog::hex(unsafe { core::ptr::read_volatile((stk + 0x60) as *const u64) });
+                crate::klog::hex({ core::ptr::read_volatile((stk + 0x60) as *const u64) });
                 crate::klog::s("\n  scc_top=0x");
-                crate::klog::hex(unsafe { crate::gdt::CURRENT_SYSCALL_STACK_TOP });
+                crate::klog::hex({ crate::gdt::CURRENT_SYSCALL_STACK_TOP });
                 crate::klog::s("\n  tasks:");
                 for ti in 0..MAX_TASKS {
                     let t = &TASKS[ti];
@@ -1874,7 +1874,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
         cur_task().store(next_id, Ordering::SeqCst);
-        unsafe { CURRENT_TASK_ID = next_id; }
+        { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
         crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack);
         // Trace kernel-mode timer-driven resumes (DEBUG; queryable via
@@ -2429,7 +2429,7 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
 }
 
 fn sys_get_ticks() -> i64 {
-    unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64 }
+    { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as i64 }
 }
 
 fn sys_rynex_yield() -> i64 {
@@ -2582,7 +2582,7 @@ fn sys_fs_mount(mp: *const u8) -> i64 {
     if mp.is_null() {
         return -EFAULT;
     }
-    let path = unsafe { cstr_from_ptr(mp) };
+    let path = { cstr_from_ptr(mp) };
     if path.is_empty() {
         return -EINVAL;
     }
@@ -2757,7 +2757,7 @@ fn sys_phys_map(phys: u64, size: u64) -> i64 {
         return -EINVAL;
     }
 let size = ((size + 0xFFF) & !0xFFF) as u64;
-    let idx = unsafe { task_idx(id) };
+    let idx = { task_idx(id) };
     let pml4 = unsafe { TASKS[idx].pml4 };
 
     // Pick a low user address range for driver mappings, clear of the ELF
@@ -2765,7 +2765,7 @@ let size = ((size + 0xFFF) & !0xFFF) as u64;
     // below the mmap region.
     let base = 0x5000_0000u64;
     let mut chosen = 0u64;
-    unsafe {
+    {
         let mut candidate = base;
         let limit = 0x6000_0000u64;
         'search: while candidate + size <= limit {
@@ -2828,14 +2828,14 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     let pages = if _pages == 0 { 1 } else { _pages.min(8) };
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    let idx = unsafe { task_idx(id) };
+    let idx = { task_idx(id) };
 
     // Allocate physically contiguous pages from the buddy allocator. The
     // buddy allocator hands out power-of-two blocks, so round the page count
     // up to the next power of two (min 1 page).
     let order = (pages as u32).next_power_of_two().trailing_zeros() as usize;
     let phys = {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         match alloc.alloc(order) {
             Some(p) => p,
             None => return -ENOMEM,
@@ -2848,7 +2848,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     let limit = 0x6000_0000u64;
     let pml4 = unsafe { TASKS[idx].pml4 };
     let mut chosen = 0u64;
-    unsafe {
+    {
         let mut candidate = base;
         'search: while candidate + size <= limit {
             match vma_first_overlap_end(pml4, candidate, candidate + size) {
@@ -2864,7 +2864,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
         }
     }
     if chosen == 0 {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         alloc.free(phys, order);
         return -ENOMEM;
     }
@@ -2873,7 +2873,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     let mut off = 0u64;
     while off < size {
         if crate::paging::PageTableManager::map_into(pml4, chosen + off, phys + off, flags).is_err() {
-            let alloc = unsafe { &mut *crate::memory::allocator() };
+            let alloc = { &mut *crate::memory::allocator() };
             alloc.free(phys, order);
             return -ENOMEM;
         }
@@ -2887,7 +2887,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     unsafe { core::ptr::write_bytes(phys as *mut u8, 0, size as usize); }
     // Register a VMA so demand paging / teardown knows about the range.
     if !vma_register(pml4, chosen, chosen + size, flags) {
-        let alloc = unsafe { &mut *crate::memory::allocator() };
+        let alloc = { &mut *crate::memory::allocator() };
         alloc.free(phys, order);
         return -ENOMEM;
     }
@@ -2906,7 +2906,7 @@ fn sys_dma_free(packed: u64) -> i64 {
     }
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    let idx = unsafe { task_idx(id) };
+    let idx = { task_idx(id) };
     let pml4 = unsafe { TASKS[idx].pml4 };
 
     // Find VMA to get the allocation size, then compute order.
@@ -2949,7 +2949,7 @@ fn sys_dma_free(packed: u64) -> i64 {
         off += 0x1000;
     }
 
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     alloc.free(phys << 12, order);
     0
 }
@@ -3505,7 +3505,7 @@ fn sys_waitpid(pid: i64, status_ptr: *mut i32, flags: u32) -> i64 {
                 serial::write_hex(wait_tidptr);
                 serial::write_str("\n");
                 let uaddr = wait_tidptr as *const u32;
-                unsafe {
+                {
                     // Wait for TID to become 0 (child clears it on exit)
                     if *uaddr != 0 {
                         futex_wait(uaddr, *uaddr, core::ptr::null());
@@ -3581,7 +3581,7 @@ fn sys_openat(dirfd: i32, pathname: *const u8, flags: i32, mode: u32) -> i64 {
 
 fn sys_open(pathname: *const u8, flags: i32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     let _ = flags;
     match crate::vfs::resolve_or_register(name) {
@@ -3597,7 +3597,7 @@ fn sys_open(pathname: *const u8, flags: i32) -> i64 {
 
 fn sys_mkdir(pathname: *const u8, mode: u32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs_core::mkdir(name, mode) {
         Ok(_) => 0,
@@ -3607,7 +3607,7 @@ fn sys_mkdir(pathname: *const u8, mode: u32) -> i64 {
 
 fn sys_rmdir(pathname: *const u8) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs_core::rmdir(name) {
         Ok(()) => 0,
@@ -3617,7 +3617,7 @@ fn sys_rmdir(pathname: *const u8) -> i64 {
 
 fn sys_unlink(pathname: *const u8) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs_core::remove(name) {
         Ok(()) => 0,
@@ -3627,8 +3627,8 @@ fn sys_unlink(pathname: *const u8) -> i64 {
 
 fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     if oldpath.is_null() || newpath.is_null() { return -EFAULT; }
-    let old = unsafe { cstr_from_ptr(oldpath) };
-    let new = unsafe { cstr_from_ptr(newpath) };
+    let old = { cstr_from_ptr(oldpath) };
+    let new = { cstr_from_ptr(newpath) };
     if old.is_empty() || new.is_empty() { return -ENOENT; }
     match crate::vfs_core::rename(old, new) {
         Ok(()) => 0,
@@ -3638,7 +3638,7 @@ fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
 
 fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
     if pathname.is_null() || buf.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs_core::open(name, crate::vfs_core::types::O_RDONLY) {
         Ok(vn_id) => {
@@ -3657,7 +3657,7 @@ fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
 
 fn sys_access(pathname: *const u8, _mode: i32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     if crate::vfs::resolve_or_register(name).is_some() { 0 } else { -ENOENT }
 }
@@ -3911,7 +3911,7 @@ fn sys_fork() -> i64 {
         let parent_fds = crate::vfs::get_fd_table();
         if let Some(pfds) = parent_fds {
             let cfds = crate::vfs::fd_table_for(child_tid);
-            unsafe { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
+            { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
         }
 
         let parent_idx = task_idx(id);
@@ -4071,7 +4071,7 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
         let kernel_stack = match alloc_stack(KERNEL_STACK_PAGES) {
             Some(s) => s,
             None => {
-                let alloc = unsafe { &mut *crate::memory::allocator() };
+                let alloc = { &mut *crate::memory::allocator() };
                 serial::write_str("SYS_CLONE: alloc_stack FAILED free_pages=");
                 serial::write_dec(alloc.free_page_count());
                 serial::write_str(" used=");
@@ -4307,7 +4307,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
         return -EINVAL;
     }
 
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let pages_needed = (elf_size + 0xFFF) / 0x1000;
     let mut elford = 0;
     while (4096usize << elford) < pages_needed * 4096 && elford < 10 {
@@ -4366,7 +4366,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         Some(p) => p,
                         None => { alloc.free(buffer_phys, elford); return -ENOMEM; }
                     };
-                    let interp_buf = unsafe {
+                    let interp_buf = {
                         core::slice::from_raw_parts_mut(interp_phys as *mut u8, interp_size)
                     };
                     match crate::vfs::inode_read(interp_inode, 0, interp_buf) {
@@ -4441,9 +4441,9 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     }
                     argv_buf_len = pos;
                 }
-                unsafe { core::arch::asm!("cli", options(nostack, nomem)); }
+                { core::arch::asm!("cli", options(nostack, nomem)); }
                 pt_mgr().switch_to(info.pml4);
-                unsafe { core::arch::asm!("sti", options(nostack, nomem)); }
+                { core::arch::asm!("sti", options(nostack, nomem)); }
                 crate::gdt::set_tss_rsp0(TASKS[idx].kernel_stack);
 
                 // ── Write argv strings from kernel buffer to user stack ──
@@ -4458,10 +4458,10 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         loop {
                             let c = argv_buf[off + s];
                             if c == 0 { break; }
-                            unsafe { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, c); }
+                            { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, c); }
                             s += 1;
                         }
-                        unsafe { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, 0u8); }
+                        { core::ptr::write_volatile((string_pos + s as u64) as *mut u8, 0u8); }
                         string_pos += s as u64 + 1;
                     }
                 }
@@ -4482,7 +4482,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     let random_data = sp;
                     {
                         let cr3: u64;
-                        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags)); }
+                        { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags)); }
                         let phys_addr = PageTableManager::resolve_phys(cr3, sp).unwrap_or(0);
                         crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_EXEC);
                         crate::klog::s("random_dataD: cr3=0x");
@@ -4561,7 +4561,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     let random_data = sp;
                     {
                         let cr3: u64;
-                        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags)); }
+                        { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem, preserves_flags)); }
                         let phys_addr = PageTableManager::resolve_phys(cr3, sp).unwrap_or(0);
                         crate::serial::write_str("  random_dataS: cr3=0x");
                         crate::serial::write_hex(cr3);
@@ -4628,7 +4628,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                         None => { alloc.free(old_pml4, 0); alloc.free(buffer_phys, elford); return -ENOMEM; }
                     };
                     // Zero the entire TLS page first
-                    unsafe { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
+                    { core::ptr::write_bytes(tls_phys as *mut u8, 0, 4096); }
 
                     let _tls_base = USER_TLS_VADDR;
                     let _tid = id; // current task id is the new thread's tid
@@ -4650,7 +4650,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     // TCB writes must go through PHYSICAL address: this pml4 is
                     // the new task's, not necessarily the currently active one.
                     let tls_phys_ptr = tls_phys as *mut u8;
-                    unsafe {
+                    {
                         // 0x00: DTV pointer (0 = initial thread, no dynamic TLS modules yet)
                         core::ptr::write_volatile(tls_phys_ptr as *mut u64, 0);
 
@@ -4719,7 +4719,7 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
 
 
                 // Naked trampoline: loads GP regs from Registers and iretqs
-                unsafe {
+                {
                     let r_ptr = &TASKS[idx].regs as *const Registers;
                     // The iretq trampoline leaves the syscall without running the
                     // normal syscall_exit path, so clear the per-task syscall flag
@@ -4933,7 +4933,7 @@ fn sys_sleep(ticks: u64) -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
 
-    let now = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+    let now = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
 
     unsafe {
         let idx = task_idx(id);
@@ -5009,7 +5009,7 @@ fn sys_brk(addr: u64) -> i64 {
         TASKS[idx].brk_end = addr;
 
         // Update the brk VMA's end.
-        unsafe {
+        {
             for rec in VMAS.iter_mut() {
                 if rec.pml4 == pml4 && rec.vma.start == brk_start {
                     rec.vma.end = addr;
@@ -5093,7 +5093,7 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
         Some(t) => t,
         None => return -EBADF,
     };
-    unsafe {
+    {
         if (oldfd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[oldfd as usize].used {
             return -EBADF;
         }
@@ -5775,7 +5775,7 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
             let start_fd = arg as usize;
             for newfd in start_fd..crate::vfs::MAX_FDS_PER_TASK {
                 if !table[newfd].used {
-                    unsafe {
+                    {
                         if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
                             return -EBADF;
                         }
@@ -5838,7 +5838,7 @@ fn sys_chdir_from_fd_inner(_fd: u32) -> i64 {
 
 fn sys_chdir(path: *const u8) -> i64 {
     if path.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(path) };
+    let name = { cstr_from_ptr(path) };
     if name.is_empty() { return -ENOENT; }
     let mut norm = [0u8; 512];
     let norm_len = crate::vfs::normalize_path(name, &mut norm).unwrap_or(0);
@@ -5876,7 +5876,7 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
     };
     let flat_idx;
     let pos;
-    unsafe {
+    {
         if (fd as usize) >= crate::vfs::MAX_FDS_PER_TASK || !table[fd as usize].used {
             return -EBADF;
         }
@@ -5936,7 +5936,7 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
             off += 1;
         }
     }
-    unsafe { table[fd as usize].pos = off; }
+    { table[fd as usize].pos = off; }
     written as i64
 }
 
@@ -5944,7 +5944,7 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
 
 fn sys_gettimeofday(tv: *mut u64, _tz: *mut u64) -> i64 {
     if tv.is_null() { return -EFAULT; }
-    let ticks = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+    let ticks = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
     // Each tick is ~20ms (50Hz PIT)
     let secs = (ticks * 20_000_000) / 1_000_000_000_000; // not precise, placeholder
     let usecs = ((ticks * 20_000_000) / 1000) % 1_000_000;
@@ -5966,7 +5966,7 @@ fn sys_gettimeofday(tv: *mut u64, _tz: *mut u64) -> i64 {
 //   unsigned int mem_unit;
 fn sys_sysinfo(info: *mut u8) -> i64 {
     if info.is_null() { return -EFAULT; }
-    let ticks = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
+    let ticks = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
     let uptime = (ticks / 100) as u64; // 100 Hz PIT -> seconds
     let mem_unit: u32 = 4096;
     let totalram = 64u64; // 64 MB in units of mem_unit
@@ -6030,7 +6030,7 @@ fn fill_statfs(buf: *mut u8) -> i64 {
 
 fn sys_statfs(pathname: *const u8, buf: *mut u8) -> i64 {
     if pathname.is_null() || buf.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs::resolve_or_register(name) {
         Some(_) => fill_statfs(buf),
@@ -6076,7 +6076,7 @@ fn sys_setrlimit(_resource: u32, buf: *mut u8) -> i64 {
 
 fn sys_mknod(pathname: *const u8, _mode: u32, _dev: u64) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs::create_file(name, b"") {
         Some(_) => 0,
@@ -6086,7 +6086,7 @@ fn sys_mknod(pathname: *const u8, _mode: u32, _dev: u64) -> i64 {
 
 fn sys_chmod(pathname: *const u8, mode: u32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs::resolve_or_register(name) {
         Some(_) => {
@@ -6105,7 +6105,7 @@ fn sys_fchmod(fd: u32, mode: u32) -> i64 {
 
 fn sys_chown(pathname: *const u8, _uid: u32, _gid: u32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs::resolve_or_register(name) {
         Some(_) => 0,
@@ -6115,7 +6115,7 @@ fn sys_chown(pathname: *const u8, _uid: u32, _gid: u32) -> i64 {
 
 fn sys_utimensat(_dirfd: i32, pathname: *const u8, _times: u64, _flags: i32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
-    let name = unsafe { cstr_from_ptr(pathname) };
+    let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
     match crate::vfs::resolve_or_register(name) {
         Some(_) => 0,
@@ -6245,7 +6245,7 @@ fn follow_symlinks(mut vn_id: u16) -> u16 {
 
  fn sys_stat(pathname: *const u8, statbuf: *mut u8) -> i64 {
      if pathname.is_null() || statbuf.is_null() { return -EFAULT; }
-     let name = unsafe { cstr_from_ptr(pathname) };
+     let name = { cstr_from_ptr(pathname) };
      if name.is_empty() { return -ENOENT; }
      match crate::vfs::resolve_or_register(name) {
         Some(flat_idx) => {
@@ -6404,9 +6404,9 @@ fn sys_poll(fds: u64, nfds: u64, _timeout: i32) -> i64 {
     let mut ready_count = 0i64;
     
     for i in 0..nfds as usize {
-        let fd_ptr = unsafe { (fds + i as u64 * 8) as *const u32 };
-        let events_ptr = unsafe { (fds + i as u64 * 8 + 4) as *const i16 };
-        let revents_ptr = unsafe { (fds + i as u64 * 8 + 6) as *mut i16 };
+        let fd_ptr = { (fds + i as u64 * 8) as *const u32 };
+        let events_ptr = { (fds + i as u64 * 8 + 4) as *const i16 };
+        let revents_ptr = { (fds + i as u64 * 8 + 6) as *mut i16 };
         
         let fd = unsafe { core::ptr::read_volatile(fd_ptr) };
         let events = unsafe { core::ptr::read_volatile(events_ptr) };
@@ -6489,7 +6489,7 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
 
 fn sys_clock_gettime(_clk_id: u64, tp: *mut u8) -> i64 {
     if tp.is_null() { return -EFAULT; }
-    let ns = unsafe { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as u64 * 20_000_000 };
+    let ns = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as u64 * 20_000_000 };
     unsafe {
         core::ptr::write_volatile(tp as *mut u64, ns / 1_000_000_000);
         core::ptr::write_volatile((tp as *mut u64).add(1), ns % 1_000_000_000);
@@ -6782,9 +6782,9 @@ pub fn boot_userland() {
     // so init gets CPU first and kernel tasks don't starve it.
     spawn_pending_kernel_tasks();
 
-    let new_task = unsafe { &mut TASKS[unsafe { BOOT_INIT_SLOT }] };
+    let new_task = unsafe { &mut TASKS[BOOT_INIT_SLOT] };
 
-    unsafe { crate::gdt::set_tss_rsp0(new_task.kernel_stack); }
+    { crate::gdt::set_tss_rsp0(new_task.kernel_stack); }
     pt_mgr().switch_to(new_task.pml4);
     unsafe {
         // Restore FS base for the new task (same as schedule() does)

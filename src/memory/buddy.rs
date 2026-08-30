@@ -327,7 +327,7 @@ pub fn df_info(phys: u64) -> (u32, u32, u8) {
 
 /// Check if a physical page is in the reserved array.
 pub fn is_reserved_page(addr: u64) -> bool {
-    unsafe {
+    {
         let alloc = &*crate::memory::allocator();
         for i in 0..alloc.reserved_count {
             if alloc.reserved[i] == addr {
@@ -340,7 +340,7 @@ pub fn is_reserved_page(addr: u64) -> bool {
 
 /// Get the head of a free list for a given order.
 pub fn free_list_head(order: usize) -> u64 {
-    unsafe { crate::memory::allocator().free_lists[order] as u64 }
+    { crate::memory::allocator().free_lists[order] as u64 }
 }
 
 pub fn alloc_base() -> u64 {

@@ -126,7 +126,7 @@ fn apply_rela_relocations(data: &[u8], load_addr: u64, pml4: u64, max_end: u64) 
     while (4096usize << relbuf_order) < pages_needed * 4096 && relbuf_order < 10 {
         relbuf_order += 1;
     }
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     let relabuf_phys = match alloc.alloc(relbuf_order) {
         Some(p) => p,
         None => return Err("OOM for RELA buffer"),
@@ -189,7 +189,7 @@ fn page_align_down(addr: u64) -> u64 {
 }
 
 fn alloc_page() -> Option<u64> {
-    let alloc = unsafe { &mut *crate::memory::allocator() };
+    let alloc = { &mut *crate::memory::allocator() };
     alloc.alloc(0)
 }
 
@@ -293,7 +293,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                 }
                 let old_pd = (pdpt.0[i] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
                 let new_pd = alloc_page().ok_or("OOM: PD clone")?;
-                unsafe { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
+                { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
                 pdpt.0[i] = new_pd | (pdpt.0[i] & !crate::paging::PTE_ADDR_MASK);
             }
         }
@@ -326,13 +326,13 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                     let pde0 = pd0.0[0];
                     if pde0 & crate::paging::PTE_PRESENT != 0 {
                         let zero_page = alloc_page().ok_or("OOM: zero page")?;
-                        unsafe { core::ptr::write_bytes(zero_page as *mut u8, 0, 4096); }
+                        { core::ptr::write_bytes(zero_page as *mut u8, 0, 4096); }
                         if pde0 & crate::paging::PTE_HUGE != 0 {
                             // 2 MB huge page – split into 4 KB pages
                             let huge_phys = pde0 & crate::paging::PTE_ADDR_MASK;
                             let new_pt = alloc_page().ok_or("OOM: null PT split")?;
-                            unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
-                            let pt = unsafe { &mut *(new_pt as *mut crate::paging::PageTable) };
+                            { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+                            let pt = { &mut *(new_pt as *mut crate::paging::PageTable) };
                             for i in 0..512 {
                                 // Identity sub-pages stay kernel-only (non-USER) to prevent
                                 // user-mode aliasing of physical memory via VA==phys.
@@ -345,7 +345,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                         } else {
                             // Already 4 KB pages – redirect PT[0] to zero page
                             let pt_addr = pde0 & crate::paging::PTE_ADDR_MASK;
-                            let pt = unsafe { &mut *(pt_addr as *mut crate::paging::PageTable) };
+                            let pt = { &mut *(pt_addr as *mut crate::paging::PageTable) };
                             pt.0[0] = zero_page | crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_NO_EXECUTE;
                         }
                     }

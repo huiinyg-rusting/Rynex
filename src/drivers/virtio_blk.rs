@@ -887,7 +887,7 @@ impl VirtioBlk {
                 let avail = self.legacy_avail_phys as *mut VirtqAvail;
                 let idx = (*avail).idx as usize % self.legacy_queue_size as usize;
                 let ring_ptr = (avail as *mut u8).add(4) as *mut u16; // skip flags (2) + idx (2) = 4
-                unsafe { *ring_ptr.add(idx) = head; }
+                { *ring_ptr.add(idx) = head; }
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 (*avail).idx = (*avail).idx.wrapping_add(1);
             }
@@ -921,7 +921,7 @@ impl VirtioBlk {
                     serial::write_str(" isr=0x");
                     serial::write_hex(isr_status as u64);
                     serial::write_str(" used_idx=");
-                    unsafe {
+                    {
                         let used = self.legacy_used_phys as *mut VirtqUsed;
                         serial::write_dec((*used).idx as u64);
                     }
@@ -1001,7 +1001,7 @@ impl VirtioBlk {
             let ring_idx = (self.legacy_last_used_idx % self.legacy_queue_size) as usize;
             // Used ring: 6 bytes header (flags:2, idx:2, padding:2) + 8 bytes per element
             let ring_ptr = (used as *mut u8).add(4) as *mut VirtqUsedElem;
-            let elem = unsafe { &*ring_ptr.add(ring_idx) };
+            let elem = { &*ring_ptr.add(ring_idx) };
             self.legacy_last_used_idx = self.legacy_last_used_idx.wrapping_add(1);
             Some((elem.id as u16, elem.len))
         }
