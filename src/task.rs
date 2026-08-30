@@ -6577,70 +6577,20 @@ pub fn boot_userland() {
 
     // Initialize TTY devices FIRST (before creating any user tasks)
     crate::tty::init();
-    let _ = crate::vfs_core::mkdir(b"/dev", crate::vfs_core::types::S_IRUSR | crate::vfs_core::types::S_IWUSR | crate::vfs_core::types::S_IXUSR | crate::vfs_core::types::S_IRGRP | crate::vfs_core::types::S_IXGRP | crate::vfs_core::types::S_IROTH);
 
-    // Use the global TTY_DEVICE for all consoles
-    let tty_dev = &crate::tty::TTY_DEVICE;
+    // Register character devices with the devfs registry.  Each device keeps
+    // its own VnodeOps and device-specific ino (the same values the old
+    // hardcoded block used), so existing open/read/write paths are unaffected.
+    let tty = &crate::tty::TTY_DEVICE as &'static dyn crate::vfs_core::VnodeOps;
+    crate::devfs::devfs_register(b"console", 1, 0, 0, tty);
+    crate::devfs::devfs_register(b"tty",     2, 0, 0, tty);
+    crate::devfs::devfs_register(b"tty0",    3, 0, 0, tty);
+    crate::devfs::devfs_register(b"zero",    4, 0, 0, &crate::tty::ZERO_DEVICE);
+    crate::devfs::devfs_register(b"urandom", 5, 0, 0, &crate::tty::URANDOM_DEVICE);
+    crate::devfs::devfs_register(b"null",    6, 0, 0, &crate::tty::NULL_DEVICE);
 
-    if crate::vfs::find_inode(b"/dev/console").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(1, 0, 0, tty_dev);
-        if let Some(vn_id) = vn_id {
-            crate::vfs_core::create(b"/dev/console", crate::vfs_core::types::S_IFCHR | 0o666).ok();
-            crate::vfs::create_file(b"/dev/console", b"");
-            if let Some(idx) = crate::vfs::find_inode(b"/dev/console") {
-                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
-            }
-            serial::write_str("VFS: created '/dev/console' (char device)\n");
-        }
-    }
-    if crate::vfs::find_inode(b"/dev/tty").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(2, 0, 0, tty_dev);
-        if let Some(vn_id) = vn_id {
-            crate::vfs_core::create(b"/dev/tty", crate::vfs_core::types::S_IFCHR | 0o666).ok();
-            crate::vfs::create_file(b"/dev/tty", b"");
-            if let Some(idx) = crate::vfs::find_inode(b"/dev/tty") {
-                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
-            }
-            serial::write_str("VFS: created '/dev/tty' (char device)\n");
-        }
-    }
-    if crate::vfs::find_inode(b"/dev/tty0").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(3, 0, 0, tty_dev);
-        if let Some(vn_id) = vn_id {
-            crate::vfs_core::create(b"/dev/tty0", crate::vfs_core::types::S_IFCHR | 0o666).ok();
-            crate::vfs::create_file(b"/dev/tty0", b"");
-            if let Some(idx) = crate::vfs::find_inode(b"/dev/tty0") {
-                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
-            }
-            serial::write_str("VFS: created '/dev/tty0' (char device)\n");
-        }
-    }
-    if crate::vfs::find_inode(b"/dev/null").is_none() {
-        crate::vfs::create_file(b"/dev/null", b"");
-        serial::write_str("VFS: created '/dev/null'\n");
-    }
-    if crate::vfs::find_inode(b"/dev/zero").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(4, 0, 0, &crate::tty::ZERO_DEVICE);
-        if let Some(vn_id) = vn_id {
-            crate::vfs_core::create(b"/dev/zero", crate::vfs_core::types::S_IFCHR | 0o666).ok();
-            crate::vfs::create_file(b"/dev/zero", b"");
-            if let Some(idx) = crate::vfs::find_inode(b"/dev/zero") {
-                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
-            }
-            serial::write_str("VFS: created '/dev/zero' (char device)\n");
-        }
-    }
-    if crate::vfs::find_inode(b"/dev/urandom").is_none() {
-        let vn_id = crate::vfs_core::vnode_alloc(5, 0, 0, &crate::tty::URANDOM_DEVICE);
-        if let Some(vn_id) = vn_id {
-            crate::vfs_core::create(b"/dev/urandom", crate::vfs_core::types::S_IFCHR | 0o666).ok();
-            crate::vfs::create_file(b"/dev/urandom", b"");
-            if let Some(idx) = crate::vfs::find_inode(b"/dev/urandom") {
-                unsafe { crate::vfs::INODES[idx].vnode_id = vn_id; }
-            }
-            serial::write_str("VFS: created '/dev/urandom' (char device)\n");
-        }
-    }
+    // Materialise /dev and create a vnode+inode for every registered device.
+    crate::devfs::devfs_init();
 
     // NOTE: /etc/passwd is NOT created here. Password/account handling is
     // user-space policy; the kernel never touches it (see README "Policy").

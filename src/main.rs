@@ -29,6 +29,7 @@ mod vfs;
 mod keyboard;
 mod tty;
 mod services;
+mod devfs;
 mod drivers;
 
 use core::alloc::Layout;

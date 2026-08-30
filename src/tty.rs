@@ -592,6 +592,33 @@ impl VnodeOps for ZeroDevice {
     }
 }
 
+pub struct NullDevice;
+
+impl VnodeOps for NullDevice {
+    fn read(&self, _ino: u64, _offset: u64, _buf: &mut [u8]) -> Result<usize, &'static str> {
+        Ok(0) // EOF: /dev/null always reads zero bytes
+    }
+    fn write(&self, _ino: u64, _offset: u64, buf: &[u8]) -> Result<usize, &'static str> {
+        Ok(buf.len()) // Discard all written data
+    }
+    fn lookup(&self, _ino: u64, _name: &[u8]) -> Result<u64, &'static str> { Err("not a directory") }
+    fn readdir(&self, _ino: u64, _offset: u64, _buf: &mut [Dirent]) -> Result<usize, &'static str> { Err("not a directory") }
+    fn create(&self, _parent: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> { Err("not a directory") }
+    fn mkdir(&self, _parent: u64, _name: &[u8], _mode: FileMode) -> Result<u64, &'static str> { Err("not a directory") }
+    fn remove(&self, _parent: u64, _name: &[u8]) -> Result<(), &'static str> { Err("not a directory") }
+    fn rmdir(&self, _parent: u64, _name: &[u8]) -> Result<(), &'static str> { Err("not a directory") }
+    fn stat(&self, _ino: u64) -> Result<Stat, &'static str> { Err("not supported") }
+    fn readlink(&self, _ino: u64) -> Result<&[u8], &'static str> { Err("not a symlink") }
+    fn symlink(&self, _parent: u64, _name: &[u8], _target: &[u8]) -> Result<u64, &'static str> { Err("not a directory") }
+    fn rename(&self, _op: u64, _on: &[u8], _np: u64, _nn: &[u8]) -> Result<(), &'static str> { Err("not a directory") }
+    fn setattr(&self, _ino: u64, _attr: &Attr) -> Result<(), &'static str> { Err("not supported") }
+    fn getxattr(&self, _ino: u64, _name: &[u8], _value: &mut [u8]) -> Result<usize, &'static str> { Err("not supported") }
+    fn setxattr(&self, _ino: u64, _name: &[u8], _value: &[u8]) -> Result<(), &'static str> { Err("not supported") }
+    fn listxattr(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, &'static str> { Err("not supported") }
+    fn truncate(&self, _ino: u64, _size: u64) -> Result<(), &'static str> { Err("not supported") }
+    fn ioctl(&self, _ino: u64, _request: u64, _arg: u64) -> Result<usize, &'static str> { Err("not supported") }
+}
+
 pub struct UrandomDevice;
 
 impl VnodeOps for UrandomDevice {
@@ -656,6 +683,7 @@ impl VnodeOps for UrandomDevice {
     }
 }
 
+pub static NULL_DEVICE: NullDevice = NullDevice;
 pub static ZERO_DEVICE: ZeroDevice = ZeroDevice;
 pub static URANDOM_DEVICE: UrandomDevice = UrandomDevice;
 
