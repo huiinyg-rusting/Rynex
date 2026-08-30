@@ -242,8 +242,8 @@ impl VirtQueue {
     fn kick(&self) {
         unsafe {
             core::arch::asm!(
-                "mov dx, {0}",
-                "mov ax, {1}",
+                "mov dx, {0:x}",
+                "mov ax, {1:x}",
                 "out dx, ax",
                 in(reg) self.notify_base as u16,
                 in(reg) 0u16,

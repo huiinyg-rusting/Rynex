@@ -340,7 +340,7 @@ pub fn is_reserved_page(addr: u64) -> bool {
 
 /// Get the head of a free list for a given order.
 pub fn free_list_head(order: usize) -> u64 {
-    { crate::memory::allocator().free_lists[order] as u64 }
+    crate::memory::allocator().free_lists[order] as u64
 }
 
 pub fn alloc_base() -> u64 {
@@ -597,6 +597,13 @@ impl BuddyAllocator {
             // tracker); reclaiming it makes a future free legitimate, so drop
             // the stale tracker entry to avoid a false ALLOCATOR DOUBLE-FREE.
             untrack_freed_page(addr);
+            // Reclaiming a page that was freed sets its used bit clear (free()
+            // clears it and PTE pages go to quarantine rather than the free
+            // list). Restore the used bit like the fresh-allocation path does
+            // (alloc_nolock) so a later free() of this reclaimed table page is
+            // treated as a genuine in-use free instead of a spurious
+            // DOUBLE-FREE DETECTED, and so it is not silently leaked.
+            used_mark(phys_to_idx(addr));
             return Some(addr);
         }
         // Fallback: fresh allocation

@@ -78,7 +78,7 @@ fn decode_pf(code: PageFaultErrorCode) -> [&'static str; 8] {
 fn dump_pf(frame: &InterruptStackFrame, code: PageFaultErrorCode, cr2: u64) {
     let flags = decode_pf(code);
     let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    unsafe { core::arch::asm!("mov {0:r}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     let cpl = (cs & 3) as u64;
     crate::serial::write_str("EXC: PAGE_FAULT\n");
     crate::serial::write_str("  addr: 0x");
@@ -156,7 +156,7 @@ pub extern "x86-interrupt" fn bound_range(frame: InterruptStackFrame) {
 pub extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
     exit_user_task(&frame, "Invalid Opcode", &[]);
     let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    unsafe { core::arch::asm!("mov {0:r}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     crate::serial::write_str("EXC: Invalid Opcode rip=0x");
     crate::serial::write_hex(frame.instruction_pointer.as_u64());
     crate::serial::write_str(" cs=0x");
@@ -254,7 +254,7 @@ pub extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, cod
 
 fn exit_user_task_early(code: u64, rip: u64, rsp: u64, name: &str) {
     let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    unsafe { core::arch::asm!("mov {0:r}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     if cs & 3 == 3 {
         crate::serial::write_str("EXC: ");
         crate::serial::write_str(name);
@@ -337,7 +337,7 @@ pub extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _code: u6
     let cr2: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem, preserves_flags)); }
     let cs: u16;
-    unsafe { core::arch::asm!("mov {}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
+    unsafe { core::arch::asm!("mov {0:r}, cs", out(reg) cs, options(nostack, nomem, preserves_flags)); }
     // Read TSS.rsp0
     let rsp0 = crate::gdt::get_tss_rsp0();
     // Read cr3
