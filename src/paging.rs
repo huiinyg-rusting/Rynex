@@ -1556,6 +1556,82 @@ pub fn cow_remap(virt: u64) -> bool {
     cow_remap_in(KERNEL_PML4.load(Ordering::SeqCst), virt)
 }
 
+/// Walk task_pml4 at `virt` and dump every table level's entry plus the final
+/// leaf, to pinpoint where an RSVD (reserved-bit) or inconsistent fault arises.
+pub fn dump_fault_walk(task_pml4: u64, virt: u64) {
+    let v = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("FW: pml4=0x");
+    crate::klog::hex(task_pml4);
+    crate::klog::s(" virt=0x");
+    crate::klog::hex(virt);
+    crate::klog::s(" idx=");
+    crate::klog::dec(v[0] as u64);
+    crate::klog::s("/");
+    crate::klog::dec(v[1] as u64);
+    crate::klog::s("/");
+    crate::klog::dec(v[2] as u64);
+    crate::klog::s("/");
+    crate::klog::dec(v[3] as u64);
+    crate::klog::s(" cr3?=");
+    crate::klog::dec(if crate::task::current_task_pml4() == task_pml4 { 1 } else { 0 });
+    crate::klog::s(" cpu=");
+    crate::klog::dec(crate::task::current_cpu() as u64);
+    crate::klog::s(" tid=");
+    crate::klog::dec(crate::task::current_task_id());
+    crate::klog::end();
+
+    let pml4 = unsafe { &*(task_pml4 as *const PageTable) };
+    let l0 = pml4.0[v[0]];
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("FW: lvl0(pml4e)=0x");
+    crate::klog::hex(l0);
+    crate::klog::s(" p=0x");
+    crate::klog::hex(l0 & PTE_ADDR_MASK);
+    crate::klog::end();
+    if l0 & PTE_PRESENT == 0 { return; }
+
+    let pdpt = l0 & PTE_ADDR_MASK;
+    let l1 = unsafe { (*(pdpt as *const PageTable)).0[v[1]] };
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("FW: lvl1(pdpte)=0x");
+    crate::klog::hex(l1);
+    crate::klog::s(" p=0x");
+    crate::klog::hex(l1 & PTE_ADDR_MASK);
+    crate::klog::s(" huge=");
+    crate::klog::dec(if l1 & PTE_HUGE != 0 { 1 } else { 0 });
+    crate::klog::end();
+    if l1 & PTE_PRESENT == 0 || l1 & PTE_HUGE != 0 { return; }
+
+    let pd = l1 & PTE_ADDR_MASK;
+    let l2 = unsafe { (*(pd as *const PageTable)).0[v[2]] };
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("FW: lvl2(pde)=0x");
+    crate::klog::hex(l2);
+    crate::klog::s(" p=0x");
+    crate::klog::hex(l2 & PTE_ADDR_MASK);
+    crate::klog::s(" huge=");
+    crate::klog::dec(if l2 & PTE_HUGE != 0 { 1 } else { 0 });
+    crate::klog::end();
+    if l2 & PTE_PRESENT == 0 || l2 & PTE_HUGE != 0 { return; }
+
+    let pt = l2 & PTE_ADDR_MASK;
+    let l3 = unsafe { (*(pt as *const PageTable)).0[v[3]] };
+    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+    crate::klog::s("FW: lvl3(pte)=0x");
+    crate::klog::hex(l3);
+    crate::klog::s(" p=0x");
+    crate::klog::hex(l3 & PTE_ADDR_MASK);
+    crate::klog::s(" cow_refc(leafphys)=");
+    crate::klog::dec(refc_get(l3 & PTE_ADDR_MASK) as u64);
+    crate::klog::end();
+}
+
 pub fn page_fault_resolve(cr2: u64, code_bits: u64, cpl: u64) -> bool {
     let is_write = code_bits & 2 != 0;
     let is_present = code_bits & 1 != 0;

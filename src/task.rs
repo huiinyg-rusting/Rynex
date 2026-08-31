@@ -992,14 +992,15 @@ pub fn mark_cpu_online(_apic_id: u32) {
 // Pick a home CPU for a newly created KERNEL task, spreading across all online
 // CPUs once an AP is up. User tasks bypass this (they're pinned to the BSP).
 fn pick_home_cpu() -> u8 {
-    // ONLINE_CPUS counts APs beyond the BSP, so total schedulable CPUs is +1.
-    let ap_count = ONLINE_CPUS.load(Ordering::SeqCst);
-    let total = (ap_count + 1).min(MAX_CPUS as u64);
-    if total <= 1 {
-        return 0;
-    }
-    let turn = HOME_CPU_ROUND.fetch_add(1, Ordering::SeqCst);
-    (turn % total) as u8
+    // User tasks stay on the BSP: user syscalls rely on BSP-only shared state
+    // (the SYSCALL_USER_*/CALLEE_REGS globals and the shared syscall stack),
+    // so a user task dispatched to the AP iretqs with stale/zeroed regs and
+    // faults (rip=0, cs=0). The AP only runs kernel tasks. Keeping every user
+    // task pinned to cpu 0 is the documented, working model.
+    //
+    // (Previously this spread forked children across online CPUs, which broke
+    // on SMP-2 with cross-CPU page faults once the AP actually ran them.)
+    0
 }
 
 // ── Per-CPU (AP) scheduling idle loop ────────────────────────────

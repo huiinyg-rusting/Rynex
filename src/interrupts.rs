@@ -326,6 +326,8 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     crate::klog::s("\n");
     crate::klog::end();
 
+    crate::paging::dump_fault_walk(crate::task::current_task_pml4(), cr2);
+
     exit_user_task(&frame, "Page Fault", &[("addr", cr2), ("pf_code", code.bits())]);
     crate::vga::write_str("EXC: Page Fault\n");
     crate::klog::dump();
