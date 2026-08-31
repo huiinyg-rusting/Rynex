@@ -1347,9 +1347,12 @@ pub fn exit_task(code: i32) {
         TASKS[idx].exit_code = code;
 
         // CLONE_CHILD_CLEARTID: clear the TID in the child's address
-        // space so that futex-based thread exit notification works.
+        // space so that futex-based thread exit notification works. Only
+        // write if it is still a valid user mapping — an orphan/cloned task
+        // may hold a stale child_tidptr whose VA was unmapped, and writing
+        // to it would fault (bug 31).
         let child_tidptr = TASKS[idx].child_tidptr;
-        if child_tidptr != 0 {
+        if child_tidptr != 0 && is_user_tidptr_valid(child_tidptr) {
             core::ptr::write_volatile(child_tidptr as *mut u64, 0u64);
             // Wake any futex waiters on this address (e.g., parent joining via futex).
             // Use max_wake=1 to wake one waiter (the parent).
@@ -1368,10 +1371,39 @@ pub fn exit_task(code: i32) {
                 enqueue_task(parent_id, TASKS[pidx].prio);
             }
         }
+
+        // Reparent any living children to init (pid 1) so they are not left
+        // orphaned: when they later exit, runit's waitpid(-1) reaps them and
+        // frees their stacks/address space. Without this, an orphaned zombie
+        // with no surviving waitpid caller leaks its resources (bug 31).
+        reparent_children_to_init(id);
     }
 
     // Force switch so the parent (typically blocked in waitpid) can reap us.
     force_schedule();
+}
+
+/// True if `v` is a mapped user TID pointer in the current (exiting) task's
+/// address space that is safe to write 0 into. Guards the child_tidptr write
+/// against stale/unmapped VAs (bug 31) without triggering a page fault in the
+/// exit/kill path.
+fn is_user_tidptr_valid(v: u64) -> bool {
+    crate::paging::is_user_addr(v)
+        && v.checked_add(8).is_some()
+        && crate::paging::PageTableManager::resolve_phys(current_task_pml4(), v & !0xFFF).is_some()
+}
+
+/// Adopt the given task's children to pid 1 (init) so they are always reaped.
+fn reparent_children_to_init(from_pid: u64) {
+    for i in 0..MAX_TASKS {
+        unsafe {
+            let t = &mut TASKS[i];
+            if t.id == 0 { continue; }
+            if t.parent == Some(from_pid) {
+                t.parent = Some(1);
+            }
+        }
+    }
 }
 
 // ── Context switch assembly ──────────────────────────────────────
@@ -5267,9 +5299,17 @@ fn kill_task_zombie(idx: usize, code: i32) {
             remove_from_runqueue(t.id);
         }
         // CLONE_CHILD_CLEARTID: clear the TID and wake futex joiners so a
-        // signal-killed thread can be joined like a normally-exited one.
-        let child_tidptr = t.child_tidptr;
-        if child_tidptr != 0 {
+        // signal-killed thread can be joined like a normally-exited one. Only
+        // valid when the killed task is the current one: the child_tidptr VA
+        // lives in the target's address space, which is only the active CR3
+        // for self-kill. A stale/cross-AS write could fault or clobber a page
+        // (bug 31), so skip it otherwise (fall through to waitpid reaping).
+        let child_tidptr = if t.id == crate::task::current_task_id() {
+            t.child_tidptr
+        } else {
+            0
+        };
+        if child_tidptr != 0 && is_user_tidptr_valid(child_tidptr) {
             core::ptr::write_volatile(child_tidptr as *mut u64, 0u64);
             futex_wake(child_tidptr as *const u32, 1);
         }
@@ -5283,6 +5323,8 @@ fn kill_task_zombie(idx: usize, code: i32) {
                 enqueue_task(p, TASKS[pidx].prio);
             }
         }
+        // A killed task's own children must still be reaped: adopt them to init.
+        reparent_children_to_init(t.id);
     }
 }
 
