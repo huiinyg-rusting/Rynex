@@ -11,6 +11,34 @@ use crate::memory::buddy::PAGE_SIZE;
 use crate::serial;
 use crate::task;
 
+// Kernel-level PCI config read — bypasses privilege checks because this runs
+// during kernel init (task 0) which has no user-space privileges.
+const PCI_ADDR: u16 = 0xCF8;
+const PCI_DATA: u16 = 0xCFC;
+
+fn kernel_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    let addr: u32 = 0x8000_0000
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | (offset as u32 & 0xFC);
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov edx, {addr_port}",
+            "out dx, eax",
+            "mov edx, {data_port}",
+            "in eax, dx",
+            addr_port = const PCI_ADDR,
+            data_port = const PCI_DATA,
+            in("eax") addr,
+            lateout("eax") value,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    value
+}
+
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
@@ -295,15 +323,16 @@ static BLK_DEVICE: AtomicU64 = AtomicU64::new(0);
 
 impl VirtioBlk {
     fn probe(bus: u8, dev: u8, func: u8) -> Option<Self> {
-        let vendor = task::sys_pci_read(bus, dev, func, 0) as u16;
-        let device = (task::sys_pci_read(bus, dev, func, 0) >> 16) as u16;
-        if vendor != 0x1AF4 || device != 0x1001 {
+        let raw = kernel_pci_read(bus, dev, func, 0);
+        let vendor = raw as u16;
+        let device = (raw >> 16) as u16;
+        if vendor != 0x1AF4 || (device != 0x1001 && device != 0x1042) {
             return None;
         }
 
         
 
-        let bar0_raw = task::sys_pci_read(bus, dev, func, 0x10);
+        let bar0_raw = kernel_pci_read(bus, dev, func, 0x10);
         let bar0 = (bar0_raw as u64) & 0xFFFFFFF0;
         let bar0_len = 4096;
 
@@ -341,10 +370,10 @@ impl VirtioBlk {
     fn init(&mut self) -> bool {
         unsafe {
             // Parse PCI capability list to find virtio capabilities
-            let mut cap_ptr = (task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x34) & 0xFF) as u8;
+            let mut cap_ptr = (kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x34) & 0xFF) as u8;
             
             while cap_ptr != 0 {
-                let cap_dword = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, cap_ptr as u8);
+                let cap_dword = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, cap_ptr as u8);
                 let cap_id = (cap_dword & 0xFF) as u8;
                 let cap_next = ((cap_dword >> 8) & 0xFF) as u8;
                 
@@ -367,17 +396,17 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
                     // Byte 8-11: offset (4 bytes)
                     // Byte 12-15: length (4 bytes)
                     let aligned_ptr = cap_ptr & !3;
-                    let cap_dword = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, aligned_ptr);
+                    let cap_dword = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, aligned_ptr);
                     let vndr_id = ((cap_dword >> 24) & 0xFF) as u8;
                     let _cap_id_check = (cap_dword & 0xFF) as u8;
                     let _cap_next_check = ((cap_dword >> 8) & 0xFF) as u8;
                     
                     if vndr_id == 0x02 { // VIRTIO_PCI_CAP_VENDOR_SPECIFIC
-                        let dword1 = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 4) as u8);
+                        let dword1 = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 4) as u8);
                         let cfg_type = (dword1 & 0xFF) as u8;
                         let bar = ((dword1 >> 8) & 0xFF) as u8;
-                        let offset = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 8) as u8);
-                        let length = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 12) as u8);
+                        let offset = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 8) as u8);
+                        let length = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, (aligned_ptr + 12) as u8);
                         
                         serial::write_str("virtio-blk: found virtio cap, cfg_type=");
                         serial::write_hex(cfg_type as u64);
@@ -397,7 +426,7 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
                         serial::write_dec(length as u64);
                         serial::write_str("\n");
                         
-                        let bar_addr = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x10 + bar * 4) as u64 & 0xFFFFFFF0;
+                        let bar_addr = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x10 + bar * 4) as u64 & 0xFFFFFFF0;
                         let base = (bar_addr + offset as u64) as *mut u8;
                         
                         match cfg_type {
@@ -476,7 +505,7 @@ if cap_id == 0x09 { // PCI_CAP_ID_VENDOR_SPECIFIC
         unsafe {
             
             
-            let bar0_raw = task::sys_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x10);
+            let bar0_raw = kernel_pci_read(self.pci_bus, self.pci_dev, self.pci_func, 0x10);
             let bar0_raw_u64 = bar0_raw as u64;
             let bar0 = bar0_raw_u64 & 0xFFFFFFF0;
             
@@ -898,36 +927,6 @@ impl VirtioBlk {
 
             let mut timeout = 1000000;
             loop {
-                // Debug: read device status and ISR every 100000 iterations
-                if timeout % 100000 == 0 {
-                    let dev_status = {
-                        let mut val: u8;
-                        core::arch::asm!("in al, dx", 
-                            in("dx") (self.legacy_bar_port + 0x12) as u16, 
-                            lateout("al") val, 
-                            options(nostack, nomem, preserves_flags));
-                        val
-                    };
-                    let isr_status = {
-                        let mut val: u8;
-                        core::arch::asm!("in al, dx", 
-                            in("dx") (self.legacy_bar_port + 0x13) as u16, 
-                            lateout("al") val, 
-                            options(nostack, nomem, preserves_flags));
-                        val
-                    };
-                    serial::write_str("virtio-blk: poll dev_status=0x");
-                    serial::write_hex(dev_status as u64);
-                    serial::write_str(" isr=0x");
-                    serial::write_hex(isr_status as u64);
-                    serial::write_str(" used_idx=");
-                    {
-                        let used = self.legacy_used_phys as *mut VirtqUsed;
-                        serial::write_dec((*used).idx as u64);
-                    }
-                    serial::write_str("\n");
-                }
-                
                 if let Some((id, _len)) = self.legacy_get_used() {
                     if id == head {
                         // For read requests the device wrote the data into the
