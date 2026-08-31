@@ -23,18 +23,33 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 pub static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
 
-// ── COW synchronization ─────────────────────────────────────────────
-// The COW refcounts (PAGE_REFC for data pages, buddy::PTE_REFC for page-table
-// pages) are non-atomic check-then-act arrays. Under SMP, fork (cow_fork_pml4)
-// and a concurrent page fault (cow_walk_pte / cow_remap_in) can race on the
-// same physical page: both may re-read a refcount before either updates it,
-// corrupting the count and either leaking a shared page or freeing one still
-// in use (double free / COW corruption). A single exclusive irq-safe spin lock
-// serializes the entire COW critical section (fork's page-table sharing walk
-// AND the fault's copy/remap) so refcount check-then-act is atomic across CPUs.
-// Lock ordering: always COW_LOCK -> BUDDY_LOCK (no path takes BUDDY_LOCK then
-// COW_LOCK), so no deadlock.
-static COW_LOCK: RawSpin = RawSpin::new();
+// ── Page-table synchronization ─────────────────────────────────────
+// A single irq-safe spin lock (`PAGING_LOCK`) serializes ALL page-table
+// mutation in the kernel. This is required for two reasons:
+//
+// 1. COW refcount check-then-act: the refcounts (PAGE_REFC for data pages,
+//    buddy::PTE_REFC for page-table pages) are non-atomic arrays. Under SMP,
+//    fork (cow_fork_pml4) and a concurrent page fault (cow_remap_in) can race
+//    reading a refcount before either updates it, corrupting the count and
+//    either leaking a shared page or freeing one still in use.
+//
+// 2. Page-table snapshot consistency: the CPU walks the (per-task) page tables
+//    to translate a fault. Historically only the COW paths held a lock, so a
+//    demand-page / mmap / brk / exec / munmap / free_address_space running on
+//    another CPU could rewrite a PTE or free a page-table page while the CPU
+//    was mid-walk, producing a transient RSVD/inconsistent snapshot (bug 5).
+//    Every such mutator now takes PAGING_LOCK, so no two CPUs ever mutate the
+//    page tables concurrently and a walker cannot observe a half-written PTE.
+//
+// Lock placement rule (RawSpin is NON-reentrant): the lock is taken at the
+// leaf page-table-mutation primitives (map_into, unmap_into, map_kernel_page,
+// map_page/2m, unmap_page/2m, merge_user_pml4, free_address_space,
+// cow_fork_pml4, cow_remap_in) and never by callers that invoke one of those
+// (page_fault_resolve, handle_demand_page, syscall map/unmap wrappers, and
+// cow_remap which delegates to cow_remap_in). None of the locked primitives
+// calls another, so no self-deadlock. Lock order: PAGING_LOCK -> BUDDY_LOCK
+// (no path takes BUDDY_LOCK then PAGING_LOCK), so no deadlock.
+static PAGING_LOCK: RawSpin = RawSpin::new();
 
 // ── COW reference counting ────────────────────────────────────────
 // Each 4K user leaf shared between a parent and its fork children gets a
@@ -233,6 +248,7 @@ impl PageTableManager {
     }
 
     pub fn map_into(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+    let _p = PAGING_LOCK.lock();
     // NOTE: map_into is a low-level "write this leaf PTE" primitive. It must
     // NOT reject non-buddy phys (sys_phys_map maps arbitrary driver/MMIO phys)
     // nor already-mapped pages (mprotect re-maps with new flags). Validation
@@ -302,6 +318,7 @@ impl PageTableManager {
     /// Unmap a single 4K page from an arbitrary PML4 (user task). Returns the
     /// previously mapped physical address, or Err if not mapped.
     pub fn unmap_into(pml4: u64, virt: u64) -> Result<u64, &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -360,6 +377,7 @@ impl PageTableManager {
 
     // Map a page in kernel page tables (without PTE_USER on intermediate tables)
     pub fn map_kernel_page(virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -421,6 +439,7 @@ impl PageTableManager {
     }
 
     pub fn map_page(&mut self, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -450,6 +469,7 @@ impl PageTableManager {
     }
 
     pub fn map_2m(&mut self, virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -466,6 +486,7 @@ impl PageTableManager {
     }
 
     pub fn unmap_page(&mut self, virt: u64) -> Result<(), &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -495,6 +516,7 @@ impl PageTableManager {
     }
 
     pub fn unmap_2m(&mut self, virt: u64) -> Result<(), &'static str> {
+        let _p = PAGING_LOCK.lock();
         let vpn = [
             ((virt >> 39) & 0x1FF) as usize,
             ((virt >> 30) & 0x1FF) as usize,
@@ -857,6 +879,7 @@ pub fn is_user_addr(addr: u64) -> bool {
 
 /// Copy user page mappings from `src_pml4` to `dst_pml4`
 pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str> {
+    let _p = PAGING_LOCK.lock();
     let _alloc = { &mut *crate::memory::allocator() };
     let src = unsafe { &*(src_pml4 as *const PageTable) };
     let dst = unsafe { &mut *(dst_pml4 as *mut PageTable) };
@@ -922,6 +945,7 @@ pub fn merge_user_pml4(src_pml4: u64, dst_pml4: u64) -> Result<(), &'static str>
 // parent). Kernel half (PML4 entries 256..512) and kernel-identity huge pages
 // are never touched.
 pub fn free_address_space(pml4: u64, free_ro: bool) {
+    let _p = PAGING_LOCK.lock();
     let alloc = { &mut *crate::memory::allocator() };
     let base = crate::memory::buddy::alloc_base();
     let end = base + crate::memory::buddy::alloc_pages() * crate::memory::buddy::PAGE_SIZE;
@@ -1272,8 +1296,8 @@ let mut pdpt_user = false;
 // map) stay shared writable.
 pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     // Serialize the entire COW page-table sharing walk against concurrent page
-    // faults (bug 14). See COW_LOCK above.
-    let _cow = COW_LOCK.lock();
+    // faults and any other page-table mutation (bug 14 / bug 5). PAGING_LOCK.
+    let _cow = PAGING_LOCK.lock();
     let alloc = { &mut *crate::memory::allocator() };
     let new_pml4 = alloc.alloc_zeroed_page()?;
     unsafe { core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096); }
@@ -1444,9 +1468,10 @@ fn cow_walk_pte(pml4: u64, virt: u64) -> Option<&'static mut u64> {
 }
 
 pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
-    // Serialize against fork's page-table sharing and other faults on the same
-    // physical page so the COW refcount check-then-act is atomic (bug 14).
-    let _cow = COW_LOCK.lock();
+    // Serialize against fork's page-table sharing, other faults, and any other
+    // page-table mutation on the same physical page so the COW refcount
+    // check-then-act is atomic across CPUs (bug 14 / bug 5). PAGING_LOCK.
+    let _cow = PAGING_LOCK.lock();
     let pte = match cow_walk_pte(pml4, virt) {
         Some(p) => p,
         None => return false,
