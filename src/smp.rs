@@ -133,6 +133,29 @@ pub extern "C" fn ap_entry(apic_id: u32) -> ! {
     crate::gdt::setup_percpu_gdt(&mut pc.gdt, &mut pc.tss, ist_stacks);
     crate::gdt::load_percpu_gdt(&pc.gdt);
 
+    // EFER is a per-core MSR: (re)enable NXE and SCE on this AP so NX-set user
+    // PTEs are not treated as reserved here (must match the BSP's EFER).
+    unsafe {
+        let mut efer_lo: u32 = 0;
+        let mut efer_hi: u32 = 0;
+        core::arch::asm!(
+            "mov ecx, 0xC0000080",
+            "rdmsr",
+            out("eax") efer_lo,
+            out("edx") efer_hi,
+            options(nostack, preserves_flags)
+        );
+        let efer = ((efer_hi as u64) << 32) | (efer_lo as u64);
+        let efer = efer | 0x800 | 0x1; // NXE (11) + SCE (0)
+        core::arch::asm!(
+            "mov ecx, 0xC0000080",
+            "wrmsr",
+            in("eax") (efer as u32),
+            in("edx") ((efer >> 32) as u32),
+            options(nostack, preserves_flags)
+        );
+    }
+
     // 2. Mark this CPU online.
     crate::task::mark_cpu_online(apic_id);
     crate::serial::write_str("AP ");
