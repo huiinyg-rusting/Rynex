@@ -25,6 +25,13 @@ static mut AUDIT_ACTIVE: bool = false;
 const FREED_BMP_WORDS: usize = (1 << 21) / 64; // 32768 words = 256 KiB
 static mut FREED_BMP: [u64; FREED_BMP_WORDS] = [0; FREED_BMP_WORDS];
 
+// Cross-order overlap detection: one byte per physical page, stores the order
+// of the free-list block that owns this page (0xFF = not on any free list).
+// Used by audit_free_lists to detect a page appearing in multiple orders' lists
+// (duplicate-free / overlapping-block bug).
+const OWNED_ORDER_SENTINEL: u8 = 0xFF;
+static mut PAGE_OWNED_BY: [u8; MAX_REFC_PAGES] = [OWNED_ORDER_SENTINEL; MAX_REFC_PAGES];
+
 #[inline(always)]
 fn freed_bit(addr: u64) -> Option<(usize, u64)> {
     let idx = phys_to_idx(addr) as usize;
@@ -429,7 +436,13 @@ impl BuddyAllocator {
             }
             AUDIT_ACTIVE = true;
         }
-        // Walk free lists and verify magic/order on each block
+        // Clear the cross-order ownership bitmap
+        unsafe {
+            for i in 0..MAX_REFC_PAGES {
+                PAGE_OWNED_BY[i] = OWNED_ORDER_SENTINEL;
+            }
+        }
+        // Walk free lists, verify magic/order, and check cross-order overlap.
         for order in 0..=MAX_ORDER {
             let mut curr = self.free_lists[order];
             while !curr.is_null() {
@@ -437,6 +450,32 @@ impl BuddyAllocator {
                 if block.magic != MAGIC || block.order != order as u32 {
                     unsafe { AUDIT_ACTIVE = false; }
                     return false;
+                }
+                // Check every page spanned by this block for ownership conflict
+                let base_idx = unsafe { phys_to_idx(curr as u64) } as usize;
+                let span = 1usize << order;
+                if base_idx + span > MAX_REFC_PAGES {
+                    unsafe { AUDIT_ACTIVE = false; }
+                    return false;
+                }
+                for p in base_idx..base_idx + span {
+                    let prev = unsafe { PAGE_OWNED_BY[p] };
+                    if prev != OWNED_ORDER_SENTINEL {
+                        // Same page already in a different order's free list
+                        crate::serial::write_str("\n=== FREE LIST OVERLAP ===\n");
+                        crate::serial::write_str("page=");
+                        crate::serial::write_dec(p as u64);
+                        crate::serial::write_str(" addr=0x");
+                        crate::serial::write_hex(self.idx_to_addr(p as u64));
+                        crate::serial::write_str(" orderA=");
+                        crate::serial::write_dec(prev as u64);
+                        crate::serial::write_str(" orderB=");
+                        crate::serial::write_dec(order as u64);
+                        crate::serial::write_str("\n");
+                        unsafe { AUDIT_ACTIVE = false; }
+                        return false;
+                    }
+                    unsafe { PAGE_OWNED_BY[p] = order as u8; }
                 }
                 curr = block.next;
             }
