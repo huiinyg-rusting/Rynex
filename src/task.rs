@@ -238,6 +238,7 @@ pub static mut VMAS: [VmaRec; MAX_VMA_RECORDS] = [VmaRec {
 // Number of pool slots that have ever been handed out. All scans are bounded
 // by this so lookup cost tracks the live population, not the 64K pool size.
 static mut VMA_USED: usize = 0;
+static VMA_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
 
 #[derive(Copy, Clone)]
 pub struct Task {
@@ -2691,6 +2692,7 @@ fn sys_fs_mount(mp: *const u8) -> i64 {
 
 /// Register [start, end) for `pml4`. Returns false when the pool is full.
 fn vma_register(pml4: u64, start: u64, end: u64, flags: u64) -> bool {
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &mut VMAS[i];
@@ -2716,6 +2718,7 @@ fn vma_register(pml4: u64, start: u64, end: u64, flags: u64) -> bool {
 
 /// Find the VMA covering `addr` in `pml4`'s address space, if any.
 fn vma_find(pml4: u64, addr: u64) -> Option<Vma> {
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &VMAS[i];
@@ -2730,6 +2733,7 @@ fn vma_find(pml4: u64, addr: u64) -> Option<Vma> {
 /// End of the first (smallest-end) VMA that overlaps [start, end), for hole
 /// scanning: the caller jumps its candidate to this end and retries.
 fn vma_first_overlap_end(pml4: u64, start: u64, end: u64) -> Option<u64> {
+    let _g = VMA_LOCK.lock();
     let mut best: Option<u64> = None;
     unsafe {
         for i in 0..VMA_USED {
@@ -2746,6 +2750,7 @@ fn vma_first_overlap_end(pml4: u64, start: u64, end: u64) -> Option<u64> {
 
 /// Drop the record whose range starts at `addr` (dma_free).
 fn vma_clear_addr(pml4: u64, addr: u64) {
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &mut VMAS[i];
@@ -2762,6 +2767,7 @@ fn vma_clear_addr(pml4: u64, addr: u64) {
 
 /// Drop or shrink records intersecting [start, end) (munmap).
 fn vma_clear_range(pml4: u64, start: u64, end: u64) {
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &mut VMAS[i];
@@ -2788,6 +2794,7 @@ fn vma_clear_range(pml4: u64, start: u64, end: u64) {
 
 /// Duplicate every record of `from` under `to` (fork / non-CLONE_VM clone).
 fn vma_clone(from: u64, to: u64) {
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &VMAS[i];
@@ -2803,6 +2810,7 @@ fn vma_clear_pml4(pml4: u64) {
     if pml4 == 0 {
         return;
     }
+    let _g = VMA_LOCK.lock();
     unsafe {
         for i in 0..VMA_USED {
             let rec = &mut VMAS[i];
