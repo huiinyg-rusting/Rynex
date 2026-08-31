@@ -549,19 +549,17 @@ pub fn vnode_release(id: u16) {
     VNODE_TABLE.lock().free(id);
 }
 
-pub fn vnode_get(id: u16) -> Option<&'static Vnode> {
+/// Return a copy of the vnode for `id` under the VNODE_TABLE lock.
+///
+/// The Vnode is returned **by value** (it is `Copy` and every field is write-once
+/// at alloc: `ino`/`fs_id`/`mount_id`/`ops`, with only `used` toggling on free),
+/// so the caller never holds an unlocked `&'static` reference into the shared
+/// table. This avoids the stale-reference / use-after-free that would otherwise
+/// arise when a slot is freed and re-allocated (the same `u16` id reused for a
+/// different file) while another CPU still dereferences it.
+pub fn vnode_get(id: u16) -> Option<Vnode> {
     let vt = VNODE_TABLE.lock();
-    let v = vt.get(id)?;
-    let ptr: *const Vnode = v;
-    unsafe { Some(&*ptr) }
-}
-
-#[allow(invalid_reference_casting)]
-pub fn vnode_get_mut(id: u16) -> Option<&'static mut Vnode> {
-    let vt = VNODE_TABLE.lock();
-    let v = vt.get(id)?;
-    let ptr = v as *const Vnode as *mut Vnode;
-    unsafe { Some(&mut *ptr) }
+    vt.get(id).copied()
 }
 
 pub fn vnode_alloc(ino: u64, fs_id: FsId, mount_id: u64, ops: &'static dyn VnodeOps) -> Option<u16> {
