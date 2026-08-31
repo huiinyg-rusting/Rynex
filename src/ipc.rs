@@ -14,8 +14,19 @@
 //!
 //! All message buffers live in pages allocated from the buddy allocator, so
 //! payloads are never copied twice and never touch user address spaces.
+//!
+//! Locking: The whole port table (PORTS), the next-id counter and the reply
+//! slots (REPLIES) are guarded by a single `IPC_LOCK` RawSpin. Every state
+//! mutation (enqueue / dequeue / port create+close / reply alloc+free+fill)
+//! happens under `IPC_LOCK`. Because `ipc_send` / `ipc_recv` / `ipc_call` block
+//! on futexes, they must never hold `IPC_LOCK` across the block: each loop
+//! releases the lock, blocks on the (stable) wake word, and re-checks the state
+//! under the lock on wakeup. Futex wakes are issued with the lock released.
+//!
+//! Lock order: IPC_LOCK -> BUDDY_LOCK (message / reply pages are allocated and
+//! freed while holding IPC_LOCK). Nothing takes BUDDY_LOCK and then IPC_LOCK.
 
-
+use crate::spinlock::RawSpin;
 
 pub const MAX_PORTS: usize = 32;
 pub const PORT_SLOTS: usize = 64;
@@ -67,6 +78,7 @@ impl Port {
 
 static mut PORTS: [Port; MAX_PORTS] = [Port::empty(); MAX_PORTS];
 static mut NEXT_PORT_ID: u64 = 1;
+static IPC_LOCK: RawSpin = RawSpin::new();
 
 fn alloc_page() -> Option<u64> {
     let alloc = { &mut *crate::memory::allocator() };
@@ -80,30 +92,33 @@ fn free_page(phys: u64) {
     alloc.free(phys, 0);
 }
 
-fn port_by_id(id: u64) -> Option<&'static mut Port> {
+// ── Port table lookups (IPC_LOCK must be held) ────────────────────
+
+fn port_idx_by_id_locked(id: u64) -> Option<usize> {
     unsafe {
         for i in 0..MAX_PORTS {
             if PORTS[i].used && PORTS[i].id == id {
-                return Some(&mut PORTS[i]);
+                return Some(i);
             }
         }
     }
     None
 }
 
-fn port_id_by_name(name: &[u8]) -> Option<u64> {
+/// Exact-name lookup. IPC_LOCK must be held.
+fn port_idx_by_name_locked(name: &[u8]) -> Option<usize> {
+    if name.len() > NAME_LEN {
+        return None;
+    }
     unsafe {
         for i in 0..MAX_PORTS {
             if !PORTS[i].used { continue; }
             let mut ok = true;
             for (j, &c) in name.iter().enumerate() {
-                if j >= NAME_LEN || PORTS[i].name[j] != c { ok = false; break; }
+                if PORTS[i].name[j] != c { ok = false; break; }
             }
-            if ok {
-                // Ensure exact length match (name bytes after len must be NUL).
-                if name.len() <= NAME_LEN && (name.len() == NAME_LEN || PORTS[i].name[name.len()] == 0) {
-                    return Some(PORTS[i].id);
-                }
+            if ok && (name.len() == NAME_LEN || PORTS[i].name[name.len()] == 0) {
+                return Some(i);
             }
         }
     }
@@ -135,6 +150,12 @@ impl ReplySlot {
 static mut REPLIES: [ReplySlot; MAX_REPLIES] = [ReplySlot::empty(); MAX_REPLIES];
 
 fn reply_alloc() -> Option<u64> {
+    let _g = RawSpin::lock(&IPC_LOCK);
+    reply_alloc_locked()
+}
+
+/// IPC_LOCK must be held.
+fn reply_alloc_locked() -> Option<u64> {
     let page = alloc_page()?;
     unsafe {
         // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
@@ -154,22 +175,22 @@ fn reply_alloc() -> Option<u64> {
     None
 }
 
-fn reply_get(id: u64) -> Option<&'static mut ReplySlot> {
-    unsafe {
-        if id < MAX_REPLIES as u64 && REPLIES[id as usize].used {
-            return Some(&mut REPLIES[id as usize]);
-        }
-    }
-    None
+fn reply_free(id: u64) {
+    let _g = RawSpin::lock(&IPC_LOCK);
+    reply_free_locked(id);
 }
 
-fn reply_free(id: u64) {
-    if let Some(slot) = reply_get(id) {
-        if slot.page != 0 {
-            free_page(slot.page);
-            slot.page = 0;
+/// IPC_LOCK must be held.
+fn reply_free_locked(id: u64) {
+    unsafe {
+        if id < MAX_REPLIES as u64 && REPLIES[id as usize].used {
+            let s = &mut REPLIES[id as usize];
+            if s.page != 0 {
+                free_page(s.page);
+                s.page = 0;
+            }
+            s.used = false;
         }
-        slot.used = false;
     }
 }
 
@@ -201,16 +222,19 @@ fn ipc_call_impl(
     };
     let src = crate::task::current_task_id();
 
+    // Post the request message to the mailbox (block while it is full).
     loop {
-        let (free_slot, msg_page) = {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
-                None => { reply_free(reply_id); return -crate::task::ESRCH; }
+        let (free_slot, wake_addr) = {
+            let _g = RawSpin::lock(&IPC_LOCK);
+            let idx = match port_idx_by_id_locked(port_id) {
+                Some(i) => i,
+                None => { reply_free_locked(reply_id); return -crate::task::ESRCH; }
             };
+            let port = unsafe { &mut PORTS[idx] };
             if port.count < PORT_SLOTS {
                 let page = match alloc_page() {
                     Some(p) => p,
-                    None => { reply_free(reply_id); return -crate::task::ENOMEM; }
+                    None => { reply_free_locked(reply_id); return -crate::task::ENOMEM; }
                 };
                 let hdr = unsafe { &mut *(page as *mut MsgHeader) };
                 hdr.src_pid = src;
@@ -220,30 +244,28 @@ fn ipc_call_impl(
                 if len > 0 {
                     if !kernel_buf && !crate::task::user_range_valid(buf as u64, len, false) {
                         free_page(page);
-                        reply_free(reply_id);
+                        reply_free_locked(reply_id);
                         return -crate::task::EFAULT;
                     }
                     unsafe {
                         core::ptr::copy_nonoverlapping(buf, (page as *mut u8).add(IPC_MSG_HEADER as usize), len);
                     }
                 }
-                let idx = (port.head + port.count) % PORT_SLOTS;
-                port.slots[idx] = page;
+                let i2 = (port.head + port.count) % PORT_SLOTS;
+                port.slots[i2] = page;
                 port.count += 1;
-                let wr = &raw const port.wake_recv as *const u32;
-                (true, wr)
+                (true, &raw const port.wake_recv as *const u32)
             } else {
-                let ws = &raw const port.wake_send as *const u32;
-                (false, ws)
+                (false, &raw const port.wake_send as *const u32)
             }
         };
 
         if free_slot {
             // Wake one blocked receiver, then wait for the reply.
-            { crate::task::futex_wake(msg_page as *const u32, 1); }
+            crate::task::futex_wake(wake_addr, 1);
             break;
         }
-        if !crate::task::block_on_futex(msg_page as *const u32) {
+        if !crate::task::block_on_futex(wake_addr) {
             reply_free(reply_id);
             return -crate::task::EAGAIN;
         }
@@ -251,24 +273,35 @@ fn ipc_call_impl(
 
     // Wait for the reply on our slot. Poll `done` before each block so a reply
     // that landed between the send and the block is not lost.
+    let page;
     loop {
-        let (done, len, page) = match reply_get(reply_id) {
-            Some(s) => (s.done, s.len as usize, s.page),
-            None => { reply_free(reply_id); return -crate::task::ESRCH; }
+        let (exists, done, slot_page, wake_addr) = {
+            let _g = RawSpin::lock(&IPC_LOCK);
+            unsafe {
+                if reply_id < MAX_REPLIES as u64 && REPLIES[reply_id as usize].used {
+                    let s = &REPLIES[reply_id as usize];
+                    (true, s.done, s.page, &raw const s.wake as *const u32)
+                } else {
+                    (false, false, 0, core::ptr::null())
+                }
+            }
         };
+        if !exists {
+            reply_free(reply_id);
+            return -crate::task::ESRCH;
+        }
         if done {
-            let _ = (len, page);
+            page = slot_page;
             break;
         }
-        let slot_wake = match reply_get(reply_id) {
-            Some(s) => &raw const s.wake as *const u32,
-            None => { reply_free(reply_id); return -crate::task::ESRCH; }
-        };
-        crate::task::block_on_futex(slot_wake);
+        if !crate::task::block_on_futex(wake_addr) {
+            reply_free(reply_id);
+            return -crate::task::EAGAIN;
+        }
     }
-    let (len, page) = match reply_get(reply_id) {
-        Some(s) => (s.len as usize, s.page),
-        None => (0, 0),
+    let len = {
+        let _g = RawSpin::lock(&IPC_LOCK);
+        unsafe { REPLIES[reply_id as usize].len as usize }
     };
     let rlen = core::cmp::min(len, out_len);
     if rlen > 0 && !out.is_null() {
@@ -286,33 +319,28 @@ fn ipc_call_impl(
 /// handlers which answer directly and `handle_with_reply`'s auto-answer don't
 /// clobber each other.
 pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
-    let slot = match reply_get(reply_id) {
-        Some(s) => s,
-        None => return -crate::task::ESRCH,
-    };
-    if slot.done {
-        return 0;
-    }
-    let page = slot.page;
-    let n = core::cmp::min(len, IPC_MSG_MAX);
-    if n > 0 && !buf.is_null() {
+    let (n, wake_addr) = {
+        let _g = RawSpin::lock(&IPC_LOCK);
         unsafe {
-            core::ptr::copy_nonoverlapping(buf, page as *mut u8, n);
+            if reply_id >= MAX_REPLIES as u64 || !REPLIES[reply_id as usize].used {
+                return -crate::task::ESRCH;
+            }
+            let s = &mut REPLIES[reply_id as usize];
+            if s.done {
+                return 0;
+            }
+            let page = s.page;
+            let n = core::cmp::min(len, IPC_MSG_MAX);
+            if n > 0 && !buf.is_null() {
+                core::ptr::copy_nonoverlapping(buf, page as *mut u8, n);
+            }
+            s.len = n as u32;
+            s.done = true;
+            (n, &raw const s.wake as *const u32)
         }
-    }
-    slot.len = n as u32;
-    slot.done = true;
-    let wake = &raw const slot.wake as *const u32;
-    { crate::task::futex_wake(wake, 1); }
+    };
+    crate::task::futex_wake(wake_addr, 1);
     n as i64
-}
-
-fn wake_port_recv(port: &Port) {
-    crate::task::futex_wake(&raw const port.wake_recv as *const u32, 1);
-}
-
-fn wake_port_send(port: &Port) {
-    crate::task::futex_wake(&raw const port.wake_send as *const u32, 1);
 }
 
 /// Create a named port (service side). Returns the port id.
@@ -321,8 +349,9 @@ pub fn ipc_create(name_ptr: *const u8, name_len: usize) -> i64 {
         return -crate::task::EINVAL;
     }
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let _g = RawSpin::lock(&IPC_LOCK);
     // Reject duplicate names.
-    if port_id_by_name(name).is_some() {
+    if port_idx_by_name_locked(name).is_some() {
         return -crate::task::EEXIST;
     }
     unsafe {
@@ -356,8 +385,9 @@ pub fn ipc_connect(name_ptr: *const u8, name_len: usize) -> i64 {
         return -crate::task::EINVAL;
     }
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-    match port_id_by_name(name) {
-        Some(id) => id as i64,
+    let _g = RawSpin::lock(&IPC_LOCK);
+    match port_idx_by_name_locked(name) {
+        Some(i) => unsafe { PORTS[i].id as i64 },
         None => -crate::task::ESRCH,
     }
 }
@@ -370,11 +400,13 @@ pub fn ipc_send(port_id: u64, buf: *const u8, len: usize, msg_type: u32) -> i64 
     let src = crate::task::current_task_id();
 
     loop {
-        let (free_slot, msg_page) = {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
+        let (free_slot, wake_addr) = {
+            let _g = RawSpin::lock(&IPC_LOCK);
+            let idx = match port_idx_by_id_locked(port_id) {
+                Some(i) => i,
                 None => return -crate::task::ESRCH,
             };
+            let port = unsafe { &mut PORTS[idx] };
             if port.count < PORT_SLOTS {
                 let page = match alloc_page() {
                     Some(p) => p,
@@ -393,27 +425,22 @@ pub fn ipc_send(port_id: u64, buf: *const u8, len: usize, msg_type: u32) -> i64 
                         core::ptr::copy_nonoverlapping(buf, (page as *mut u8).add(IPC_MSG_HEADER as usize), len);
                     }
                 }
-                let idx = (port.head + port.count) % PORT_SLOTS;
-                port.slots[idx] = page;
+                let i2 = (port.head + port.count) % PORT_SLOTS;
+                port.slots[i2] = page;
                 port.count += 1;
-                let wr = &raw const port.wake_recv as *const u32;
-                (true, wr)
+                (true, &raw const port.wake_recv as *const u32)
             } else {
-                let ws = &raw const port.wake_send as *const u32;
-                (false, ws)
+                (false, &raw const port.wake_send as *const u32)
             }
         };
 
         if free_slot {
             // Wake one blocked receiver.
-            { crate::task::futex_wake(msg_page as *const u32, 1); }
+            crate::task::futex_wake(wake_addr, 1);
             return 0;
         }
-
         // Mailbox full: block on the send wake word.
-        if crate::task::block_on_futex(msg_page as *const u32) {
-            // Woken: retry the loop.
-        } else {
+        if !crate::task::block_on_futex(wake_addr) {
             return -crate::task::EAGAIN;
         }
     }
@@ -423,32 +450,28 @@ pub fn ipc_send(port_id: u64, buf: *const u8, len: usize, msg_type: u32) -> i64 
 /// Returns the message length (bytes) or a negative error.
 pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
     let page = loop {
-        {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
+        let (got, pg, wake_addr) = {
+            let _g = RawSpin::lock(&IPC_LOCK);
+            let idx = match port_idx_by_id_locked(port_id) {
+                Some(i) => i,
                 None => return -crate::task::ESRCH,
             };
+            let port = unsafe { &mut PORTS[idx] };
             if port.count > 0 {
-                let idx = port.head;
-                let pg = port.slots[idx];
-                port.head = (idx + 1) % PORT_SLOTS;
+                let i2 = port.head;
+                let p = port.slots[i2];
+                port.head = (i2 + 1) % PORT_SLOTS;
                 port.count -= 1;
-                // Wake one blocked sender.
-                let ws = &raw const port.wake_send as *const u32;
-                { crate::task::futex_wake(ws, 1); }
-                break pg;
+                (true, p, &raw const port.wake_send as *const u32)
+            } else {
+                (false, 0, &raw const port.wake_recv as *const u32)
             }
-        }
-
-        // Mailbox empty: block on the recv wake word.
-        let wr = {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
-                None => return -crate::task::ESRCH,
-            };
-            &raw const port.wake_recv as *const u32
         };
-        if !crate::task::block_on_futex(wr) {
+        if got {
+            crate::task::futex_wake(wake_addr, 1);
+            break pg;
+        }
+        if !crate::task::block_on_futex(wake_addr) {
             return -crate::task::EAGAIN;
         }
     };
@@ -471,7 +494,6 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
 
 /// Non-blocking receive that also returns the reply token.
 /// Returns (length, reply_id); length is 0 when the mailbox is empty.
-/// Non-blocking receive with reply token: dequeue a message if one is pending.
 /// `buf` is validated as a user-space pointer (default). Kernel tasks should
 /// use `ipc_peek_ex_internal` so their kernel-stack buffers are accepted.
 pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
@@ -486,17 +508,19 @@ pub fn ipc_peek_ex_internal(port_id: u64, buf: *mut u8, max_len: usize) -> (i64,
 
 fn ipc_peek_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool) -> (i64, u64) {
     let page = {
-        let port = match port_by_id(port_id) {
-            Some(p) => p,
+        let _g = RawSpin::lock(&IPC_LOCK);
+        let idx = match port_idx_by_id_locked(port_id) {
+            Some(i) => i,
             None => return (-crate::task::ESRCH, 0),
         };
+        let port = unsafe { &mut PORTS[idx] };
         if port.count == 0 { return (0, 0); }
-        let idx = port.head;
-        let pg = port.slots[idx];
-        port.head = (idx + 1) % PORT_SLOTS;
+        let i2 = port.head;
+        let pg = port.slots[i2];
+        port.head = (i2 + 1) % PORT_SLOTS;
         port.count -= 1;
         let ws = &raw const port.wake_send as *const u32;
-        { crate::task::futex_wake(ws, 1); }
+        crate::task::futex_wake(ws, 1);
         pg
     };
 
@@ -546,29 +570,28 @@ pub fn ipc_recv_ex_internal(port_id: u64, buf: *mut u8, max_len: usize) -> (i64,
 
 fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool) -> (i64, u64) {
     let page = loop {
-        {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
+        let (got, pg, wake_addr) = {
+            let _g = RawSpin::lock(&IPC_LOCK);
+            let idx = match port_idx_by_id_locked(port_id) {
+                Some(i) => i,
                 None => return (-crate::task::ESRCH, 0),
             };
+            let port = unsafe { &mut PORTS[idx] };
             if port.count > 0 {
-                let idx = port.head;
-                let pg = port.slots[idx];
-                port.head = (idx + 1) % PORT_SLOTS;
+                let i2 = port.head;
+                let p = port.slots[i2];
+                port.head = (i2 + 1) % PORT_SLOTS;
                 port.count -= 1;
-                let ws = &raw const port.wake_send as *const u32;
-                { crate::task::futex_wake(ws, 1); }
-                break pg;
+                (true, p, &raw const port.wake_send as *const u32)
+            } else {
+                (false, 0, &raw const port.wake_recv as *const u32)
             }
-        }
-        let wr = {
-            let port = match port_by_id(port_id) {
-                Some(p) => p,
-                None => return (-crate::task::ESRCH, 0),
-            };
-            &raw const port.wake_recv as *const u32
         };
-        if !crate::task::block_on_futex(wr) {
+        if got {
+            crate::task::futex_wake(wake_addr, 1);
+            break pg;
+        }
+        if !crate::task::block_on_futex(wake_addr) {
             return (-crate::task::EAGAIN, 0);
         }
     };
@@ -594,18 +617,20 @@ fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
 /// blocking), the message length on success, or a negative error.
 pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
     let page = {
-        let port = match port_by_id(port_id) {
-            Some(p) => p,
+        let _g = RawSpin::lock(&IPC_LOCK);
+        let idx = match port_idx_by_id_locked(port_id) {
+            Some(i) => i,
             None => return -crate::task::ESRCH,
         };
+        let port = unsafe { &mut PORTS[idx] };
         if port.count == 0 { return 0; }
-        let idx = port.head;
-        let pg = port.slots[idx];
-        port.head = (idx + 1) % PORT_SLOTS;
+        let i2 = port.head;
+        let pg = port.slots[i2];
+        port.head = (i2 + 1) % PORT_SLOTS;
         port.count -= 1;
         // Wake one blocked sender.
         let ws = &raw const port.wake_send as *const u32;
-        { crate::task::futex_wake(ws, 1); }
+        crate::task::futex_wake(ws, 1);
         pg
     };
 
@@ -627,6 +652,7 @@ pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
 
 /// Destroy a port and free any queued messages.
 pub fn ipc_close(port_id: u64) -> i64 {
+    let _g = RawSpin::lock(&IPC_LOCK);
     unsafe {
         for i in 0..MAX_PORTS {
             if PORTS[i].used && PORTS[i].id == port_id {
