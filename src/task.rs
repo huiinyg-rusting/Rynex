@@ -1851,20 +1851,15 @@ pub extern "C" fn timer_schedule() -> u64 {
         // transitioning user tasks, so the AP must not touch it.
         return 0;
     }
-    // Poll UART for serial input and feed into keyboard buffer.
-    while let Some(c) = crate::serial::read_byte_nonblocking() {
-        // Filter: accept printable ASCII and common control chars.
-        // ESC (0x1B) is accepted so terminal line-editing (arrow keys, etc.)
-        // receives the full ESC [ A sequences instead of losing the ESC byte.
-        // ISIG control chars (^C=0x03 SIGINT, ^\=0x1C SIGQUIT, ^Z=0x1A SIGTSTP)
-        // and line-edit chars (^D=0x04 VEOF, ^U=0x15 VKILL) are passed through so
-        // TtyDevice::push_input can turn them into signals / handle them; if we
-        // dropped them here Ctrl+C would never reach the TTY over a serial console.
-        let isig_char = c == 0x03 || c == 0x1C || c == 0x1A || c == 0x04 || c == 0x15;
-        if c >= 0x20 && c <= 0x7E || c == 0x1B || c == b'\n' || c == b'\r' || c == b'\t' || c == 0x08 || c == 0x7F || isig_char {
-            crate::keyboard::push_char(c);
-        }
-    }
+
+    // NOTE: Serial input is NOT polled here (bug 88). The timer path and the
+    // TtyDevice::read path both polled serial::read_byte_nonblocking(),
+    // racing on the same read-once hardware FIFO. This caused double-echo
+    // (timer pushed + echoed each byte, then the shell echoed again) and
+    // unpredictable byte splitting between the two buffers. Serial input now
+    // flows exclusively through TtyDevice::read (the blocking read path),
+    // eliminating the race. PS/2 keyboard input is unaffected — IRQ1 calls
+    // push_char directly.
 
     // Wake up sleeping tasks whose wakeup tick has arrived (shared, race-safe).
     wakeup_expired_sleepers();
