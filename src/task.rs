@@ -328,6 +328,12 @@ pub struct Task {
     // user page belongs to this task. False for a COW-forked child that never
     // exec'd, where read-only pages are shared with the parent.
     pub addr_space_private: bool,
+
+    // Per-task alternate signal stack (sigaltstack). Stored here (not as globals)
+    // so each process's altstack does not clobber another's.
+    pub altstack_sp: u64,
+    pub altstack_flags: u32,
+    pub altstack_size: u64,
 }
 
 impl Task {
@@ -378,6 +384,9 @@ blocked_on: 0,
             child_tidptr: 0,
             addr_space_private: false,
             saved_user_regs: None,
+            altstack_sp: 0,
+            altstack_flags: 0,
+            altstack_size: 0,
         }
     }
 }
@@ -4013,6 +4022,9 @@ fn sys_fork() -> i64 {
             child_tidptr: 0,
             addr_space_private: true,
             saved_user_regs: None,
+            altstack_sp: 0,
+            altstack_flags: 0,
+            altstack_size: 0,
         };
 
         // The child has its own (COW) page table, so duplicate the parent's
@@ -4209,6 +4221,9 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             },
             addr_space_private: flags & CLONE_VM == 0,
             saved_user_regs: None,
+            altstack_sp: parent.altstack_sp,
+            altstack_flags: parent.altstack_flags,
+            altstack_size: parent.altstack_size,
         };
 
         // CLONE_VM shares the parent's pml4, so the child automatically sees
@@ -5651,23 +5666,21 @@ fn sys_sigaltstack(ss: u64, old_ss: u64) -> i64 {
     // stack_t layout: { ss_sp:u64, ss_flags:u32, _pad:u32, ss_size:u64 }
     let id = current_task_id();
     if id == 0 { return -EINVAL; }
-    let _idx = task_idx(id);
+    let idx = task_idx(id);
     unsafe {
-        // Keep a simple static altstack mirror for the kernel task state.
-        static mut ALTSTACK_SP: u64 = 0;
-        static mut ALTSTACK_FLAGS: u32 = 0;
-        static mut ALTSTACK_SIZE: u64 = 0;
+        // Per-task altstack mirror (in the Task struct, not globals, so each
+        // process's sigaltstack does not clobber another's).
         if old_ss != 0 {
-            core::ptr::write_volatile(old_ss as *mut u64, ALTSTACK_SP);
-            core::ptr::write_volatile((old_ss + 8) as *mut u32, ALTSTACK_FLAGS);
-            core::ptr::write_volatile((old_ss + 16) as *mut u64, ALTSTACK_SIZE);
+            core::ptr::write_volatile(old_ss as *mut u64, TASKS[idx].altstack_sp);
+            core::ptr::write_volatile((old_ss + 8) as *mut u32, TASKS[idx].altstack_flags);
+            core::ptr::write_volatile((old_ss + 16) as *mut u64, TASKS[idx].altstack_size);
         }
         if ss != 0 {
             let sp = core::ptr::read_volatile(ss as *const u64);
             let size = core::ptr::read_volatile((ss + 16) as *const u64);
-            ALTSTACK_SP = sp;
-            ALTSTACK_SIZE = size;
-            ALTSTACK_FLAGS = 0;
+            TASKS[idx].altstack_sp = sp;
+            TASKS[idx].altstack_size = size;
+            TASKS[idx].altstack_flags = 0;
         }
     }
     0
