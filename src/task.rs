@@ -279,6 +279,13 @@ pub struct Task {
     // name on exec/spawn.
     pub comm: [u8; 16],
 
+    // Privilege bitmask granted to this task (bug 15). Gates privileged
+    // syscalls (phys_map, dma_alloc, pci, port_io, irq, reboot) that would
+    // otherwise let any user process read/write arbitrary physical memory.
+    // 0 = no privileges. Only granted to trusted binaries on exec (runit/udev)
+    // or to kernel tasks; everything else stays fully unprivileged.
+    pub privileges: u32,
+
     pub runqueue_next: Option<u64>,
 
     // Per-task "currently inside a syscall" flag. The old global AtomicBool
@@ -379,6 +386,7 @@ blocked_on: 0,
             sig_blocked: 0,
             sig_pending: 0,
             comm: [0; 16],
+            privileges: 0,
             wakeup_tick: 0,
             futex_deadline: 0,
             child_tidptr: 0,
@@ -768,6 +776,9 @@ pub fn create_kernel_task_prio(entry: u64, nice: i32, comm: &[u8]) -> Option<u64
     task.prio = task.static_prio;
     task.time_slice = initial_time_slice(task.prio);
     task.parent = None;
+    // Kernel tasks run in ring 0 and are governed by the kernel, not these
+    // user syscall gates; give them full privileges for completeness.
+    task.privileges = PRIV_ALL;
 
     // Set comm name
     let len = core::cmp::min(comm.len(), 15);
@@ -929,6 +940,10 @@ pub fn create_user_task_on_cpu(entry: u64, pml4: u64, user_stack_top: u64, nice:
     task.prio = task.static_prio;
     task.time_slice = initial_time_slice(task.prio);
     task.parent = Some(current_task_id());
+    // bug 15: the first user task (init, pid 1) is trusted; grant it full
+    // privileges. Its exec of /bin/runit re-affirms them via the whitelist;
+    // children runit forks+execs are de-privileged unless in the whitelist.
+    if tid == 1 { task.privileges = PRIV_ALL; }
     serial::write_str("TASK: create_user_task - parent set\n");
 
     // Set up stdin/stdout/stderr to /dev/console
@@ -2406,6 +2421,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
 }
 
 fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> i64 {
+    if !have_priv(PRIV_REBOOT) { return -EPERM; }
     const LINUX_REBOOT_MAGIC1: u32 = 0xFEE1DEAD;
     const LINUX_REBOOT_MAGIC2: u32 = 0x28121969;
     const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
@@ -2503,7 +2519,8 @@ fn sys_rynex_yield() -> i64 {
 // delivery through a per-IRQ shared counter + futex wake word.
 
 /// Port I/O read. `width` is 1/2/4 for inb/inw/inl. Returns value or -EINVAL.
-fn sys_port_in(port: u16, width: u32) -> i64 {
+ fn sys_port_in(port: u16, width: u32) -> i64 {
+    if !have_priv(PRIV_PORT) { return -EPERM; }
     match width {
         1 => {
             let v: u8;
@@ -2526,6 +2543,7 @@ fn sys_port_in(port: u16, width: u32) -> i64 {
 
 /// Port I/O write. `width` is 1/2/4 for outb/outw/outl.
 fn sys_port_out(port: u16, width: u32, value: u64) -> i64 {
+    if !have_priv(PRIV_PORT) { return -EPERM; }
     match width {
         1 => {
             let v = value as u8;
@@ -2553,6 +2571,7 @@ static mut DRIVER_IRQ_WORD: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
 
 /// Driver task registers a user-space u32 counter for `irq`. Returns 0.
 fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
+    if !have_priv(PRIV_IRQ) { return -EPERM; }
     if irq as usize >= MAX_DRIVER_IRQS {
         return -EINVAL;
     }
@@ -2570,6 +2589,7 @@ fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
 /// Polls the counter (futex block is the natural primitive already used by
 /// the IPC layer for the same purpose).
 fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
+    if !have_priv(PRIV_IRQ) { return -EPERM; }
     if irq as usize >= MAX_DRIVER_IRQS {
         return -EINVAL;
     }
@@ -2807,6 +2827,9 @@ fn vma_clear_pml4(pml4: u64) {
 fn sys_phys_map(phys: u64, size: u64) -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
+    // bug 15: only privileged (trusted driver) tasks may map arbitrary physical
+    // memory. Without this, any user process could read/write kernel pages.
+    if !have_priv(PRIV_PHYS_MAP) { return -EPERM; }
     if phys == 0 || size == 0 || size > 0x1_0000_0000 {
         return -EINVAL;
     }
@@ -2879,6 +2902,7 @@ let size = ((size + 0xFFF) & !0xFFF) as u64;
 /// Allocate a DMA-capable physical page and map it into the caller. Returns
 /// (user_vaddr, phys_addr) packed: phys in high 32 bits, vaddr in low 48.
 fn sys_dma_alloc(_pages: usize) -> i64 {
+    if !have_priv(PRIV_DMA_ALLOC) { return -EPERM; }
     let pages = if _pages == 0 { 1 } else { _pages.min(8) };
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
@@ -2953,6 +2977,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
 /// Free a DMA buffer previously returned by sys_dma_alloc. The low 32 bits
 /// carry the user address; the physical page is returned to the buddy allocator.
 fn sys_dma_free(packed: u64) -> i64 {
+    if !have_priv(PRIV_DMA_ALLOC) { return -EPERM; }
     let vaddr = packed & 0xFFFF_FFFF;
     let phys = (packed >> 32) & 0xFFFF_FFFF;
     if vaddr == 0 || phys == 0 {
@@ -3013,6 +3038,7 @@ const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// Read a PCI config register. Returns the 32-bit value or a negated errno.
 pub fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
+    if !have_priv(PRIV_PCI) { return -EPERM; }
     if offset > 0xFC || offset % 4 != 0 {
         return -EINVAL;
     }
@@ -3036,6 +3062,7 @@ pub fn sys_pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> i64 {
 
 /// Write a PCI config register.
 pub fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 {
+    if !have_priv(PRIV_PCI) { return -EPERM; }
     if offset > 0xFC || offset % 4 != 0 {
         return -EINVAL;
     }
@@ -3060,6 +3087,7 @@ pub fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 
 /// Scan bus 0 for a device with the given vendor/device id. Returns
 /// (bus<<16 | dev<<11 | func<<8) or -ENODEV. Only devs 0..=31 checked.
 pub fn sys_pci_find(vendor_device: u16) -> i64 {
+    if !have_priv(PRIV_PCI) { return -EPERM; }
     let _ = vendor_device;
     for dev in 0u8..32 {
         for func in 0u8..8 {
@@ -3481,6 +3509,44 @@ pub const ETIMEDOUT: i64 = 110;
 pub const ENOTEMPTY: i64 = 39;
 pub const EMSGSIZE: i64 = 90;
 pub const EADDRNOTAVAIL: i64 = 99;
+
+// ── Privileges (bug 15) ─────────────────────────────────────────
+// Bitmask of privileged operations a task is allowed to perform. Gates the
+// dangerous syscalls that would otherwise let any user process map / read /
+// write arbitrary physical memory or poke at hardware. Known trusted binaries
+// (runit, udev) are granted PRIV_ALL_DRIVER on exec; everything else is 0.
+pub const PRIV_PHYS_MAP: u32 = 1 << 0;
+pub const PRIV_DMA_ALLOC: u32 = 1 << 1;
+pub const PRIV_PCI: u32 = 1 << 2;
+pub const PRIV_PORT: u32 = 1 << 3;
+pub const PRIV_IRQ: u32 = 1 << 4;
+pub const PRIV_REBOOT: u32 = 1 << 5;
+pub const PRIV_ALL_DRIVER: u32 =
+    PRIV_PHYS_MAP | PRIV_DMA_ALLOC | PRIV_PCI | PRIV_PORT | PRIV_IRQ;
+pub const PRIV_ALL: u32 = PRIV_ALL_DRIVER | PRIV_REBOOT;
+
+/// True if the current task holds the given privilege bit (bug 15).
+fn have_priv(bit: u32) -> bool {
+    let id = cur_task().load(Ordering::SeqCst);
+    if id == 0 { return false; }
+    unsafe { TASKS[task_idx(id)].privileges & bit != 0 }
+}
+
+/// Privileges granted to a freshly exec'd binary, decided by path (bug 15).
+/// Only known trusted platform binaries are privileged; everything else runs
+/// fully unprivileged so an attacker-controlled user program cannot map or
+/// scribble physical memory via sys_phys_map et al.
+fn privileges_for_path(path: &[u8]) -> u32 {
+    // runit is the init supervisor; grant it full privileges incl. reboot/poweroff.
+    if path == b"/bin/runit" || path == b"/bin/init" {
+        return PRIV_ALL;
+    }
+    // udev is a trusted device manager but has no reason to reboot the machine.
+    if path == b"/bin/udev" {
+        return PRIV_ALL_DRIVER;
+    }
+    0
+}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -4050,6 +4116,7 @@ fn sys_fork() -> i64 {
             sig_blocked: parent.sig_blocked,
             sig_pending: 0,
             comm: parent.comm,
+            privileges: parent.privileges,
             wakeup_tick: 0,
             futex_deadline: 0,
             child_tidptr: 0,
@@ -4245,6 +4312,7 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             sig_blocked: parent.sig_blocked,
             sig_pending: 0,
             comm: parent.comm,
+            privileges: parent.privileges,
             wakeup_tick: 0,
             futex_deadline: 0,
             child_tidptr: if flags & CLONE_CHILD_CLEARTID != 0 {
@@ -4753,6 +4821,12 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                     TASKS[idx].regs.fs_base = USER_TLS_VADDR;
                 }
                 TASKS[idx].pml4 = info.pml4;
+                // bug 15: after exec the process is a fresh image, so reset its
+                // privileges based on the binary being run. Only trusted
+                // platform binaries (runit/udev) regain driver privileges; any
+                // unprivileged child of runit (e.g. shell, or anything a user
+                // execs) is fully de-privileged here.
+                TASKS[idx].privileges = privileges_for_path(&path_buf[..len]);
                 // Switch to the new page table so the iretq finds the user mappings
 
                 pt_mgr().switch_to(info.pml4);
@@ -6772,6 +6846,7 @@ pub fn boot_userland() {
     task0.regs = Registers::new_kernel(continue_after_schedule as *const () as u64, task0.kernel_stack);
     task0.pml4 = pt_mgr().kernel_pml4();
     task0.cpu = 0;
+    task0.privileges = PRIV_ALL;
     task0.static_prio = nice_to_prio(19);
     task0.normal_prio = task0.static_prio;
     task0.prio = task0.static_prio;
