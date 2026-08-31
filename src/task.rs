@@ -1748,6 +1748,13 @@ static SCHED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 // concurrently). Lock order: this -> RUNQUEUE_LOCK[cpu].
 static TIMER_WAKE_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
 
+/// Serializes mutations of per-task sig_pending/sig_blocked. These bitmasks are
+/// accessed from both syscall context (sys_kill, sigprocmask, check_deliver_signal)
+/// and interrupt context (timer ISR -> signal_foreground_group -> sig_deliver_to_task),
+/// so a single IRQ-safe spinlock prevents SMP races. Lock order: SIGNAL_LOCK
+// -> RUNQUEUE_LOCK (signal ops may wake tasks).
+static SIGNAL_LOCK: crate::spinlock::RawSpin = crate::spinlock::RawSpin::new();
+
 /// Wake sleeping user tasks whose time-based wakeup tick has arrived. May be run
 /// by either CPU's timer; guarded by TIMER_WAKE_LOCK against the BSP running the
 /// same scan concurrently. The woken task is enqueued onto its home-CPU runqueue
@@ -5178,6 +5185,7 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
 
 /// Deliver `sig` to a single task slot. Returns 0 ok / -ESRCH.
 fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
+    let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
     unsafe {
         let t = &mut TASKS[idx];
         if t.id == 0 || t.state == TaskState::Empty { return -ESRCH; }
@@ -5405,6 +5413,7 @@ fn sys_rt_sigaction(sig: i32, act: u64, oldact: u64) -> i64 {
 }
 
 fn sys_rt_sigprocmask(how: i32, set: u64, oldset: u64) -> i64 {
+    let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
     let id = current_task_id();
     if id == 0 { return -EINVAL; }
     let idx = task_idx(id);
@@ -5496,6 +5505,7 @@ unsafe fn sig_write_u16(p: u64, v: u16) { core::ptr::write_volatile(p as *mut u1
 /// so it enters a handler (or resumes from rt_sigreturn) instead.
 #[no_mangle]
 pub extern "C" fn check_deliver_signal(kstack: u64, sys_ret: u64) -> u64 {
+    let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
     unsafe {
         // Resume from a previous handler: rt_sigreturn parked the restored
         // context here, rewrite this syscall's exit slots with it.
@@ -5603,6 +5613,7 @@ exit_task(128 + sigi);
 }
 
 fn sys_rt_sigreturn() -> i64 {
+    let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
     unsafe {
         // The handler returned to the restorer trampoline (musl __restore_rt),
         // which called rt_sigreturn with the user RSP at &ucontext = frame+8.
