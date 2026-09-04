@@ -70,21 +70,21 @@ static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 pub fn in_syscall_enter() {
     let id = cur_task().load(Ordering::SeqCst);
     if id != 0 {
-        unsafe { TASKS[task_idx(id)].in_syscall = true; }
+        task_mut(id).in_syscall = true;
     }
 }
 
 pub fn in_syscall_exit() {
     let id = cur_task().load(Ordering::SeqCst);
     if id != 0 {
-        unsafe { TASKS[task_idx(id)].in_syscall = false; }
+        task_mut(id).in_syscall = false;
     }
 }
 
 pub fn in_syscall() -> bool {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return false; }
-    unsafe { TASKS[task_idx(id)].in_syscall }
+    task_ref(id).in_syscall
 }
 
 /// Snapshot of a task for /proc reporting.
@@ -421,6 +421,20 @@ impl RunQueue {
 
 static mut TASKS: [Task; MAX_TASKS] = [Task::empty(); MAX_TASKS];
 
+// Safe accessors that encapsulate the static-mut TASKS[] deref (bug 86).
+// Callers use task_ref for read-only field access (no aliasing risk) and
+// task_mut for mutation. As with the rest of the kernel, the caller must not
+// hold two task_mut() references to the SAME task concurrently — this is
+// identical to the previous `unsafe { TASKS[idx] }` usage, only centralized.
+#[inline(always)]
+fn task_ref(tid: u64) -> &'static Task {
+    unsafe { &TASKS[task_idx(tid)] }
+}
+#[inline(always)]
+fn task_mut(tid: u64) -> &'static mut Task {
+    unsafe { &mut TASKS[task_idx(tid)] }
+}
+
 // SMP: maximum number of logical CPUs the scheduler is built for. The BSP is CPU 0;
 // APIC IDs above the physical count simply stay unwired. Each CPU has its OWN current
 // task, runqueue, and runqueue lock (per-CPU scheduling).
@@ -522,7 +536,7 @@ pub fn current_task_id() -> u64 {
 
 pub fn task_kernel_stack_by_id(id: u64) -> u64 {
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].kernel_stack }
+    task_ref(id).kernel_stack
 }
 
 pub fn current_task_regs_rip() -> u64 {
@@ -617,7 +631,7 @@ pub fn task_by_id(id: u64) -> Option<&'static mut Task> {
 
 fn enqueue_task(tid: u64, prio: u8) {
     // Enqueue onto the task's home CPU runqueue (affinity).
-    let cpu = unsafe { TASKS[task_idx(tid)].cpu } as usize;
+    let cpu = task_ref(tid).cpu as usize;
     let _g = RUNQUEUE_LOCK[cpu].lock();
     unsafe {
         let rq = &mut RUNQUEUE[cpu];
@@ -661,7 +675,7 @@ fn dequeue_task() -> Option<u64> {
 }
 
 fn remove_from_runqueue(tid: u64) -> bool {
-    let cpu = unsafe { TASKS[task_idx(tid)].cpu } as usize;
+    let cpu = task_ref(tid).cpu as usize;
     let _g = RUNQUEUE_LOCK[cpu].lock();
     unsafe {
         let rq = &mut RUNQUEUE[cpu];
@@ -1073,8 +1087,8 @@ pub fn ap_begin_scheduling(apic_id: u32) -> ! {
 
     cur_task().store(tid, Ordering::SeqCst);
     unsafe { TASKS[task_idx(tid)].state = TaskState::Running; }
-    crate::gdt::set_tss_rsp0(unsafe { TASKS[task_idx(tid)].kernel_stack });
-    pt_mgr().switch_to(unsafe { TASKS[task_idx(tid)].pml4 });
+    crate::gdt::set_tss_rsp0(task_ref(tid).kernel_stack);
+    pt_mgr().switch_to(task_ref(tid).pml4);
 
     unsafe {
         // IDTR is per-CPU: the AP must load the shared IDT itself.
@@ -5416,7 +5430,7 @@ pub fn signal_foreground_group(sig: i32) {
     let current = current_task_id();
     if current == 0 { return; }
     let fg = crate::tty::TTY_DEVICE.get_fg_pgrp() as u64;
-    let cur_pg = unsafe { TASKS[task_idx(current)].tgid };
+    let cur_pg = task_ref(current).tgid;
     let target = if fg > 0 { fg } else { cur_pg };
     unsafe {
         for i in 0..MAX_TASKS {
