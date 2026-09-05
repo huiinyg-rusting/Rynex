@@ -18,6 +18,10 @@ fn inb(port: u16) -> u8 {
     val
 }
 
+fn cpu_pause() {
+    unsafe { core::arch::asm!("pause", options(nostack, nomem)); }
+}
+
 pub fn init() {
     outb(COM1 + 1, 0x00);
     outb(COM1 + 3, 0x80);
@@ -33,7 +37,7 @@ pub fn init() {
 // Raw, unlocked byte write. Callers must hold SERIAL_LOCK.
 fn write_byte_unlocked(byte: u8) {
     while (inb(COM1 + 5) & 0x20) == 0 {
-        unsafe { core::arch::asm!("pause", options(nostack, nomem)); }
+        cpu_pause();
     }
     outb(COM1, byte);
 }
@@ -93,7 +97,7 @@ pub fn receive_ready() -> bool {
 
 pub fn read_byte() -> u8 {
     while !receive_ready() {
-        unsafe { core::arch::asm!("pause", options(nostack, nomem)); }
+        cpu_pause();
     }
     inb(COM1)
 }

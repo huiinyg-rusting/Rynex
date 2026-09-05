@@ -51,7 +51,7 @@ pub fn init() {
 /// init(); each AP must load it into its own per-CPU IDTR before enabling
 /// interrupts, since IDTR is a per-CPU register.
 pub unsafe fn load_current() {
-    (unsafe { &IDT }).load();
+    (&IDT).load();
 }
 
 pub fn register_irq(vector: u8, handler_addr: u64) {

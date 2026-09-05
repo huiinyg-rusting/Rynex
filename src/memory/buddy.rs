@@ -452,7 +452,7 @@ impl BuddyAllocator {
                     return false;
                 }
                 // Check every page spanned by this block for ownership conflict
-                let base_idx = unsafe { phys_to_idx(curr as u64) } as usize;
+                let base_idx = phys_to_idx(curr as u64) as usize;
                 let span = 1usize << order;
                 if base_idx + span > MAX_REFC_PAGES {
                     unsafe { AUDIT_ACTIVE = false; }

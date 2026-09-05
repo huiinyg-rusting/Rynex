@@ -80,6 +80,22 @@ static mut PORTS: [Port; MAX_PORTS] = [Port::empty(); MAX_PORTS];
 static mut NEXT_PORT_ID: u64 = 1;
 static IPC_LOCK: RawSpin = RawSpin::new();
 
+fn port_ref(idx: usize) -> &'static mut Port {
+    unsafe { &mut PORTS[idx] }
+}
+
+fn reply_ref(idx: usize) -> &'static mut ReplySlot {
+    unsafe { &mut REPLIES[idx] }
+}
+
+fn msg_hdr_ref(page: u64) -> &'static MsgHeader {
+    unsafe { &*(page as *const MsgHeader) }
+}
+
+fn msg_hdr_mut(page: u64) -> &'static mut MsgHeader {
+    unsafe { &mut *(page as *mut MsgHeader) }
+}
+
 fn alloc_page() -> Option<u64> {
     let alloc = { &mut *crate::memory::allocator() };
     let phys = alloc.alloc(0)?;
@@ -95,11 +111,9 @@ fn free_page(phys: u64) {
 // ── Port table lookups (IPC_LOCK must be held) ────────────────────
 
 fn port_idx_by_id_locked(id: u64) -> Option<usize> {
-    unsafe {
-        for i in 0..MAX_PORTS {
-            if PORTS[i].used && PORTS[i].id == id {
-                return Some(i);
-            }
+    for i in 0..MAX_PORTS {
+        if port_ref(i).used && port_ref(i).id == id {
+            return Some(i);
         }
     }
     None
@@ -110,16 +124,14 @@ fn port_idx_by_name_locked(name: &[u8]) -> Option<usize> {
     if name.len() > NAME_LEN {
         return None;
     }
-    unsafe {
-        for i in 0..MAX_PORTS {
-            if !PORTS[i].used { continue; }
-            let mut ok = true;
-            for (j, &c) in name.iter().enumerate() {
-                if PORTS[i].name[j] != c { ok = false; break; }
-            }
-            if ok && (name.len() == NAME_LEN || PORTS[i].name[name.len()] == 0) {
-                return Some(i);
-            }
+    for i in 0..MAX_PORTS {
+        if !port_ref(i).used { continue; }
+        let mut ok = true;
+        for (j, &c) in name.iter().enumerate() {
+            if port_ref(i).name[j] != c { ok = false; break; }
+        }
+        if ok && (name.len() == NAME_LEN || port_ref(i).name[name.len()] == 0) {
+            return Some(i);
         }
     }
     None
@@ -157,18 +169,17 @@ fn reply_alloc() -> Option<u64> {
 /// IPC_LOCK must be held.
 fn reply_alloc_locked() -> Option<u64> {
     let page = alloc_page()?;
-    unsafe {
-        // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
-        // expected), so a real synchronous reply token must never be 0.
-        for i in 1..MAX_REPLIES {
-            if !REPLIES[i].used {
-                REPLIES[i].used = true;
-                REPLIES[i].page = page;
-                REPLIES[i].len = 0;
-                REPLIES[i].done = false;
-                REPLIES[i].wake = 0;
-                return Some(i as u64);
-            }
+    // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
+    // expected), so a real synchronous reply token must never be 0.
+    for i in 1..MAX_REPLIES {
+        if !reply_ref(i).used {
+            let r = reply_ref(i);
+            r.used = true;
+            r.page = page;
+            r.len = 0;
+            r.done = false;
+            r.wake = 0;
+            return Some(i as u64);
         }
     }
     free_page(page);
@@ -182,15 +193,13 @@ fn reply_free(id: u64) {
 
 /// IPC_LOCK must be held.
 fn reply_free_locked(id: u64) {
-    unsafe {
-        if id < MAX_REPLIES as u64 && REPLIES[id as usize].used {
-            let s = &mut REPLIES[id as usize];
-            if s.page != 0 {
-                free_page(s.page);
-                s.page = 0;
-            }
-            s.used = false;
+    if id < MAX_REPLIES as u64 && reply_ref(id as usize).used {
+        let s = reply_ref(id as usize);
+        if s.page != 0 {
+            free_page(s.page);
+            s.page = 0;
         }
+        s.used = false;
     }
 }
 
@@ -230,13 +239,13 @@ fn ipc_call_impl(
                 Some(i) => i,
                 None => { reply_free_locked(reply_id); return -crate::task::ESRCH; }
             };
-            let port = unsafe { &mut PORTS[idx] };
+            let port = port_ref(idx);
             if port.count < PORT_SLOTS {
                 let page = match alloc_page() {
                     Some(p) => p,
                     None => { reply_free_locked(reply_id); return -crate::task::ENOMEM; }
                 };
-                let hdr = unsafe { &mut *(page as *mut MsgHeader) };
+                let hdr = msg_hdr_mut(page);
                 hdr.src_pid = src;
                 hdr.reply_id = reply_id;
                 hdr.msg_type = 0;
@@ -277,13 +286,11 @@ fn ipc_call_impl(
     loop {
         let (exists, done, slot_page, wake_addr) = {
             let _g = RawSpin::lock(&IPC_LOCK);
-            unsafe {
-                if reply_id < MAX_REPLIES as u64 && REPLIES[reply_id as usize].used {
-                    let s = &REPLIES[reply_id as usize];
-                    (true, s.done, s.page, &raw const s.wake as *const u32)
-                } else {
-                    (false, false, 0, core::ptr::null())
-                }
+            if reply_id < MAX_REPLIES as u64 && reply_ref(reply_id as usize).used {
+                let s = reply_ref(reply_id as usize);
+                (true, s.done, s.page, &raw const s.wake as *const u32)
+            } else {
+                (false, false, 0, core::ptr::null())
             }
         };
         if !exists {
@@ -301,7 +308,7 @@ fn ipc_call_impl(
     }
     let len = {
         let _g = RawSpin::lock(&IPC_LOCK);
-        unsafe { REPLIES[reply_id as usize].len as usize }
+        reply_ref(reply_id as usize).len as usize
     };
     let rlen = core::cmp::min(len, out_len);
     if rlen > 0 && !out.is_null() {
@@ -321,23 +328,21 @@ fn ipc_call_impl(
 pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
     let (n, wake_addr) = {
         let _g = RawSpin::lock(&IPC_LOCK);
-        unsafe {
-            if reply_id >= MAX_REPLIES as u64 || !REPLIES[reply_id as usize].used {
-                return -crate::task::ESRCH;
-            }
-            let s = &mut REPLIES[reply_id as usize];
-            if s.done {
-                return 0;
-            }
-            let page = s.page;
-            let n = core::cmp::min(len, IPC_MSG_MAX);
-            if n > 0 && !buf.is_null() {
-                core::ptr::copy_nonoverlapping(buf, page as *mut u8, n);
-            }
-            s.len = n as u32;
-            s.done = true;
-            (n, &raw const s.wake as *const u32)
+        if reply_id >= MAX_REPLIES as u64 || !reply_ref(reply_id as usize).used {
+            return -crate::task::ESRCH;
         }
+        let s = reply_ref(reply_id as usize);
+        if s.done {
+            return 0;
+        }
+        let page = s.page;
+        let n = core::cmp::min(len, IPC_MSG_MAX);
+        if n > 0 && !buf.is_null() {
+            unsafe { core::ptr::copy_nonoverlapping(buf, page as *mut u8, n); }
+        }
+        s.len = n as u32;
+        s.done = true;
+        (n, &raw const s.wake as *const u32)
     };
     crate::task::futex_wake(wake_addr, 1);
     n as i64
@@ -354,26 +359,25 @@ pub fn ipc_create(name_ptr: *const u8, name_len: usize) -> i64 {
     if port_idx_by_name_locked(name).is_some() {
         return -crate::task::EEXIST;
     }
-    unsafe {
-        for i in 0..MAX_PORTS {
-            if !PORTS[i].used {
-                PORTS[i].used = true;
-                PORTS[i].id = NEXT_PORT_ID;
-                NEXT_PORT_ID += 1;
-                for (j, &c) in name.iter().enumerate() {
-                    PORTS[i].name[j] = c;
-                }
-                PORTS[i].head = 0;
-                PORTS[i].count = 0;
-                PORTS[i].wake_recv = 0;
-                PORTS[i].wake_send = 0;
-                crate::serial::write_str("IPC: create port ");
-                crate::serial::write_str(&alloc::format!("{}", core::str::from_utf8(name).unwrap_or("?")));
-                crate::serial::write_str(" id=");
-                crate::serial::write_dec(PORTS[i].id);
-                crate::serial::write_str("\n");
-                return PORTS[i].id as i64;
+    for i in 0..MAX_PORTS {
+        if !port_ref(i).used {
+            let p = port_ref(i);
+            p.used = true;
+            p.id = unsafe { NEXT_PORT_ID };
+            unsafe { NEXT_PORT_ID += 1; }
+            for (j, &c) in name.iter().enumerate() {
+                p.name[j] = c;
             }
+            p.head = 0;
+            p.count = 0;
+            p.wake_recv = 0;
+            p.wake_send = 0;
+            crate::serial::write_str("IPC: create port ");
+            crate::serial::write_str(&alloc::format!("{}", core::str::from_utf8(name).unwrap_or("?")));
+            crate::serial::write_str(" id=");
+            crate::serial::write_dec(p.id);
+            crate::serial::write_str("\n");
+            return p.id as i64;
         }
     }
     -crate::task::ENOMEM
@@ -387,7 +391,7 @@ pub fn ipc_connect(name_ptr: *const u8, name_len: usize) -> i64 {
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let _g = RawSpin::lock(&IPC_LOCK);
     match port_idx_by_name_locked(name) {
-        Some(i) => unsafe { PORTS[i].id as i64 },
+        Some(i) => port_ref(i).id as i64,
         None => -crate::task::ESRCH,
     }
 }
@@ -406,13 +410,13 @@ pub fn ipc_send(port_id: u64, buf: *const u8, len: usize, msg_type: u32) -> i64 
                 Some(i) => i,
                 None => return -crate::task::ESRCH,
             };
-            let port = unsafe { &mut PORTS[idx] };
+            let port = port_ref(idx);
             if port.count < PORT_SLOTS {
                 let page = match alloc_page() {
                     Some(p) => p,
                     None => return -crate::task::ENOMEM,
                 };
-                let hdr = unsafe { &mut *(page as *mut MsgHeader) };
+                let hdr = msg_hdr_mut(page);
                 hdr.src_pid = src;
                 hdr.msg_type = msg_type;
                 hdr.len = len as u32;
@@ -456,7 +460,7 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
                 Some(i) => i,
                 None => return -crate::task::ESRCH,
             };
-            let port = unsafe { &mut PORTS[idx] };
+            let port = port_ref(idx);
             if port.count > 0 {
                 let i2 = port.head;
                 let p = port.slots[i2];
@@ -476,7 +480,7 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
         }
     };
 
-    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let hdr = msg_hdr_ref(page);
     let len = hdr.len as usize;
     let out_len = core::cmp::min(len, max_len);
     if out_len > 0 && !buf.is_null() {
@@ -513,7 +517,7 @@ fn ipc_peek_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
             Some(i) => i,
             None => return (-crate::task::ESRCH, 0),
         };
-        let port = unsafe { &mut PORTS[idx] };
+        let port = port_ref(idx);
         if port.count == 0 { return (0, 0); }
         let i2 = port.head;
         let pg = port.slots[i2];
@@ -524,7 +528,7 @@ fn ipc_peek_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
         pg
     };
 
-    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let hdr = msg_hdr_ref(page);
     let len = hdr.len as usize;
     let reply_id = hdr.reply_id;
     let out_len = core::cmp::min(len, max_len);
@@ -576,7 +580,7 @@ fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
                 Some(i) => i,
                 None => return (-crate::task::ESRCH, 0),
             };
-            let port = unsafe { &mut PORTS[idx] };
+            let port = port_ref(idx);
             if port.count > 0 {
                 let i2 = port.head;
                 let p = port.slots[i2];
@@ -596,7 +600,7 @@ fn ipc_recv_ex_impl(port_id: u64, buf: *mut u8, max_len: usize, kernel_buf: bool
         }
     };
 
-    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let hdr = msg_hdr_ref(page);
     let len = hdr.len as usize;
     let reply_id = hdr.reply_id;
     let out_len = core::cmp::min(len, max_len);
@@ -622,7 +626,7 @@ pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
             Some(i) => i,
             None => return -crate::task::ESRCH,
         };
-        let port = unsafe { &mut PORTS[idx] };
+        let port = port_ref(idx);
         if port.count == 0 { return 0; }
         let i2 = port.head;
         let pg = port.slots[i2];
@@ -634,7 +638,7 @@ pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
         pg
     };
 
-    let hdr = unsafe { &*(page as *const MsgHeader) };
+    let hdr = msg_hdr_ref(page);
     let len = hdr.len as usize;
     let out_len = core::cmp::min(len, max_len);
     if out_len > 0 && !buf.is_null() {
@@ -653,22 +657,21 @@ pub fn ipc_peek(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
 /// Destroy a port and free any queued messages.
 pub fn ipc_close(port_id: u64) -> i64 {
     let _g = RawSpin::lock(&IPC_LOCK);
-    unsafe {
-        for i in 0..MAX_PORTS {
-            if PORTS[i].used && PORTS[i].id == port_id {
-                for j in 0..PORTS[i].count {
-                    let idx = (PORTS[i].head + j) % PORT_SLOTS;
-                    if PORTS[i].slots[idx] != 0 {
-                        free_page(PORTS[i].slots[idx]);
-                        PORTS[i].slots[idx] = 0;
-                    }
+    for i in 0..MAX_PORTS {
+        let p = port_ref(i);
+        if p.used && p.id == port_id {
+            for j in 0..p.count {
+                let idx = (p.head + j) % PORT_SLOTS;
+                if p.slots[idx] != 0 {
+                    free_page(p.slots[idx]);
+                    p.slots[idx] = 0;
                 }
-                // Wake any blocked parties so they can observe ESRCH/retry.
-                crate::task::futex_wake(&raw const PORTS[i].wake_recv as *const u32, u32::MAX);
-                crate::task::futex_wake(&raw const PORTS[i].wake_send as *const u32, u32::MAX);
-                PORTS[i] = Port::empty();
-                return 0;
             }
+            // Wake any blocked parties so they can observe ESRCH/retry.
+            crate::task::futex_wake(&raw const p.wake_recv as *const u32, u32::MAX);
+            crate::task::futex_wake(&raw const p.wake_send as *const u32, u32::MAX);
+            *p = Port::empty();
+            return 0;
         }
     }
     -crate::task::ESRCH
@@ -694,10 +697,7 @@ pub fn shm_setup(partner_id: u64, _vaddr: u64) -> i64 {
 
 pub fn shm_notify(_partner_id: u64) -> i64 { 0 }
 pub fn shm_wait(_timeout_ms: u64) -> i64 { 0 }
-pub fn shm_teardown(_partner_id: u64) -> i64 { 0 }
-
-// Service registration for kernel services.
-/// Register a kernel service under a well-known name. Returns 0 on success.
+pub fn shm_teardown(_partner_id: u64 Register a kernel service under a well-known name. Returns 0 on success.
 pub fn register_service(name: &[u8]) -> i64 {
     ipc_create(name.as_ptr(), name.len())
 }

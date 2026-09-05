@@ -22,6 +22,63 @@ fn outb(port: u16, val: u8) {
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags)); }
 }
 
+fn cpu_pause() {
+    unsafe { core::arch::asm!("pause", options(nostack, nomem)); }
+}
+
+struct KbState {
+    shift: bool,
+    capslock: bool,
+    ctrl: bool,
+    extended: bool,
+    break_pending: bool,
+}
+
+static mut KB_STATE: KbState = KbState {
+    shift: false,
+    capslock: false,
+    ctrl: false,
+    extended: false,
+    break_pending: false,
+};
+
+fn kb_state() -> &'static mut KbState {
+    unsafe { &mut KB_STATE }
+}
+
+fn ring_push(c: u8) {
+    unsafe {
+        let next = (RING_HEAD + 1) % BUFFER_SIZE;
+        if next != RING_TAIL {
+            RING_BUF[RING_HEAD] = c;
+            RING_HEAD = next;
+        } else {
+            RING_TAIL = (RING_TAIL + 1) % BUFFER_SIZE;
+            RING_BUF[RING_HEAD] = c;
+            RING_HEAD = next;
+        }
+    }
+}
+
+fn ring_pop() -> Option<u8> {
+    unsafe {
+        if RING_HEAD == RING_TAIL {
+            None
+        } else {
+            let c = RING_BUF[RING_TAIL];
+            RING_TAIL = (RING_TAIL + 1) % BUFFER_SIZE;
+            Some(c)
+        }
+    }
+}
+
+fn ring_reset() {
+    unsafe {
+        RING_HEAD = 0;
+        RING_TAIL = 0;
+    }
+}
+
 // Simple US keyboard layout: scancode set 1
 // Scancode set 1 tables — exactly 128 entries each (indices 0x00-0x7F)
 static SCANCODE_MAP: [u8; 128] = [
@@ -75,18 +132,7 @@ static SCANCODE_SHIFT_MAP: [u8; 128] = [
 ];
 
 pub fn push_char(c: u8) {
-    unsafe {
-        let next = (RING_HEAD + 1) % BUFFER_SIZE;
-        if next != RING_TAIL {
-            RING_BUF[RING_HEAD] = c;
-            RING_HEAD = next;
-        } else {
-            // Buffer full: overwrite oldest
-            RING_TAIL = (RING_TAIL + 1) % BUFFER_SIZE;
-            RING_BUF[RING_HEAD] = c;
-            RING_HEAD = next;
-        }
-    }
+    ring_push(c);
     KEY_COUNT.fetch_add(1, Ordering::SeqCst);
     // Also push to TTY device for /dev/tty, /dev/console
     crate::tty::push_key(c);
@@ -104,16 +150,9 @@ fn push_seq(bytes: &[u8]) {
 }
 
 pub fn pop_char() -> Option<u8> {
-    unsafe {
-        if RING_HEAD == RING_TAIL {
-            None
-        } else {
-            let c = RING_BUF[RING_TAIL];
-            RING_TAIL = (RING_TAIL + 1) % BUFFER_SIZE;
-            KEY_COUNT.fetch_sub(1, Ordering::SeqCst);
-            Some(c)
-        }
-    }
+    let c = ring_pop()?;
+    KEY_COUNT.fetch_sub(1, Ordering::SeqCst);
+    Some(c)
 }
 
 pub fn read_char() -> u8 {
@@ -183,15 +222,15 @@ const E0_PGDN: u16 = 0x51;
 fn key_char(sc: u16) -> u8 {
     let idx = sc as usize;
     if idx >= 128 { return 0; }
-    let shifted = unsafe { SHIFT };
+    let s = kb_state();
+    let shifted = s.shift;
     let base = if shifted {
         SCANCODE_SHIFT_MAP[idx]
     } else {
         SCANCODE_MAP[idx]
     };
     // Apply Caps Lock: toggle case on letter keys (does not affect digits/symbols).
-    let caps = unsafe { CAPSLOCK };
-    if caps {
+    if s.capslock {
         return base.to_ascii_uppercase();
     }
     base
@@ -228,16 +267,16 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
         // 0xF0 prefix (scancode set 2 break). If pending, the next byte is the
         // release code — ignore it but reset our modifier state for it.
         if sc == 0xF0 {
-            unsafe { BREAK_PENDING = true; }
+            kb_state().break_pending = true;
             crate::pic::send_eoi(1);
             return;
         }
-        if unsafe { BREAK_PENDING } {
-            unsafe { BREAK_PENDING = false; }
+        if kb_state().break_pending {
+            kb_state().break_pending = false;
             // Mark the (already released) key's modifier bit cleared.
             match sc & 0x7F {
-                0x2A | 0x36 => unsafe { SHIFT = false; },
-                0x1D => unsafe { CTRL = false; },
+                0x2A | 0x36 => kb_state().shift = false,
+                0x1D => kb_state().ctrl = false,
                 _ => {}
             }
             crate::pic::send_eoi(1);
@@ -249,13 +288,13 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
 
         // Track the 0xE0 prefix (extended key) first.
         if sc == 0xE0 {
-            unsafe { EXTENDED = true; }
+            kb_state().extended = true;
             crate::pic::send_eoi(1);
             return;
         }
 
-        if unsafe { EXTENDED } {
-            unsafe { EXTENDED = false; }
+        if kb_state().extended {
+            kb_state().extended = false;
             handle_extended(sc);
             crate::pic::send_eoi(1);
             return;
@@ -263,8 +302,8 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
 
         // Update modifier state on both press and release.
         match make {
-            0x2A | 0x36 => unsafe { SHIFT = !released; }, // Left/Right Shift
-            0x1D => unsafe { CTRL = !released; },          // Ctrl
+            0x2A | 0x36 => kb_state().shift = !released, // Left/Right Shift
+            0x1D => kb_state().ctrl = !released,          // Ctrl
             0x38 => { /* Alt — no layout impact here */ }
             _ => {}
         }
@@ -276,7 +315,8 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
 
         // Caps Lock: toggle on press and consume.
         if make == 0x3A {
-            unsafe { CAPSLOCK = !CAPSLOCK; }
+            let s = kb_state();
+            s.capslock = !s.capslock;
             crate::pic::send_eoi(1);
             return;
         }
@@ -285,7 +325,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: x86_64::structu
             // Ctrl+letter → control character (e.g. Ctrl+C = 0x03). The TTY
             // uses ISIG to turn ^C into SIGINT; raw control codes still get
             // passed through so non-canonical readers can see them.
-            let ctrl = unsafe { CTRL };
+            let ctrl = kb_state().ctrl;
             if ctrl {
                 let ch = key_char(make as u16);
                 if ch.is_ascii_alphabetic() {
@@ -307,69 +347,66 @@ pub fn init() {
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         crate::serial::write_str("KBD: init\n");
     }
-    unsafe {
-        // Wait for input buffer to be empty
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        // Disable keyboard (command 0xAD)
-        outb(KEYBOARD_STATUS, 0xAD);
-        // Flush output buffer
-        while inb(KEYBOARD_STATUS) & 0x01 != 0 {
-            let _ = inb(KEYBOARD_DATA);
-        }
-        // Set command byte: enable IRQ1 (bit 0), translation (bit 6)
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        outb(KEYBOARD_STATUS, 0x20); // Read command byte
-        while inb(KEYBOARD_STATUS) & 0x01 == 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        let mut cmd = inb(KEYBOARD_DATA);
-        cmd |= 0x01; // Enable IRQ1
-        cmd |= 0x40; // Translation
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        outb(KEYBOARD_STATUS, 0x60); // Write command byte
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        outb(KEYBOARD_DATA, cmd);
-        // Enable keyboard (command 0xAE)
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        outb(KEYBOARD_STATUS, 0xAE);
-        // Reset keyboard (command 0xFF)
-        while inb(KEYBOARD_STATUS) & 0x02 != 0 {
-            core::arch::asm!("pause", options(nostack, nomem));
-        }
-        outb(KEYBOARD_DATA, 0xFF);
-        // Wait for ACK (0xFA) and BAT completion (0xAA)
-        loop {
-            while inb(KEYBOARD_STATUS) & 0x01 == 0 {
-                core::arch::asm!("pause", options(nostack, nomem));
-            }
-            let resp = inb(KEYBOARD_DATA);
-            if resp == 0xFA { break; } // ACK
-        }
-        loop {
-            while inb(KEYBOARD_STATUS) & 0x01 == 0 {
-                core::arch::asm!("pause", options(nostack, nomem));
-            }
-            let resp = inb(KEYBOARD_DATA);
-            if resp == 0xAA { break; } // BAT success
-        }
-        // Flush any remaining
-        while inb(KEYBOARD_STATUS) & 0x01 != 0 {
-            let _ = inb(KEYBOARD_DATA);
-        }
-
-        RING_HEAD = 0;
-        RING_TAIL = 0;
+    // Wait for input buffer to be empty
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
     }
+    // Disable keyboard (command 0xAD)
+    outb(KEYBOARD_STATUS, 0xAD);
+    // Flush output buffer
+    while inb(KEYBOARD_STATUS) & 0x01 != 0 {
+        let _ = inb(KEYBOARD_DATA);
+    }
+    // Set command byte: enable IRQ1 (bit 0), translation (bit 6)
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
+    }
+    outb(KEYBOARD_STATUS, 0x20); // Read command byte
+    while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+        cpu_pause();
+    }
+    let mut cmd = inb(KEYBOARD_DATA);
+    cmd |= 0x01; // Enable IRQ1
+    cmd |= 0x40; // Translation
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
+    }
+    outb(KEYBOARD_STATUS, 0x60); // Write command byte
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
+    }
+    outb(KEYBOARD_DATA, cmd);
+    // Enable keyboard (command 0xAE)
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
+    }
+    outb(KEYBOARD_STATUS, 0xAE);
+    // Reset keyboard (command 0xFF)
+    while inb(KEYBOARD_STATUS) & 0x02 != 0 {
+        cpu_pause();
+    }
+    outb(KEYBOARD_DATA, 0xFF);
+    // Wait for ACK (0xFA) and BAT completion (0xAA)
+    loop {
+        while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+            cpu_pause();
+        }
+        let resp = inb(KEYBOARD_DATA);
+        if resp == 0xFA { break; } // ACK
+    }
+    loop {
+        while inb(KEYBOARD_STATUS) & 0x01 == 0 {
+            cpu_pause();
+        }
+        let resp = inb(KEYBOARD_DATA);
+        if resp == 0xAA { break; } // BAT success
+    }
+    // Flush any remaining
+    while inb(KEYBOARD_STATUS) & 0x01 != 0 {
+        let _ = inb(KEYBOARD_DATA);
+    }
+
+    ring_reset();
     KEY_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         crate::serial::write_str("KBD: OK\n");
