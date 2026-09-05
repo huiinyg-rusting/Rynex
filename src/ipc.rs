@@ -697,7 +697,9 @@ pub fn shm_setup(partner_id: u64, _vaddr: u64) -> i64 {
 
 pub fn shm_notify(_partner_id: u64) -> i64 { 0 }
 pub fn shm_wait(_timeout_ms: u64) -> i64 { 0 }
-pub fn shm_teardown(_partner_id: u64 Register a kernel service under a well-known name. Returns 0 on success.
+pub fn shm_teardown(_partner_id: u64) -> i64 { 0 }
+
+// Register a kernel service under a well-known name. Returns 0 on success.
 pub fn register_service(name: &[u8]) -> i64 {
     ipc_create(name.as_ptr(), name.len())
 }
