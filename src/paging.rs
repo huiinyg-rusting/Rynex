@@ -66,10 +66,17 @@ fn refc_idx(phys: u64) -> usize {
     (phys >> 12) as usize
 }
 
+// Centralized accessors for the static-mut COW refcount array (bug 86). Callers
+// pass a valid physical page number; reads/writes are scalar so no aliasing risk.
+#[inline(always)]
+fn refc_slot(i: usize) -> &'static mut u8 {
+    unsafe { &mut PAGE_REFC[i] }
+}
+
 fn refc_get(phys: u64) -> u8 {
     let i = refc_idx(phys);
     if i < MAX_REFC_PAGES {
-        unsafe { PAGE_REFC[i] }
+        *refc_slot(i)
     } else {
         0
     }
@@ -78,19 +85,17 @@ fn refc_get(phys: u64) -> u8 {
 fn refc_inc(phys: u64) {
     let i = refc_idx(phys);
     if i < MAX_REFC_PAGES {
-        unsafe {
-            PAGE_REFC[i] = PAGE_REFC[i].saturating_add(1);
-        }
+        let s = refc_slot(i);
+        *s = s.saturating_add(1);
     }
 }
 
 fn refc_dec(phys: u64) {
     let i = refc_idx(phys);
     if i < MAX_REFC_PAGES {
-        unsafe {
-            if PAGE_REFC[i] > 0 {
-                PAGE_REFC[i] -= 1;
-            }
+        let s = refc_slot(i);
+        if *s > 0 {
+            *s -= 1;
         }
     }
 }
@@ -102,7 +107,7 @@ fn refc_dec(phys: u64) {
 pub fn refc_of(phys: u64) -> u8 {
     let i = refc_idx(phys);
     if i < MAX_REFC_PAGES {
-        unsafe { PAGE_REFC[i] }
+        *refc_slot(i)
     } else {
         0
     }
