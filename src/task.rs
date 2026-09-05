@@ -120,14 +120,11 @@ pub fn proc_entry(idx: usize) -> Option<ProcEntry> {
 pub fn set_current_comm(name: &[u8]) {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
-    let idx = task_idx(id);
     let len = core::cmp::min(name.len(), 15);
-    unsafe {
-        for i in 0..len {
-            TASKS[idx].comm[i] = name[i];
-        }
-        TASKS[idx].comm[len] = 0;
+    for i in 0..len {
+        task_mut(id).comm[i] = name[i];
     }
+    task_mut(id).comm[len] = 0;
 }
 
 pub const KERNEL_CODE_SELECTOR: u64 = 0x08;
@@ -540,13 +537,13 @@ pub fn task_kernel_stack_by_id(id: u64) -> u64 {
 pub fn current_task_regs_rip() -> u64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].regs.rip }
+    task_ref(id).regs.rip
 }
 
 pub fn current_task_regs_rsp() -> u64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].regs.rsp }
+    task_ref(id).regs.rsp
 }
 
 fn task_idx(id: u64) -> usize {
@@ -617,12 +614,12 @@ fn free_pid(pid: u64) {
 pub fn current_task() -> Option<&'static mut Task> {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return None; }
-    unsafe { Some(&mut TASKS[task_idx(id)]) }
+    Some(task_mut(id))
 }
 
 pub fn task_by_id(id: u64) -> Option<&'static mut Task> {
     if id == 0 { return None; }
-    unsafe { Some(&mut TASKS[task_idx(id)]) }
+    Some(task_mut(id))
 }
 
 // ── Runqueue operations ──────────────────────────────────────────
@@ -918,7 +915,7 @@ pub fn create_user_task_on_cpu(entry: u64, pml4: u64, user_stack_top: u64, nice:
         core::ptr::write_bytes(tls_phys_ptr.add(0x40), 0, 4096 - 0x40);
     }
 
-    let task = unsafe { &mut TASKS[task_idx(tid)] };
+    let task = task_mut(tid);
     task.id = tid;
     task.tgid = tid;
     task.state = TaskState::Ready;
@@ -1065,7 +1062,7 @@ pub fn ap_begin_scheduling(apic_id: u32) -> ! {
         };
         let kernel_stack = alloc_stack(KERNEL_STACK_PAGES)
             .expect("AP idle task stack");
-        let task = unsafe { &mut TASKS[task_idx(tid)] };
+let task = task_mut(tid);
         task.id = tid;
         task.tgid = tid;
         task.state = TaskState::Running;
@@ -1252,15 +1249,14 @@ fn schedule_inner(force: bool) {
 
     // Enqueue current task (if still active) before switching
     if current != 0 {
-        let cur_idx = task_idx(current);
-        let state = unsafe { TASKS[cur_idx].state };
+        let state = task_ref(current).state;
         if state == TaskState::Running {
             // Preempted: mark Ready and requeue
-            unsafe { TASKS[cur_idx].state = TaskState::Ready; }
-            let prio = unsafe { TASKS[cur_idx].prio };
+            task_mut(current).state = TaskState::Ready;
+            let prio = task_ref(current).prio;
             { enqueue_task(current, prio); }
         } else if state == TaskState::Ready {
-            let prio = unsafe { TASKS[cur_idx].prio };
+            let prio = task_ref(current).prio;
             { enqueue_task(current, prio); }
         }
     }
@@ -1275,7 +1271,7 @@ fn schedule_inner(force: bool) {
         crate::klog::end();
     }
 
-    unsafe { crate::gdt::set_tss_rsp0(TASKS[new_idx].kernel_stack); }
+    crate::gdt::set_tss_rsp0(task_ref(next_id).kernel_stack);
 
     let old = cur_task().swap(next_id, Ordering::SeqCst);
 
@@ -1335,16 +1331,13 @@ pub fn yield_now() {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
-    unsafe {
-        let idx = task_idx(id);
-        if TASKS[idx].state == TaskState::Running {
-            TASKS[idx].state = TaskState::Ready;
-            // NOTE: do NOT reset the time slice here. schedule() declines to
-            // switch inside a syscall (in_syscall()==true), so a spin-yield
-            // loop would otherwise keep refreshing its slice and monopolize the
-            // CPU forever (observed in the context_switch_storm stress test).
-            // Letting the slice expire lets the timer preempt normally.
-        }
+    if task_ref(id).state == TaskState::Running {
+        task_mut(id).state = TaskState::Ready;
+        // NOTE: do NOT reset the time slice here. schedule() declines to
+        // switch inside a syscall (in_syscall()==true), so a spin-yield
+        // loop would otherwise keep refreshing its slice and monopolize the
+        // CPU forever (observed in the context_switch_storm stress test).
+        // Letting the slice expire lets the timer preempt normally.
     }
 
     schedule();
@@ -1354,12 +1347,9 @@ pub fn yield_now_force() {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
-    unsafe {
-        let idx = task_idx(id);
-        if TASKS[idx].state == TaskState::Running {
-            TASKS[idx].state = TaskState::Ready;
-            TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
-        }
+    if task_ref(id).state == TaskState::Running {
+        task_mut(id).state = TaskState::Ready;
+        task_mut(id).time_slice = initial_time_slice(task_ref(id).prio);
     }
 
     force_schedule();
@@ -1369,19 +1359,18 @@ pub fn exit_task(code: i32) {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
-    unsafe {
-        let idx = task_idx(id);
-        TASKS[idx].state = TaskState::Zombie;
-        TASKS[idx].exit_code = code;
+    {
+        task_mut(id).state = TaskState::Zombie;
+        task_mut(id).exit_code = code;
 
         // CLONE_CHILD_CLEARTID: clear the TID in the child's address
         // space so that futex-based thread exit notification works. Only
         // write if it is still a valid user mapping — an orphan/cloned task
         // may hold a stale child_tidptr whose VA was unmapped, and writing
         // to it would fault (bug 31).
-        let child_tidptr = TASKS[idx].child_tidptr;
+        let child_tidptr = task_ref(id).child_tidptr;
         if child_tidptr != 0 && is_user_tidptr_valid(child_tidptr) {
-            core::ptr::write_volatile(child_tidptr as *mut u64, 0u64);
+            unsafe { core::ptr::write_volatile(child_tidptr as *mut u64, 0u64); }
             // Wake any futex waiters on this address (e.g., parent joining via futex).
             // Use max_wake=1 to wake one waiter (the parent).
             futex_wake(child_tidptr as *const u32, 1);
@@ -1389,14 +1378,13 @@ pub fn exit_task(code: i32) {
 
         // Parent (or any task waiting on this PID) will free stacks via waitpid
         // Wake parent if it's blocked waiting for this child
-        if let Some(parent_id) = TASKS[idx].parent {
-            let pidx = task_idx(parent_id);
-            if TASKS[pidx].state == TaskState::Blocked
-                && (TASKS[pidx].blocked_on == id || TASKS[pidx].blocked_on == u64::MAX)
+        if let Some(parent_id) = task_ref(id).parent {
+            if task_ref(parent_id).state == TaskState::Blocked
+                && (task_ref(parent_id).blocked_on == id || task_ref(parent_id).blocked_on == u64::MAX)
             {
-                TASKS[pidx].state = TaskState::Ready;
-                TASKS[pidx].blocked_on = 0;
-                enqueue_task(parent_id, TASKS[pidx].prio);
+                task_mut(parent_id).state = TaskState::Ready;
+                task_mut(parent_id).blocked_on = 0;
+                enqueue_task(parent_id, task_ref(parent_id).prio);
             }
         }
 
@@ -2849,8 +2837,7 @@ fn sys_phys_map(phys: u64, size: u64) -> i64 {
         return -EINVAL;
     }
 let size = ((size + 0xFFF) & !0xFFF) as u64;
-    let idx = { task_idx(id) };
-    let pml4 = unsafe { TASKS[idx].pml4 };
+    let pml4 = task_ref(id).pml4;
 
     // Pick a low user address range for driver mappings, clear of the ELF
     // image (0x400000-ish), heap and stack. 0x50000000 is far above brk and
@@ -2921,8 +2908,6 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     let pages = if _pages == 0 { 1 } else { _pages.min(8) };
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    let idx = { task_idx(id) };
-
     // Allocate physically contiguous pages from the buddy allocator. The
     // buddy allocator hands out power-of-two blocks, so round the page count
     // up to the next power of two (min 1 page).
@@ -2939,7 +2924,7 @@ fn sys_dma_alloc(_pages: usize) -> i64 {
     // Map into a fresh low user address (below the mmap region).
     let base = 0x5000_0000u64;
     let limit = 0x6000_0000u64;
-    let pml4 = unsafe { TASKS[idx].pml4 };
+    let pml4 = task_ref(id).pml4;
     let mut chosen = 0u64;
     {
         let mut candidate = base;
@@ -3000,8 +2985,7 @@ fn sys_dma_free(packed: u64) -> i64 {
     }
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
-    let idx = { task_idx(id) };
-    let pml4 = unsafe { TASKS[idx].pml4 };
+    let pml4 = task_ref(id).pml4;
 
     // Find VMA to get the allocation size, then compute order.
     let mut order = 0usize;
