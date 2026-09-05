@@ -32,6 +32,34 @@ static mut FREED_BMP: [u64; FREED_BMP_WORDS] = [0; FREED_BMP_WORDS];
 const OWNED_ORDER_SENTINEL: u8 = 0xFF;
 static mut PAGE_OWNED_BY: [u8; MAX_REFC_PAGES] = [OWNED_ORDER_SENTINEL; MAX_REFC_PAGES];
 
+// Centralized accessors for the static-mut tracking arrays (bug 86). Scalar
+// load/store only, so holding the returned reference briefly is safe; the
+// caller is responsible for the usual BUDDY_LOCK discipline.
+#[inline(always)]
+fn owned_ref(i: usize) -> &'static mut u8 {
+    unsafe { &mut PAGE_OWNED_BY[i] }
+}
+#[inline(always)]
+fn audit_counter_ref() -> &'static mut u64 {
+    unsafe { &mut BUDDY_AUDIT_COUNTER }
+}
+#[inline(always)]
+fn audit_active_ref() -> &'static mut bool {
+    unsafe { &mut AUDIT_ACTIVE }
+}
+#[inline(always)]
+fn type_ref(i: usize) -> &'static mut u8 {
+    unsafe { &mut PAGE_TYPE[i] }
+}
+#[inline(always)]
+fn pte_refc_ref(i: usize) -> &'static mut u16 {
+    unsafe { &mut PTE_REFC[i] }
+}
+#[inline(always)]
+fn freed_word_ref(w: usize) -> &'static mut u64 {
+    unsafe { &mut FREED_BMP[w] }
+}
+
 #[inline(always)]
 fn freed_bit(addr: u64) -> Option<(usize, u64)> {
     let idx = phys_to_idx(addr) as usize;
@@ -41,8 +69,9 @@ fn freed_bit(addr: u64) -> Option<(usize, u64)> {
 
 fn track_freed_page(addr: u64) -> bool {
     match freed_bit(addr) {
-        Some((w, b)) => unsafe {
-            if FREED_BMP[w] & b != 0 {
+        Some((w, b)) => {
+            let word = freed_word_ref(w);
+            if *word & b != 0 {
                 // Double-free detected at allocator level
                 let caller = core::intrinsics::return_address() as u64;
                 crate::serial::write_str("\n=== ALLOCATOR DOUBLE-FREE ===\n");
@@ -53,7 +82,7 @@ fn track_freed_page(addr: u64) -> bool {
                 crate::serial::write_str("\n");
                 return true;
             }
-            FREED_BMP[w] |= b;
+            *word |= b;
             false
         },
         None => false,
@@ -62,7 +91,7 @@ fn track_freed_page(addr: u64) -> bool {
 
 fn untrack_freed_page(addr: u64) {
     if let Some((w, b)) = freed_bit(addr) {
-        unsafe { FREED_BMP[w] &= !b; }
+        *freed_word_ref(w) &= !b;
     }
 }
 
@@ -117,7 +146,8 @@ static mut PTE_REFC: [u16; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
 pub fn pte_refc_inc(addr: u64) {
     let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
-        unsafe { PTE_REFC[idx] = PTE_REFC[idx].saturating_add(1); }
+        let s = pte_refc_ref(idx);
+        *s = s.saturating_add(1);
     }
 }
 
@@ -125,24 +155,23 @@ pub fn pte_refc_inc(addr: u64) {
 pub fn pte_refc_dec(addr: u64) -> bool {
     let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
-        unsafe {
-            if PTE_REFC[idx] > 0 { PTE_REFC[idx] -= 1; }
-            PTE_REFC[idx] == 0
-        }
+        let s = pte_refc_ref(idx);
+        if *s > 0 { *s -= 1; }
+        *s == 0
     } else { true }
 }
 
 #[inline(always)]
 pub fn pte_refc_get(addr: u64) -> u16 {
     let idx = phys_to_idx(addr) as usize;
-    if idx < MAX_REFC_PAGES { unsafe { PTE_REFC[idx] } } else { 0 }
+    if idx < MAX_REFC_PAGES { *pte_refc_ref(idx) } else { 0 }
 }
 
 #[inline(always)]
 pub fn page_type_get(addr: u64) -> u8 {
     let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
-        unsafe { PAGE_TYPE[idx] }
+        *type_ref(idx)
     } else {
         PAGE_TYPE_FREE
     }
@@ -151,7 +180,7 @@ pub fn page_type_get(addr: u64) -> u8 {
 pub fn page_type_set(addr: u64, t: u8) {
     let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
-        unsafe { PAGE_TYPE[idx] = t; }
+        *type_ref(idx) = t;
     }
 }
 
@@ -185,54 +214,74 @@ static mut QUARANTINE_HEAD: usize = 0;
 static mut QUARANTINE_COUNT: usize = 0;
 static mut QUARANTINE_FULL_COUNT: u64 = 0;
 
+// Accessors for the quarantine static-mut state (bug 86).
+#[inline(always)]
+fn q_slot_ref(i: usize) -> &'static mut u64 {
+    unsafe { &mut QUARANTINE[i % QUARANTINE_MAX_CAP] }
+}
+#[inline(always)]
+fn q_cap_ref() -> &'static mut usize {
+    unsafe { &mut QUARANTINE_CAP }
+}
+#[inline(always)]
+fn q_head_ref() -> &'static mut usize {
+    unsafe { &mut QUARANTINE_HEAD }
+}
+#[inline(always)]
+fn q_count_ref() -> &'static mut usize {
+    unsafe { &mut QUARANTINE_COUNT }
+}
+#[inline(always)]
+fn q_full_ref() -> &'static mut u64 {
+    unsafe { &mut QUARANTINE_FULL_COUNT }
+}
+
 /// Returns true if the page was queued in the quarantine; false if the
 /// quarantine is full. When false, the caller must return the page to the
 /// buddy allocator (free_one) instead of dropping it, otherwise the page is
 /// leaked (it is neither in the quarantine nor reusable).
 fn q_push(addr: u64) -> bool {
-    unsafe {
-        if QUARANTINE_COUNT < QUARANTINE_CAP {
-            QUARANTINE[QUARANTINE_HEAD] = addr;
-            QUARANTINE_HEAD = (QUARANTINE_HEAD + 1) % QUARANTINE_CAP;
-            QUARANTINE_COUNT += 1;
-            true
-        } else {
-            // 隔离区满：记录，并让调用方把该页归还 buddy（避免静默泄漏物理页）。
-            QUARANTINE_FULL_COUNT += 1;
-            if QUARANTINE_FULL_COUNT <= 10 || QUARANTINE_FULL_COUNT % 100 == 0 {
-                q_log_full();
-            }
-            // 动态扩容（仅前几次，且未达上限）
-            if QUARANTINE_CAP < QUARANTINE_MAX_CAP && QUARANTINE_FULL_COUNT <= 5 {
-                QUARANTINE_CAP = (QUARANTINE_CAP * 2).min(QUARANTINE_MAX_CAP);
-                crate::serial::write_str("QUARANTINE: expanded to ");
-                crate::serial::write_dec(QUARANTINE_CAP as u64);
-                crate::serial::write_str("\n");
-            }
-            false
+    if *q_count_ref() < *q_cap_ref() {
+        *q_slot_ref(*q_head_ref()) = addr;
+        let h = q_head_ref();
+        *h = (*h + 1) % *q_cap_ref();
+        *q_count_ref() += 1;
+        true
+    } else {
+        // 隔离区满：记录，并让调用方把该页归还 buddy（避免静默泄漏物理页）。
+        *q_full_ref() += 1;
+        if *q_full_ref() <= 10 || *q_full_ref() % 100 == 0 {
+            q_log_full();
         }
+        // 动态扩容（仅前几次，且未达上限）
+        if *q_cap_ref() < QUARANTINE_MAX_CAP && *q_full_ref() <= 5 {
+            let c = q_cap_ref();
+            *c = (*c * 2).min(QUARANTINE_MAX_CAP);
+            crate::serial::write_str("QUARANTINE: expanded to ");
+            crate::serial::write_dec(*q_cap_ref() as u64);
+            crate::serial::write_str("\n");
+        }
+        false
     }
 }
 
 fn q_pop() -> Option<u64> {
-    unsafe {
-        if QUARANTINE_COUNT == 0 { return None; }
-        let idx = (QUARANTINE_HEAD + QUARANTINE_MAX_CAP - QUARANTINE_COUNT) % QUARANTINE_MAX_CAP;
-        let addr = QUARANTINE[idx];
-        QUARANTINE_COUNT -= 1;
-        pte_refc_inc(addr);
-        Some(addr)
-    }
+    if *q_count_ref() == 0 { return None; }
+    let idx = (*q_head_ref() + QUARANTINE_MAX_CAP - *q_count_ref()) % QUARANTINE_MAX_CAP;
+    let addr = *q_slot_ref(idx);
+    *q_count_ref() -= 1;
+    pte_refc_inc(addr);
+    Some(addr)
 }
 
 fn q_log_full() {
     crate::serial::write_str("\n=== QUARANTINE FULL ===\n");
     crate::serial::write_str("count=");
-    crate::serial::write_dec(unsafe { QUARANTINE_COUNT as u64 });
+    crate::serial::write_dec(*q_count_ref() as u64);
     crate::serial::write_str(" capacity=");
-    crate::serial::write_dec(unsafe { QUARANTINE_CAP as u64 });
+    crate::serial::write_dec(*q_cap_ref() as u64);
     crate::serial::write_str(" full_count=");
-    crate::serial::write_dec(unsafe { QUARANTINE_FULL_COUNT as u64 });
+    crate::serial::write_dec(*q_full_ref() as u64);
     crate::serial::write_str(" cr3=0x");
     crate::serial::write_hex(crate::task::current_task_pml4());
     crate::serial::write_str(" task=");
@@ -421,26 +470,24 @@ impl BuddyAllocator {
     }
 
     fn maybe_audit(&mut self) {
-        unsafe {
-            BUDDY_AUDIT_COUNTER += 1;
-            if BUDDY_AUDIT_COUNTER % AUDIT_PERIOD == 0 {
-                let _ = self.audit_free_lists();
-            }
+        let c = audit_counter_ref();
+        *c += 1;
+        if *c % AUDIT_PERIOD == 0 {
+            let _ = self.audit_free_lists();
         }
     }
 
     fn audit_free_lists(&mut self) -> bool {
-        unsafe {
-            if AUDIT_ACTIVE {
+        {
+            let a = audit_active_ref();
+            if *a {
                 return true;
             }
-            AUDIT_ACTIVE = true;
+            *a = true;
         }
         // Clear the cross-order ownership bitmap
-        unsafe {
-            for i in 0..MAX_REFC_PAGES {
-                PAGE_OWNED_BY[i] = OWNED_ORDER_SENTINEL;
-            }
+        for i in 0..MAX_REFC_PAGES {
+            *owned_ref(i) = OWNED_ORDER_SENTINEL;
         }
         // Walk free lists, verify magic/order, and check cross-order overlap.
         for order in 0..=MAX_ORDER {
@@ -448,18 +495,18 @@ impl BuddyAllocator {
             while !curr.is_null() {
                 let block = unsafe { &*curr };
                 if block.magic != MAGIC || block.order != order as u32 {
-                    unsafe { AUDIT_ACTIVE = false; }
+                    *audit_active_ref() = false;
                     return false;
                 }
                 // Check every page spanned by this block for ownership conflict
                 let base_idx = phys_to_idx(curr as u64) as usize;
                 let span = 1usize << order;
                 if base_idx + span > MAX_REFC_PAGES {
-                    unsafe { AUDIT_ACTIVE = false; }
+                    *audit_active_ref() = false;
                     return false;
                 }
                 for p in base_idx..base_idx + span {
-                    let prev = unsafe { PAGE_OWNED_BY[p] };
+                    let prev = *owned_ref(p);
                     if prev != OWNED_ORDER_SENTINEL {
                         // Same page already in a different order's free list
                         crate::serial::write_str("\n=== FREE LIST OVERLAP ===\n");
@@ -472,15 +519,15 @@ impl BuddyAllocator {
                         crate::serial::write_str(" orderB=");
                         crate::serial::write_dec(order as u64);
                         crate::serial::write_str("\n");
-                        unsafe { AUDIT_ACTIVE = false; }
+                        *audit_active_ref() = false;
                         return false;
                     }
-                    unsafe { PAGE_OWNED_BY[p] = order as u8; }
+                    *owned_ref(p) = order as u8;
                 }
                 curr = block.next;
             }
         }
-        unsafe { AUDIT_ACTIVE = false; }
+        *audit_active_ref() = false;
         true
     }
 
