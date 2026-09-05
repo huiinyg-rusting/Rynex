@@ -4938,19 +4938,19 @@ fn sys_getuid() -> i64 {
 fn sys_getgid() -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].gid as i64 }
+    task_ref(id).gid as i64
 }
 
 fn sys_geteuid() -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].euid as i64 }
+    task_ref(id).euid as i64
 }
 
 fn sys_getegid() -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe { TASKS[task_idx(id)].egid as i64 }
+    task_ref(id).egid as i64
 }
 
 fn sys_getpid() -> i64 {
@@ -4961,11 +4961,9 @@ fn sys_getpid() -> i64 {
 fn sys_getppid() -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return 0; }
-    unsafe {
-        match TASKS[task_idx(id)].parent {
-            Some(pid) => pid as i64,
-            None => 0,
-        }
+    match task_ref(id).parent {
+        Some(pid) => pid as i64,
+        None => 0,
     }
 }
 
@@ -4974,10 +4972,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
         ARCH_SET_FS => {
             let id = cur_task().load(Ordering::SeqCst);
             if id == 0 { return -EINVAL; }
-            unsafe {
-                let idx = task_idx(id);
-                TASKS[idx].regs.fs_base = addr;
-            }
+            task_mut(id).regs.fs_base = addr;
             unsafe {
                 core::arch::asm!(
                     "mov ecx, 0xC0000100",
@@ -4993,12 +4988,9 @@ fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
         ARCH_GET_FS => {
             let id = cur_task().load(Ordering::SeqCst);
             if id == 0 { return -EINVAL; }
-            unsafe {
-                let idx = task_idx(id);
-                let val = TASKS[idx].regs.fs_base;
-                if addr != 0 {
-                    core::ptr::write_volatile(addr as *mut u64, val);
-                }
+            let val = task_ref(id).regs.fs_base;
+            if addr != 0 {
+                unsafe { core::ptr::write_volatile(addr as *mut u64, val); }
             }
             0
         }
@@ -5068,21 +5060,27 @@ fn sys_sleep(ticks: u64) -> i64 {
 
     let now = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
 
-    unsafe {
-        let idx = task_idx(id);
-        // Save user context from syscall entry globals (not task.regs which holds
-        // stale kernel context). This is the context to restore on wakeup.
-        TASKS[idx].saved_user_regs = Some(Registers {
-            rax: 0, rbx: 0, rcx: 0, rdx: 0,
-            rsi: 0, rdi: 0, rbp: 0, rsp: SYSCALL_USER_RSP,
-            r8: 0, r9: 0, r10: 0, r11: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
-            rip: SYSCALL_USER_RIP, rflags: SYSCALL_USER_RFLAGS,
-            cs: 0x23, ss: 0x1B, fs_base: SYSCALL_USER_FS_BASE,
-        });
-        TASKS[idx].wakeup_tick = now + ticks;
-        TASKS[idx].state = TaskState::Blocked;
-    }
+    let (ursp, urip, urfl, ufsb) = unsafe {
+        (
+            SYSCALL_USER_RSP,
+            SYSCALL_USER_RIP,
+            SYSCALL_USER_RFLAGS,
+            SYSCALL_USER_FS_BASE,
+        )
+    };
+
+    // Save user context from syscall entry globals (not task.regs which holds
+    // stale kernel context). This is the context to restore on wakeup.
+    task_mut(id).saved_user_regs = Some(Registers {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0,
+        rsi: 0, rdi: 0, rbp: 0, rsp: ursp,
+        r8: 0, r9: 0, r10: 0, r11: 0,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rip: urip, rflags: urfl,
+        cs: 0x23, ss: 0x1B, fs_base: ufsb,
+    });
+    task_mut(id).wakeup_tick = now + ticks;
+    task_mut(id).state = TaskState::Blocked;
 
     // Must force the switch: sys_sleep runs inside a syscall where in_syscall()
     // is true, so the plain schedule() would bail out immediately and we would
