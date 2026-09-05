@@ -93,11 +93,9 @@ pub fn set_tss_rsp0(rsp0: u64) {
     unsafe {
         crate::percpu::percpu(cpu as u32).tss.rsp[0] = rsp0;
         SYSCALL_STACK_TOPS[cpu as usize] = rsp0;
-    }
-    if cpu == 0 {
-        // Keep the legacy global in sync for any readers (diagnostics). The
-        // BSP also uses the shared TSS for its hardware interrupt stack.
-        unsafe {
+        if cpu == 0 {
+            // Keep the legacy global in sync for any readers (diagnostics). The
+            // BSP also uses the shared TSS for its hardware interrupt stack.
             TSS.rsp[0] = rsp0;
             CURRENT_SYSCALL_STACK_TOP = rsp0;
         }

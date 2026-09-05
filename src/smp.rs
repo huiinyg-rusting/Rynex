@@ -38,11 +38,11 @@ pub unsafe fn init_aps(ap_entry_fn: u64) {
     // Copy trampoline byte array to physical 0x7000 (via identity map at KERNEL_BASE + 0x7000)
     let trampoline_dst = TRAMPOLINE_VIRT as *mut u8;
     for i in 0..AP_TRAMPOLINE_LEN {
-        unsafe { core::ptr::write_volatile(trampoline_dst.add(i), AP_TRAMPOLINE[i]); }
+        core::ptr::write_volatile(trampoline_dst.add(i), AP_TRAMPOLINE[i]);
     }
     
     // Verify trampoline at physical 0x7000
-    let first_byte = unsafe { core::ptr::read_volatile(TRAMPOLINE_VIRT as *const u8) };
+    let first_byte = core::ptr::read_volatile(TRAMPOLINE_VIRT as *const u8);
     crate::serial::write_str("SMP: verify trampoline at 0x7000, byte0=0x");
     crate::serial::write_hex(first_byte as u64);
     crate::serial::write_str(" (expected 0xB0)\n");
@@ -73,7 +73,7 @@ pub unsafe fn init_aps(ap_entry_fn: u64) {
         crate::serial::write_hex(phys);
         crate::serial::write_str("\n");
         let slot = (KERNEL_BASE + TRAMPOLINE_PHYS + 0x208 + (apic_id as u64) * 8) as *mut u64;
-        unsafe { core::ptr::write_volatile(slot, phys); }
+        core::ptr::write_volatile(slot, phys);
     }
     
     for &apic_id in &cpus {
@@ -135,9 +135,9 @@ pub extern "C" fn ap_entry(apic_id: u32) -> ! {
 
     // EFER is a per-core MSR: (re)enable NXE and SCE on this AP so NX-set user
     // PTEs are not treated as reserved here (must match the BSP's EFER).
+    let mut efer_lo: u32 = 0;
+    let mut efer_hi: u32 = 0;
     unsafe {
-        let mut efer_lo: u32 = 0;
-        let mut efer_hi: u32 = 0;
         core::arch::asm!(
             "mov ecx, 0xC0000080",
             "rdmsr",
@@ -145,8 +145,10 @@ pub extern "C" fn ap_entry(apic_id: u32) -> ! {
             out("edx") efer_hi,
             options(nostack, preserves_flags)
         );
-        let efer = ((efer_hi as u64) << 32) | (efer_lo as u64);
-        let efer = efer | 0x800 | 0x1; // NXE (11) + SCE (0)
+    }
+    let efer = ((efer_hi as u64) << 32) | (efer_lo as u64);
+    let efer = efer | 0x800 | 0x1; // NXE (11) + SCE (0)
+    unsafe {
         core::arch::asm!(
             "mov ecx, 0xC0000080",
             "wrmsr",

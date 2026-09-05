@@ -101,20 +101,18 @@ pub struct ProcEntry {
 
 /// Return a snapshot of task slot `idx` for /proc/<pid> reporting.
 pub fn proc_entry(idx: usize) -> Option<ProcEntry> {
-    unsafe {
-        if idx >= MAX_TASKS { return None; }
-        let t = &TASKS[idx];
-        if t.id == 0 { return None; }
-        Some(ProcEntry {
-            id: t.id,
-            tgid: t.tgid,
-            ppid: t.parent,
-            state: t.state,
-            comm: t.comm,
-            pml4: t.pml4,
-            user_stack: t.user_stack,
-        })
-    }
+    if idx >= MAX_TASKS { return None; }
+    let t = task_ref(idx as u64);
+    if t.id == 0 { return None; }
+    Some(ProcEntry {
+        id: t.id,
+        tgid: t.tgid,
+        ppid: t.parent,
+        state: t.state,
+        comm: t.comm,
+        pml4: t.pml4,
+        user_stack: t.user_stack,
+    })
 }
 
 /// Set the running task's short command name (for /proc/<pid>/stat). Truncates
