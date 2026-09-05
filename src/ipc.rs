@@ -111,12 +111,7 @@ fn free_page(phys: u64) {
 // ── Port table lookups (IPC_LOCK must be held) ────────────────────
 
 fn port_idx_by_id_locked(id: u64) -> Option<usize> {
-    for i in 0..MAX_PORTS {
-        if port_ref(i).used && port_ref(i).id == id {
-            return Some(i);
-        }
-    }
-    None
+    (0..MAX_PORTS).find(|&i| port_ref(i).used && port_ref(i).id == id)
 }
 
 /// Exact-name lookup. IPC_LOCK must be held.
