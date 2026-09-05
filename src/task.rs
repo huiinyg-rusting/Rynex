@@ -2446,14 +2446,14 @@ fn sys_exit(status: i32) -> i64 {
     serial::write_str(" status=");
     serial::write_dec(status as u64);
     serial::write_str(" rip=0x");
-    serial::write_hex(unsafe { TASKS[task_idx(id)].regs.rip });
+    serial::write_hex(task_ref(id).regs.rip);
     serial::write_str(" rflags=0x");
-    serial::write_hex(unsafe { TASKS[task_idx(id)].regs.rflags });
+    serial::write_hex(task_ref(id).regs.rflags);
     serial::write_str("\n");
     exit_task(status);
     // If no other task to schedule, halt
     let id2 = cur_task().load(Ordering::SeqCst);
-    if id2 == 0 || unsafe { TASKS[task_idx(id2)].state } == TaskState::Zombie {
+    if id2 == 0 || task_ref(id2).state == TaskState::Zombie {
         serial::write_str("SYS_EXIT: no more tasks, halting\n");
         unsafe { core::arch::asm!("cli; hlt", options(noreturn)); }
     }
