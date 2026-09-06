@@ -8,6 +8,8 @@
 extern crate alloc;
 pub mod paging;
 mod vga;
+mod fb;
+mod bootmode;
 mod serial;
 mod klog;
 mod gdt;
@@ -30,6 +32,7 @@ mod keyboard;
 mod tty;
 mod services;
 mod devfs;
+mod firmware;
 mod drivers;
 
 use core::alloc::Layout;
@@ -61,6 +64,10 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     }
 
     serial::init();
+    // Parse the Multiboot2 info once: detect UEFI handoff, ACPI RSDP copies,
+    // and install the framebuffer console when GRUB provided one. Must happen
+    // before the banner below so the banner already goes to the fb.
+    bootmode::init(_info);
     // Console log level. DEBUG traces (SYS>, [RSM:], mmap VMA/MMAP/CTX, execve
     // markers) are *always* captured in the klog ring buffer (queryable via
     // klog::dump() on a fault); they are mirrored to the serial port only when
@@ -89,10 +96,18 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
         serial::write_str("IDT: OK\n");
     }
 
-    pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
-    pic::mask_all();
-    pic::unmask(0);
-    pic::unmask(1);
+    // UEFI machines have no legacy 8259 PIC (interrupt delivery goes through
+    // the local/IO APICs); remapping/masking non-existent PIC ports is a no-op
+    // at best and can misroute spurious-vector logic at worst. Keep the PIC
+    // code intact, just skip it on a UEFI handoff.
+    if bootmode::is_uefi() {
+        serial::write_str("UEFI handoff: skipping legacy 8259 PIC setup\n");
+    } else {
+        pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
+        pic::mask_all();
+        pic::unmask(0);
+        pic::unmask(1);
+    }
     vga::write_str("PIC: OK\n");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {
         serial::write_str("PIC: OK\n");
@@ -206,6 +221,96 @@ pit::init(100);
         );
     }
     paging::init();
+    // Framebuffer console can now be enabled: paging is up, so an LFB at a
+    // physical address beyond the 1 GiB boot identity map (e.g. ~0xFD000000
+    // on BIOS VBE) can be remapped into the kernel direct map and used as the
+    // display path.
+    bootmode::install_framebuffer();
+    if bootmode::has_framebuffer() {
+        // UTF-8 console sanity (fbcon): a CJK ideograph renders as '?' (no
+        // glyph) and box-drawing characters come from the built-in font. Read
+        // real framebuffer pixels back as serial evidence the console is live:
+        // the leading 'F' glyph (cell 0,0) has scanline 0xFE at y=1, so (3,1)
+        // is an on pixel (bright yellow, ~0x00FFAA00) and (7,1)/(0,0) are bg.
+        vga::set_color(0x0E, 0x00);
+        let (dfg, dbg, daddr) = crate::fb::debug_fb();
+        serial::write_str("FBstate-before: FG=0x");
+        serial::write_hex(dfg as u64);
+        serial::write_str(" BG=0x");
+        serial::write_hex(dbg as u64);
+        serial::write_str(" addr=0x");
+        serial::write_hex(daddr);
+        serial::write_str("\n");
+        vga::write_str("FBcon UTF-8: 你 ─┐│┘└ box\n");
+        let (dfg2, dbg2, daddr2) = crate::fb::debug_fb();
+        serial::write_str("FBstate-after: FG=0x");
+        serial::write_hex(dfg2 as u64);
+        serial::write_str(" BG=0x");
+        serial::write_hex(dbg2 as u64);
+        serial::write_str(" addr=0x");
+        serial::write_hex(daddr2);
+        serial::write_str("\n");
+        let px_fg = crate::fb::probe_pixel(3, 1);
+        let px_bg = crate::fb::probe_pixel(7, 1);
+        let px_bl = crate::fb::probe_pixel(0, 0);
+        serial::write_str("FBdemo: pixel(3,1)=0x");
+        serial::write_hex(px_fg as u64);
+        serial::write_str(" (expect bright-yellow on-dot), pixel(7,1)=0x");
+        serial::write_hex(px_bg as u64);
+        serial::write_str(", pixel(0,0)=0x");
+        serial::write_hex(px_bl as u64);
+        serial::write_str(" (expect bg)\n");
+        for ry in 0..2u32 {
+            serial::write_str("FBdiag row");
+            serial::write_dec(ry as u64);
+            serial::write_str(": ");
+            for cx in 0..8u32 {
+                serial::write_hex(crate::fb::probe_pixel(cx, ry) as u64);
+                serial::write_char(' ');
+            }
+            serial::write_str("\n");
+        }
+        serial::write_str("FBdiag mid: ");
+        serial::write_hex(crate::fb::probe_pixel(512, 384) as u64);
+        serial::write_str(" corner: ");
+        serial::write_hex(crate::fb::probe_pixel(1023, 767) as u64);
+        serial::write_str("\n");
+        let fb_base = crate::paging::KERNEL_BASE + 0xFD000000u64;
+        unsafe {
+            (fb_base as *mut u8).write_volatile(0xAB);
+        }
+        let rb = unsafe { (fb_base as *mut u8).read_volatile() };
+        serial::write_str("FBraw: wrote 0xAB at virt, read back 0x");
+        serial::write_hex(rb as u64);
+        serial::write_str("\n");
+        let mut v = fb_base;
+        let pml4 = crate::paging::KERNEL_PML4.load(core::sync::atomic::Ordering::Relaxed);
+        let idx = [
+            ((v >> 39) & 0x1FF) as usize,
+            ((v >> 30) & 0x1FF) as usize,
+            ((v >> 21) & 0x1FF) as usize,
+            ((v >> 12) & 0x1FF) as usize,
+        ];
+        let p4 = unsafe { &*((pml4 + (idx[0] as u64) * 8) as *const u64) };
+        serial::write_str("FBwalk pml4e=");
+        serial::write_hex(*p4);
+        let pdpt_p = (*p4 & crate::paging::PTE_ADDR_MASK) as *const u64;
+        let pdpe = unsafe { *pdpt_p.add(idx[1]) };
+        serial::write_str(" pdpte=");
+        serial::write_hex(pdpe);
+        let pd_p = (pdpe & crate::paging::PTE_ADDR_MASK) as *const u64;
+        let pde = unsafe { *pd_p.add(idx[2]) };
+        serial::write_str(" pde=");
+        serial::write_hex(pde);
+        let pt_p = (pde & crate::paging::PTE_ADDR_MASK) as *const u64;
+        let pte = unsafe { *pt_p.add(idx[3]) };
+        serial::write_str(" pte=");
+        serial::write_hex(pte);
+        serial::write_str("\n");
+        vga::set_color(0x0F, 0x00);
+    } else {
+        serial::write_str("FBdemo: framebuffer console not enabled (VGA text path)\n");
+    }
     // Resolve kernel .eh_frame_hdr for AT_SYSINFO_EHDR (auxv 33)
     // The symbol __eh_frame_hdr_start is exported by linker.ld
     extern "C" { static __eh_frame_hdr_start: u8; }

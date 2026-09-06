@@ -155,6 +155,10 @@ pub fn pop_char() -> Option<u8> {
     Some(c)
 }
 
+pub fn has_pending_input() -> bool {
+    KEY_COUNT.load(Ordering::SeqCst) > 0
+}
+
 pub fn read_char() -> u8 {
     loop {
         if let Some(c) = pop_char() {

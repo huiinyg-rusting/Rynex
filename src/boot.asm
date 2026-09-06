@@ -12,10 +12,21 @@ multiboot_header:
     .long ARCH
     .long HDR_LEN
     .long -(MAGIC + ARCH + HDR_LEN)
-    /* End tag */
+    /* Framebuffer tag (type 5): request a 1024x768x32 direct-colour display.
+       GRUB reads this and honours the gfxpayload path on BIOS (otherwise it
+       forces "text" and hands over only an EGA text tag). width/height/depth
+       being non-zero makes GRUB set gfxpayload="1024x768x32,1024x768,auto". */
     .balign 8
-    .long 0
-    .long 0
+    .word 5
+    .word 0
+    .long 20
+    .long 1024
+    .long 768
+    .long 32
+    /* End tag (type 0, size 8) */
+    .balign 8
+    .word 0
+    .word 0
     .long 8
 header_end:
 

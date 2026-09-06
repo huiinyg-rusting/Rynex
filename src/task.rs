@@ -40,6 +40,11 @@ pub const SIGCHLD: i32 = 17;
 pub const SIGSTOP: i32 = 19;
 pub const SIGTSTP: i32 = 20;
 
+// Sentinel used in Task.blocked_on while a task sleeps in rt_sigsuspend (it has
+// no futex address to park on). Deliberately not u64::MAX, which waitpid(pid)
+// uses to mean "any child". Signal delivery wakes such a task and clears it.
+pub const SIGSUSPEND_MAGIC: u64 = u64::MAX - 1;
+
 // A per-task signal action, stored in the Linux rt_sigaction layout field
 // subset the kernel needs: handler pointer + flags + mask + restorer.
 #[derive(Clone, Copy)]
@@ -337,6 +342,12 @@ pub struct Task {
     pub altstack_sp: u64,
     pub altstack_flags: u32,
     pub altstack_size: u64,
+
+    // For sys_poll: saved context when blocking in poll
+    pub poll_fds: u64,
+    pub poll_nfds: u64,
+    pub poll_timeout: i32,
+    pub poll_revents_buf: u64,
 }
 
 impl Task {
@@ -391,6 +402,11 @@ blocked_on: 0,
             altstack_sp: 0,
             altstack_flags: 0,
             altstack_size: 0,
+
+            poll_fds: 0,
+            poll_nfds: 0,
+            poll_timeout: 0,
+            poll_revents_buf: 0,
         }
     }
 }
@@ -2174,6 +2190,7 @@ pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 pub const SYS_getppid: u64 = 110;
 pub const SYS_getpgid: u64 = 121;
+pub const SYS_rt_sigsuspend: u64 = 130;
 pub const SYS_sigaltstack: u64 = 131;
 pub const SYS_setpgid: u64 = 109;
 pub const SYS_getpgrp: u64 = 111;
@@ -2227,6 +2244,7 @@ pub const SYS_rynex_dma_free: u64 = 2031;
 pub const SYS_rynex_pci_read: u64 = 2032;
 pub const SYS_rynex_pci_write: u64 = 2033;
 pub const SYS_rynex_pci_find: u64 = 2034;
+pub const SYS_rynex_request_firmware: u64 = 2035;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -2322,6 +2340,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rt_sigaction => sys_rt_sigaction(arg1 as i32, arg2 as u64, arg3 as u64),
         SYS_rt_sigprocmask => sys_rt_sigprocmask(arg1 as i32, arg2 as u64, arg3 as u64),
         SYS_rt_sigreturn => sys_rt_sigreturn(),
+        SYS_rt_sigsuspend => sys_rt_sigsuspend(arg1 as u64),
         SYS_sigaltstack => sys_sigaltstack(arg1 as u64, arg2 as u64),
         SYS_setpgid => sys_setpgid(arg1 as i32, arg2 as i32),
         SYS_getppid => sys_getppid(),
@@ -2374,6 +2393,8 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_pci_read => sys_pci_read(arg1 as u8, arg2 as u8, arg3 as u8, arg4 as u8),
         SYS_rynex_pci_write => sys_pci_write(arg1 as u8, arg2 as u8, arg3 as u8, arg4 as u8, arg5 as u32),
         SYS_rynex_pci_find => sys_pci_find(arg1 as u16),
+        SYS_rynex_request_firmware =>
+            crate::firmware::sys_request_firmware(arg1 as *const u8, arg2 as usize, arg3 as *mut u8, arg4 as usize),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -2472,14 +2493,19 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
     // Pipe write end?
     if inode_fd.inode_idx == crate::vfs::MAX_INODES - 2 {
         let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+        let mut wrote = false;
         unsafe {
             for &c in slice {
                 if c == 0 { break; }
                 if PIPE_WPOS < 4096 {
                     PIPE_BUF[PIPE_WPOS] = c;
                     PIPE_WPOS += 1;
+                    wrote = true;
                 }
             }
+        }
+        if wrote {
+            pipe_wake_waiters();
         }
         slice.len() as i64
     } else {
@@ -2490,6 +2516,60 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
                 n as i64
             }
             None => -EIO,
+        }
+    }
+}
+
+/// Event-driven wake for tasks blocked in `sys_poll` on one of the two pipe
+/// inode slots (MAX_INODES-1 = read end, MAX_INODES-2 = write end). Called by
+/// the pipe writer right after data lands in the global PIPE_BUF, so pollers
+/// awaiting POLLIN resume immediately instead of waiting out their timeout.
+///
+/// Runs under TIMER_WAKE_LOCK (same lock as wakeup_expired_sleepers) so a pipe
+/// wake and a tick wakeup can never double-enqueue the same task; lock order
+/// TIMER_WAKE_LOCK -> RUNQUEUE_LOCK matches the timer path.
+fn pipe_wake_waiters() {
+    let _g = TIMER_WAKE_LOCK.lock();
+    let me = cur_task().load(core::sync::atomic::Ordering::SeqCst);
+    let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        for i in 0..MAX_TASKS {
+            let t = &TASKS[i];
+            if t.id == 0 || t.id == me {
+                continue;
+            }
+            // Pollers record poll_fds when they block; anything else sleeping
+            // (sys_sleep, futex, pipe read) is not ours to wake.
+            if t.state != TaskState::Blocked || t.poll_fds == 0 {
+                continue;
+            }
+            // ANY open fd bound to a pipe end means the poller is watching the
+            // global pipe (only one pipe exists, both ends at MAX_INODES-1/-2).
+            // True even when the pollfd entry is the other end being polled for
+            // POLLOUT; a false wake is harmless (poll re-scans then re-blocks).
+            let tbl = crate::vfs::fd_table_for(t.id);
+            let mut has_pipe = false;
+            for fd in tbl.iter() {
+                if fd.used
+                    && (fd.inode_idx == crate::vfs::MAX_INODES - 1
+                        || fd.inode_idx == crate::vfs::MAX_INODES - 2)
+                {
+                    has_pipe = true;
+                    break;
+                }
+            }
+            if !has_pipe {
+                continue;
+            }
+            TASKS[i].state = TaskState::Ready;
+            if TASKS[i].wakeup_tick > now {
+                TASKS[i].wakeup_tick = now;
+            }
+            // Same semantics as wakeup_expired_sleepers: resume on the live regs
+            // saved by the last context switch, not the zeroed saved_user_regs.
+            let _ = TASKS[i].saved_user_regs.take();
+            let prio = TASKS[i].prio;
+            enqueue_task(TASKS[i].id, prio);
         }
     }
 }
@@ -4124,6 +4204,11 @@ fn sys_fork() -> i64 {
             altstack_sp: 0,
             altstack_flags: 0,
             altstack_size: 0,
+
+            poll_fds: 0,
+            poll_nfds: 0,
+            poll_timeout: 0,
+            poll_revents_buf: 0,
         };
 
         // The child has its own (COW) page table, so duplicate the parent's
@@ -4324,6 +4409,11 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             altstack_sp: parent.altstack_sp,
             altstack_flags: parent.altstack_flags,
             altstack_size: parent.altstack_size,
+
+            poll_fds: 0,
+            poll_nfds: 0,
+            poll_timeout: 0,
+            poll_revents_buf: 0,
         };
 
         // CLONE_VM shares the parent's pml4, so the child automatically sees
@@ -6540,60 +6630,137 @@ pub fn user_range_valid(addr: u64, len: usize, want_write: bool) -> bool {
     true
 }
 
-fn sys_poll(fds: u64, nfds: u64, _timeout: i32) -> i64 {
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const POLLNVAL: i16 = 0x0020;
+
+fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
+    let inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
+        Some(f) => f,
+        None => {
+            unsafe { core::ptr::write_volatile(revents_ptr, POLLNVAL); }
+            return POLLNVAL;
+        }
+    };
+
+    let mut revents = 0i16;
+    let inode_idx = inode_fd.inode_idx;
+
+    // Pipe read end (MAX_INODES-1) / write end (MAX_INODES-2): report REAL
+    // readiness from the global PIPE_BUF positions, so a poller actually
+    // blocks until data/space exists instead of returning always-ready.
+    if inode_idx == crate::vfs::MAX_INODES - 1 || inode_idx == crate::vfs::MAX_INODES - 2 {
+        unsafe {
+            if events & POLLIN != 0 && PIPE_RPOS < PIPE_WPOS {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 && PIPE_WPOS < 4096 {
+                revents |= POLLOUT;
+            }
+        }
+    } else {
+        // TTY / console / other character device: become ready on pending
+        // keyboard input only. POLLOUT on a tty is always ready.
+        if events & POLLIN != 0 && crate::keyboard::has_pending_input() {
+            revents |= POLLIN;
+        }
+        if events & POLLOUT != 0 {
+            revents |= POLLOUT;
+        }
+    }
+
+    revents
+}
+
+fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
     if fds == 0 || nfds == 0 {
         return -EFAULT;
     }
-    
-    const POLLIN: i16 = 0x0001;
-    const POLLOUT: i16 = 0x0004;
-    const POLLERR: i16 = 0x0008;
-    const POLLHUP: i16 = 0x0010;
-    const POLLNVAL: i16 = 0x0020;
-    
-    let mut ready_count = 0i64;
-    
-    for i in 0..nfds as usize {
-        let fd_ptr = { (fds + i as u64 * 8) as *const u32 };
-        let events_ptr = { (fds + i as u64 * 8 + 4) as *const i16 };
-        let revents_ptr = { (fds + i as u64 * 8 + 6) as *mut i16 };
-        
-        let fd = unsafe { core::ptr::read_volatile(fd_ptr) };
-        let events = unsafe { core::ptr::read_volatile(events_ptr) };
-        
-        let mut revents = 0i16;
-        
-        // Check if fd is valid
-        let _inode_fd = match crate::vfs::fd_to_inode(fd as usize) {
-            Some(f) => f,
-            None => {
-                revents = POLLNVAL;
-                unsafe { core::ptr::write_volatile(revents_ptr, revents); }
-                continue;
-            }
-        };
-        
-        // For TTY devices (including console on fd 0,1,2), check if data is available
-        if events & POLLIN != 0 {
-            // Check if there's input data available in TTY buffer
-            // For now, assume TTY is always ready for read if it's a valid TTY fd
-            // This makes poll return immediately with POLLIN, which should make shell proceed to read
-            revents |= POLLIN;
-        }
-        
-        if events & POLLOUT != 0 {
-            // Writing is usually always ready for TTY
-            revents |= POLLOUT;
-        }
-        
-        unsafe { core::ptr::write_volatile(revents_ptr, revents); }
-        
-        if revents != 0 {
-            ready_count += 1;
-        }
+
+    let id = cur_task().load(core::sync::atomic::Ordering::SeqCst);
+    if id == 0 {
+        return -EFAULT;
     }
-    
-    ready_count
+
+    // timeout < 0 polls forever (event wakeups only); timeout == 0 is
+    // non-blocking; timeout > 0 is an absolute deadline in ticks.
+    let infinite = timeout < 0;
+    let deadline = if timeout == 0 {
+        0
+    } else if infinite {
+        u64::MAX
+    } else {
+        let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        // ms -> ticks at 50Hz; clamp so a sub-tick timeout still sleeps >= 1 tick.
+        let ticks = ((timeout as u64 + 19) / 20).max(1);
+        now + ticks
+    };
+
+    // Reentrant scan/block loop. force_schedule() below switches away while
+    // Blocked; on wake (timer expiry, or pipe_wake_waiters) execution resumes
+    // right here and the fds are re-scanned. If data still isn't ready and the
+    // deadline hasn't passed, we simply block again.
+    loop {
+        let mut ready_count = 0i64;
+        for i in 0..nfds as usize {
+            let fd_ptr = { (fds + i as u64 * 8) as *const u32 };
+            let events_ptr = { (fds + i as u64 * 8 + 4) as *const i16 };
+            let revents_ptr = { (fds + i as u64 * 8 + 6) as *mut i16 };
+
+            let fd = unsafe { core::ptr::read_volatile(fd_ptr) };
+            let events = unsafe { core::ptr::read_volatile(events_ptr) };
+
+            let revents = poll_fd_readiness(fd, events, revents_ptr);
+
+            unsafe { core::ptr::write_volatile(revents_ptr, revents); }
+
+            if revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            return ready_count;
+        }
+        if timeout == 0 {
+            return 0;
+        }
+
+        let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if !infinite && now >= deadline {
+            return 0;
+        }
+
+        // Block until the deadline (or until pipe_wake_waiters events us in).
+        let (ursp, urip, urfl, ufsb) = unsafe {
+            (
+                SYSCALL_USER_RSP,
+                SYSCALL_USER_RIP,
+                SYSCALL_USER_RFLAGS,
+                SYSCALL_USER_FS_BASE,
+            )
+        };
+
+        let t = task_mut(id);
+        t.saved_user_regs = Some(Registers {
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: ursp,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: urip, rflags: urfl,
+            cs: 0x23, ss: 0x1B, fs_base: ufsb,
+        });
+        t.wakeup_tick = deadline;
+        // Publish the poll context for event-driven wakeups (pipe_wake_waiters):
+        // while Blocked, poll_fds != 0 marks this task as a poll sleeper.
+        t.poll_fds = fds;
+        t.poll_nfds = nfds;
+        t.state = TaskState::Blocked;
+
+        force_schedule();
+
+        // Woken up — loop around, re-scan, re-block until ready or deadline.
+    }
 }
 
 fn sys_lseek(_fd: u32, _offset: i64, _whence: i32) -> i64 {
@@ -6751,7 +6918,7 @@ pub fn boot_userland() {
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     let mut init_tid = 0u64;
     if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 8];
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 16];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
         for i in 0..n {
             let mod_data = unsafe {
@@ -6830,6 +6997,28 @@ pub fn boot_userland() {
                         }
                     }
                 }
+            }
+        }
+
+        // Non-ELF modules are firmware blobs: register each under its module
+        // basename in the firmware table (used by rynex_request_firmware).
+        for i in 0..n {
+            let mod_data = unsafe {
+                core::slice::from_raw_parts(
+                    modules[i].start as *const u8,
+                    (modules[i].end - modules[i].start) as usize,
+                )
+            };
+            let is_elf = mod_data.len() >= 4 && mod_data[0] == 0x7f
+                && mod_data[1] == b'E' && mod_data[2] == b'L' && mod_data[3] == b'F';
+            if is_elf || mod_data.is_empty() {
+                continue;
+            }
+            let base = &modules[i].name;
+            let mut len = 0usize;
+            while len < base.len() && base[len] != 0 { len += 1; }
+            if len > 0 {
+                crate::firmware::register(&base[..len], mod_data);
             }
         }
     }
