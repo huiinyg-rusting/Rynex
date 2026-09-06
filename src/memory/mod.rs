@@ -100,7 +100,7 @@ pub fn init(info_addr: u32) {
     let ke = buddy::page_align_up(kend);
 
     // Find modules first so we can exclude their pages from free regions
-    let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 8];
+    let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 16];
     let nmodules = crate::multiboot2::find_modules(info_addr, &mut modules);
     for i in 0..nmodules {
         crate::serial::write_str("MEM: module ");
