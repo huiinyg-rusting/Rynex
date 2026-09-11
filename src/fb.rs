@@ -153,7 +153,11 @@ pub fn enable_console() -> bool {
     crate::serial::write_dec(info.bpp as u64);
     crate::serial::write_str(" @0x");
     crate::serial::write_hex(info.addr);
-    crate::serial::write_str(")\n");
+    crate::serial::write_str(") cols=");
+    crate::serial::write_dec((info.width / FONT_W) as u64);
+    crate::serial::write_str(" rows=");
+    crate::serial::write_dec((info.height / FONT_H) as u64);
+    crate::serial::write_str("\n");
     true
 }
 

@@ -1392,6 +1392,38 @@ pub fn exit_task(code: i32) {
             futex_wake(child_tidptr as *const u32, 1);
         }
 
+        // POSIX: a child exit sets SIGCHLD pending on the parent. Supervisors
+        // like runit wait with sigsuspend (not waitpid), so without this they
+        // never wake to reap the zombie. Skipped when the parent ignores
+        // SIGCHLD (default action for it is "reap silently", too).
+        if let Some(parent_id) = task_ref(id).parent {
+            let pidx = task_idx(parent_id);
+            let wake = {
+                let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
+                let p = unsafe { &mut TASKS[pidx] };
+                if p.id != 0 && p.state != TaskState::Empty {
+                    let act = p.sig_handlers[SIGCHLD as usize];
+                    if act.handler != SIG_IGN as u64 && act.handler != SIG_DFL as u64 {
+                        p.sig_pending |= 1u64 << SIGCHLD;
+                        if p.state == TaskState::Blocked && p.blocked_on == SIGSUSPEND_MAGIC {
+                            p.state = TaskState::Ready;
+                            p.blocked_on = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if wake {
+                enqueue_task(parent_id, task_ref(parent_id).prio);
+            }
+        }
+
         // Parent (or any task waiting on this PID) will free stacks via waitpid
         // Wake parent if it's blocked waiting for this child
         if let Some(parent_id) = task_ref(id).parent {
@@ -3753,6 +3785,13 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
                         return written as i64;
                     }
                 }
+                let nonblock = crate::vfs::get_fd_table().map_or(false, |t| {
+                    (fd as usize) < crate::vfs::MAX_FDS_PER_TASK && t[fd as usize].used
+                        && t[fd as usize].flags & 0x800 != 0  // O_NONBLOCK / O_NDELAY
+                });
+                if nonblock {
+                    return -EAGAIN;
+                }
                 // No data - block
                 let addr = &raw mut PIPE_BUF as u64;
                 let idx = task_idx(current_task_id());
@@ -5395,7 +5434,9 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
 /// Deliver `sig` to a single task slot. Returns 0 ok / -ESRCH.
 fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
     let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
-    unsafe {
+    // Task to re-queue after dropping the lock (sigsuspend waiter woken below).
+    let mut wake = 0u64;
+    let r = unsafe {
         let t = &mut TASKS[idx];
         if t.id == 0 || t.state == TaskState::Empty { return -ESRCH; }
         if sig <= 0 || sig as usize >= SIGNAL_COUNT { return -EINVAL; }
@@ -5419,9 +5460,16 @@ fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
         // Real handler: mark the signal pending whether or not it is currently
         // blocked (POSIX: a blocked signal is held pending and delivered once
         // it is unblocked). check_deliver_signal runs it on the next syscall
-        // boundary once the bit is no longer blocked.
+        // boundary once the bit is no longer blocked. A task blocked in
+        // sigsuspend (runit's sleep) must be woken so the pending handler can
+        // run; without the wake it sleeps forever.
         if act.handler != SIG_DFL as u64 {
             t.sig_pending |= 1u64 << sigi;
+            if t.state == TaskState::Blocked && t.blocked_on == SIGSUSPEND_MAGIC {
+                t.state = TaskState::Ready;
+                t.blocked_on = 0;
+                wake = t.id;
+            }
             return 0;
         }
         // Default action: for the terminating set, kill the task. If the target
@@ -5445,7 +5493,11 @@ fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
         }
         // SIGCONT etc. are no-ops here.
         0
+    };
+    if wake != 0 {
+        unsafe { enqueue_task(wake, TASKS[task_idx(wake)].prio); }
     }
+    r
 }
 
 /// Mark a task (by slot) as a zombie, remove it from the runqueue, and wake its
@@ -5831,6 +5883,58 @@ exit_task(128 + sigi);
     0
 }
 
+/// rt_sigsuspend(2): atomically replace the signal mask with `set`, then block
+/// until a signal is delivered. Returns -EINTR (restoring the old mask); the
+/// syscall-exit path then runs the now-pending handler. runit's main loop calls
+/// this for every child wait via sigsuspend(), so without it the init chain
+/// spins. Blocked tasks park with blocked_on == SIGSUSPEND_MAGIC and are woken
+/// by sig_deliver_to_task / exit_task when a signal becomes pending.
+fn sys_rt_sigsuspend(mask_set: u64) -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    if mask_set == 0 { return -EINVAL; }
+    let idx = task_idx(id);
+    let mask = unsafe { core::ptr::read_volatile(mask_set as *const u64) };
+
+    // Install the new mask and check for an already-pending, unblocked signal
+    // (with a real handler, or a terminating one that will kill us below).
+    let old_mask;
+    let ready_now = {
+        let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
+        let t = unsafe { &mut TASKS[idx] };
+        old_mask = t.sig_blocked;
+        t.sig_blocked = mask;
+        let mut any = false;
+        for sig in 1..SIGNAL_COUNT {
+            let bit = 1u64 << sig;
+            if t.sig_pending & bit != 0 && (t.sig_blocked >> sig) & 1 == 0 {
+                let act = t.sig_handlers[sig];
+                if act.handler != SIG_IGN as u64 {
+                    any = true;
+                    break;
+                }
+            }
+        }
+        if any {
+            t.sig_blocked = old_mask;
+        } else {
+            t.blocked_on = SIGSUSPEND_MAGIC;
+            t.state = TaskState::Blocked;
+        }
+        any
+    };
+    if ready_now {
+        return -EINTR;
+    }
+    // Park until a signal delivery wakes us (wake point restores Ready and
+    // clears blocked_on).
+    force_schedule();
+    unsafe {
+        TASKS[idx].sig_blocked = old_mask;
+    }
+    -EINTR
+}
+
 fn sys_rt_sigreturn() -> i64 {
     let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
     unsafe {
@@ -6004,8 +6108,22 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
         0 => sys_dup2(fd, fd),
         1 => 0,  // F_GETFD
         2 => 0,  // F_SETFD
-        3 => 2,  // F_GETFL → return O_RDWR (2)
-        4 => 0,  // F_SETFL
+        3 => {
+            // F_GETFL
+            let table = match crate::vfs::get_fd_table() { Some(t) => t, None => return -EBADF };
+            if (fd as usize) < crate::vfs::MAX_FDS_PER_TASK && table[fd as usize].used {
+                table[fd as usize].flags as i64
+            } else { -EBADF }
+        },
+        4 => {
+            // F_SETFL — persist O_NONBLOCK so sys_read/sys_write can honour it.
+            let table = match crate::vfs::get_fd_table() { Some(t) => t, None => return -EBADF };
+            if (fd as usize) < crate::vfs::MAX_FDS_PER_TASK && table[fd as usize].used {
+                // Only the low 14 bits are user-settable flags (POSIX).
+                table[fd as usize].flags = (table[fd as usize].flags & !0x3FFF) | (arg as i32 & 0x3FFF);
+                0
+            } else { -EBADF }
+        },
         1030 => { // F_DUPFD_CLOEXEC
             // Find lowest available fd >= arg
             let table = match crate::vfs::get_fd_table() {
