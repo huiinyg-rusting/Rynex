@@ -230,8 +230,9 @@ pit::init(100);
         // UTF-8 console sanity (fbcon): a CJK ideograph renders as '?' (no
         // glyph) and box-drawing characters come from the built-in font. Read
         // real framebuffer pixels back as serial evidence the console is live:
-        // the leading 'F' glyph (cell 0,0) has scanline 0xFE at y=1, so (3,1)
-        // is an on pixel (bright yellow, ~0x00FFAA00) and (7,1)/(0,0) are bg.
+        // the leading 'F' glyph (cell 0,0) has scanline 0xFE in its third row,
+        // so (3,2) is an on pixel (bright yellow, ~0x00FFAA55) and (7,2)/(0,0)
+        // are bg.
         vga::set_color(0x0E, 0x00);
         let (dfg, dbg, daddr) = crate::fb::debug_fb();
         serial::write_str("FBstate-before: FG=0x");
@@ -250,17 +251,17 @@ pit::init(100);
         serial::write_str(" addr=0x");
         serial::write_hex(daddr2);
         serial::write_str("\n");
-        let px_fg = crate::fb::probe_pixel(3, 1);
-        let px_bg = crate::fb::probe_pixel(7, 1);
+        let px_fg = crate::fb::probe_pixel(3, 2);
+        let px_bg = crate::fb::probe_pixel(7, 2);
         let px_bl = crate::fb::probe_pixel(0, 0);
-        serial::write_str("FBdemo: pixel(3,1)=0x");
+        serial::write_str("FBdemo: pixel(3,2)=0x");
         serial::write_hex(px_fg as u64);
-        serial::write_str(" (expect bright-yellow on-dot), pixel(7,1)=0x");
+        serial::write_str(" (expect bright-yellow on-dot), pixel(7,2)=0x");
         serial::write_hex(px_bg as u64);
         serial::write_str(", pixel(0,0)=0x");
         serial::write_hex(px_bl as u64);
         serial::write_str(" (expect bg)\n");
-        for ry in 0..2u32 {
+        for ry in 0..3u32 {
             serial::write_str("FBdiag row");
             serial::write_dec(ry as u64);
             serial::write_str(": ");
