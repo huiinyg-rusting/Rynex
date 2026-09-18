@@ -2911,7 +2911,30 @@ fn vma_clone(from: u64, to: u64) {
         for i in 0..VMA_USED {
             let rec = &VMAS[i];
             if rec.pml4 == from {
-                vma_register(to, rec.vma.start, rec.vma.end, rec.vma.flags);
+                // Register [start, end) for `to` while still holding VMA_LOCK.
+                // Do NOT call vma_register() here: it re-takes the non-reentrant
+                // lock and self-deadlocks as soon as any VMA matches (fork of a
+                // process that mmap'd/brk'd after exec, e.g. runsvdir forking).
+                let (s, e, f) = (rec.vma.start, rec.vma.end, rec.vma.flags);
+                let mut done = false;
+                for j in 0..VMA_USED {
+                    let nr = &mut VMAS[j];
+                    if nr.pml4 == 0 && nr.vma.start == 0 {
+                        nr.pml4 = to;
+                        nr.vma.start = s;
+                        nr.vma.end = e;
+                        nr.vma.flags = f;
+                        done = true;
+                        break;
+                    }
+                }
+                if !done && VMA_USED < MAX_VMA_RECORDS {
+                    VMAS[VMA_USED] = VmaRec {
+                        pml4: to,
+                        vma: Vma { start: s, end: e, flags: f },
+                    };
+                    VMA_USED += 1;
+                }
             }
         }
     }

@@ -629,9 +629,21 @@ impl BuddyAllocator {
     }
 
     fn alloc_nolock(&mut self, order: usize) -> Option<u64> {
+        let mut steps: u64 = 0;
         for o in order..=MAX_ORDER {
             let block = self.free_lists[o];
             if !block.is_null() {
+                steps += 1;
+                if steps > 1_000_000 {
+                    crate::serial::write_str("\nALLOC-SPIN order=");
+                    crate::serial::write_dec(o as u64);
+                    crate::serial::write_str(" head=0x");
+                    crate::serial::write_hex(block as u64);
+                    crate::serial::write_str(" task=");
+                    crate::serial::write_dec(crate::task::current_task_id());
+                    crate::serial::write_str("\n");
+                    return None;
+                }
                 let addr = block as u64;
                 let next = unsafe { (*block).next };
                 if self.is_reserved(addr) {

@@ -1204,23 +1204,33 @@ let mut pdpt_user = false;
                         // PT page: if still shared (fork partner references it),
                         // drop our reference; otherwise it is ours to free.
                         let pt_phys = pde & PTE_ADDR_MASK;
-                        // Track visited PT to prevent double-free
-                        if visited_count < 2048 {
-                            let mut found = false;
-                            for i in 0..visited_count {
-                                if visited_pt[i] == pt_phys {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
+                        // Track visited PT to prevent double-free AND double-dec:
+                        // the same table page can be reachable through more than
+                        // one path in this walk. Dedup the whole dec+free, not
+                        // just the free, or a shared page's refcount is released
+                        // twice and freed while a fork sibling still points at it.
+                        let mut already = false;
+                        for i in 0..visited_count {
+                            if visited_pt[i] == pt_phys { already = true; break; }
+                        }
+                        if already {
+                            crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                            crate::klog::s("FAS ALIAS PT pml4=0x");
+                            crate::klog::hex(pml4);
+                            crate::klog::s(" pt_phys=0x");
+                            crate::klog::hex(pt_phys);
+                            crate::klog::s(" task=");
+                            crate::klog::dec(crate::task::current_task_id());
+                            crate::klog::end();
+                        } else {
+                            if visited_count < 2048 {
                                 visited_pt[visited_count] = pt_phys;
                                 visited_count += 1;
                             }
-                        }
-                        if crate::memory::buddy::pte_refc_dec(pt_phys) {
+                            if crate::memory::buddy::pte_refc_dec(pt_phys) {
                                 if pt_phys >= base && pt_phys < end {
-                                alloc.free(pt_phys, 0);
+                                    alloc.free(pt_phys, 0);
+                                }
                             }
                         }
                         pd_user = true;
@@ -1228,23 +1238,29 @@ let mut pdpt_user = false;
                 }
                 if pd_user {
                     let pd_phys = pdpte & PTE_ADDR_MASK;
-                    // Track visited PD to prevent double-free
-                    if visited_count < 2048 {
-                        let mut found = false;
-                        for i in 0..visited_count {
-                            if visited_pt[i] == pd_phys {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
+                    // Track visited PD to prevent double-free AND double-dec.
+                    let mut already = false;
+                    for i in 0..visited_count {
+                        if visited_pt[i] == pd_phys { already = true; break; }
+                    }
+                    if already {
+                        crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                        crate::klog::s("FAS ALIAS PD pml4=0x");
+                        crate::klog::hex(pml4);
+                        crate::klog::s(" pd_phys=0x");
+                        crate::klog::hex(pd_phys);
+                        crate::klog::s(" task=");
+                        crate::klog::dec(crate::task::current_task_id());
+                        crate::klog::end();
+                    } else {
+                        if visited_count < 2048 {
                             visited_pt[visited_count] = pd_phys;
                             visited_count += 1;
                         }
-                    }
-                    if crate::memory::buddy::pte_refc_dec(pd_phys) {
+                        if crate::memory::buddy::pte_refc_dec(pd_phys) {
                             if pd_phys >= base && pd_phys < end {
-                            alloc.free(pd_phys, 0);
+                                alloc.free(pd_phys, 0);
+                            }
                         }
                     }
                     pdpt_user = true;
@@ -1252,23 +1268,29 @@ let mut pdpt_user = false;
             }
             if pdpt_user {
                 let pdpt_phys = pml4e & PTE_ADDR_MASK;
-                // Track visited PDPT to prevent double-free
-                if visited_count < 2048 {
-                    let mut found = false;
-                    for i in 0..visited_count {
-                        if visited_pt[i] == pdpt_phys {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
+                // Track visited PDPT to prevent double-free AND double-dec.
+                let mut already = false;
+                for i in 0..visited_count {
+                    if visited_pt[i] == pdpt_phys { already = true; break; }
+                }
+                if already {
+                    crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                    crate::klog::s("FAS ALIAS PDPT pml4=0x");
+                    crate::klog::hex(pml4);
+                    crate::klog::s(" pdpt_phys=0x");
+                    crate::klog::hex(pdpt_phys);
+                    crate::klog::s(" task=");
+                    crate::klog::dec(crate::task::current_task_id());
+                    crate::klog::end();
+                } else {
+                    if visited_count < 2048 {
                         visited_pt[visited_count] = pdpt_phys;
                         visited_count += 1;
                     }
-                }
-                if crate::memory::buddy::pte_refc_dec(pdpt_phys) {
-                    if pdpt_phys >= base && pdpt_phys < end {
-                        alloc.free(pdpt_phys, 0);
+                    if crate::memory::buddy::pte_refc_dec(pdpt_phys) {
+                        if pdpt_phys >= base && pdpt_phys < end {
+                            alloc.free(pdpt_phys, 0);
+                        }
                     }
                 }
             }

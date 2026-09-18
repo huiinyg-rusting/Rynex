@@ -3,7 +3,7 @@ use crate::paging::{PageTableManager, PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_N
 use crate::paging::{PTE_ADDR_MASK, KERNEL_PML4};
 
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-pub const USER_STACK_PAGES: usize = 4;
+pub const USER_STACK_PAGES: usize = 16;
 
 #[repr(C)]
 struct Elf64Header {
