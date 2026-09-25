@@ -247,16 +247,30 @@ impl VnodeOps for RamFs {
         let ino = alloc_inode().ok_or("ramfs: no inodes")?;
         let child_ptr = get_ino(ino).ok_or("bad child")?;
         let child = unsafe { &mut *child_ptr };
-        child.mode = mode | S_IFREG;
+        // Honor a caller-supplied file type (e.g. S_IFIFO from mknod's fifo_make);
+        // default to plain regular file when no type bits are given. Without
+        // this, mknod(S_IFIFO) files stat as S_IFREG and runit's S_ISFIFO
+        // check fails ("supervise/control exists but is not a fifo").
+        child.mode = if mode & S_IFMT != 0 { mode } else { mode | S_IFREG };
 
-        if parent.dirent_count >= MAX_DIRENTS {
-            free_inode_blocks(child);
-            child.used = false;
-            return Err("ramfs: dirents full");
+        // Reuse a freed dirent slot (rename/remove leave used=false gaps) before
+        // appending, or dirent_count grows monotonically and the directory
+        // fills up under runit's per-cycle pid.new/status.new churn.
+        let mut slot = MAX_DIRENTS;
+        for i in 0..parent.dirent_count {
+            if !parent.dirents[i].used { slot = i; break; }
         }
-        let de = &mut parent.dirents[parent.dirent_count];
+        if slot == MAX_DIRENTS {
+            if parent.dirent_count >= MAX_DIRENTS {
+                free_inode_blocks(child);
+                child.used = false;
+                return Err("ramfs: dirents full");
+            }
+            slot = parent.dirent_count;
+            parent.dirent_count += 1;
+        }
+        let de = &mut parent.dirents[slot];
         de.set(ino, name, FT_REG_FILE);
-        parent.dirent_count += 1;
         child.nlink = 1;
         Ok(ino)
     }
@@ -274,9 +288,16 @@ impl VnodeOps for RamFs {
             child.used = false;
             return Err("ramfs: dirents full");
         }
-        let de = &mut parent.dirents[parent.dirent_count];
+        let mut slot = MAX_DIRENTS;
+        for i in 0..parent.dirent_count {
+            if !parent.dirents[i].used { slot = i; break; }
+        }
+        if slot == MAX_DIRENTS {
+            slot = parent.dirent_count;
+            parent.dirent_count += 1;
+        }
+        let de = &mut parent.dirents[slot];
         de.set(ino, name, FT_DIR);
-        parent.dirent_count += 1;
         Ok(ino)
     }
 
@@ -362,10 +383,43 @@ impl VnodeOps for RamFs {
 
         let new_ptr = get_ino(new_parent).ok_or("bad new parent")?;
         let new = unsafe { &mut *new_ptr };
-        if new.dirent_count >= MAX_DIRENTS { return Err("ramfs: dirents full"); }
-        let de = &mut new.dirents[new.dirent_count];
-        de.set(ino, new_name, ftype);
-        new.dirent_count += 1;
+        // Replace an existing target dirent instead of appending a duplicate:
+        // runsv renames pid.new/status.new over an existing pid/status every
+        // cycle; without replacement each cycle would leak an inode+dirent.
+        // The moved entry must take over the FREED TARGET SLOT — appending it
+        // at dirent_count-1 instead would leave the target slot as a permanent
+        // gap, bump dirent_count every cycle, and exhaust MAX_DIRENTS within
+        // ~30 respawn cycles ("ramfs: dirents full").
+        let mut target_slot = None;
+        for i in 0..new.dirent_count {
+            let hit = {
+                let d = &new.dirents[i];
+                d.used
+                    && d.name_len as usize == new_name.len()
+                    && &d.name[..d.name_len as usize] == new_name
+            };
+            if hit {
+                let tino = new.dirents[i].ino;
+                let tptr = get_ino(tino).ok_or("bad target ino")?;
+                let tinode = unsafe { &mut *tptr };
+                free_inode_blocks(tinode);
+                unsafe { (*tptr).used = false; }
+                // Free vnodes wrapping the replaced inode too, or the
+                // per-cycle pid/status rename churn leaks the vnode table.
+                crate::vfs_core::vnode_free_by_ino(tino);
+                new.dirents[i].used = false;
+                target_slot = Some(i);
+                break;
+            }
+        }
+        match target_slot {
+            Some(i) => new.dirents[i].set(ino, new_name, ftype),
+            None => {
+                if new.dirent_count >= MAX_DIRENTS { return Err("ramfs: dirents full"); }
+                new.dirents[new.dirent_count].set(ino, new_name, ftype);
+                new.dirent_count += 1;
+            }
+        }
         Ok(())
     }
 

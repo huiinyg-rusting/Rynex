@@ -281,6 +281,15 @@ impl VnodeTableInner {
             false
         }
     }
+
+    fn free_by_ino(&mut self, ino: u64) {
+        for i in 0..MAX_VNODES {
+            if self.vnodes[i].used && self.vnodes[i].ino == ino {
+                self.vnodes[i].used = false;
+                self.count = self.count.saturating_sub(1);
+            }
+        }
+    }
 }
 
 struct MountTableInner {
@@ -564,6 +573,14 @@ pub fn vnode_get(id: u16) -> Option<Vnode> {
 
 pub fn vnode_alloc(ino: u64, fs_id: FsId, mount_id: u64, ops: &'static dyn VnodeOps) -> Option<u16> {
     VNODE_TABLE.lock().alloc(ino, fs_id, mount_id, ops)
+}
+
+/// Free every vnode wrapping the given ramfs inode. Used when a ramfs inode
+/// dies (rename target replacement): the per-cycle pid.new/status.new churn in
+/// runit would otherwise leak one vnode per cycle and exhaust the 256-entry
+/// vnode table within a couple of minutes.
+pub fn vnode_free_by_ino(ino: u64) {
+    VNODE_TABLE.lock().free_by_ino(ino);
 }
 
 pub fn dispatch(msg: &mut VfsMessage) -> i64 {

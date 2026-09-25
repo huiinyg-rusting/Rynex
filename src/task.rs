@@ -280,6 +280,13 @@ pub struct Task {
     // name on exec/spawn.
     pub comm: [u8; 16],
 
+    // Per-task working directory (copied at fork, mutated by chdir). Siblings
+    // resolve relative paths against their OWN cwd, never a shared global —
+    // runsvdir's per-service chdir used to clobber the global CWD so every
+    // service but the first got ENOENT.
+    pub cwd: [u8; 256],
+    pub cwd_len: usize,
+
     // Privilege bitmask granted to this task (bug 15). Gates privileged
     // syscalls (phys_map, dma_alloc, pci, port_io, irq, reboot) that would
     // otherwise let any user process read/write arbitrary physical memory.
@@ -393,6 +400,8 @@ blocked_on: 0,
             sig_blocked: 0,
             sig_pending: 0,
             comm: [0; 16],
+            cwd: [0; 256],
+            cwd_len: 0,
             privileges: 0,
             wakeup_tick: 0,
             futex_deadline: 0,
@@ -1375,6 +1384,17 @@ pub fn exit_task(code: i32) {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return; }
 
+    // Release this task's file descriptors (including pipe-end references) so
+    // pipe slots and fd-table entries are actually freed on exit instead of
+    // leaking forever (leaks made every later pipe()/open() fail with EMFILE).
+    if let Some(tbl) = crate::vfs::get_fd_table() {
+        let mut i = 0usize;
+        while i < crate::vfs::MAX_FDS_PER_TASK {
+            if tbl[i].used { let _ = crate::vfs::close_fd(i); }
+            i += 1;
+        }
+    }
+
     {
         task_mut(id).state = TaskState::Zombie;
         task_mut(id).exit_code = code;
@@ -1405,7 +1425,16 @@ pub fn exit_task(code: i32) {
                     let act = p.sig_handlers[SIGCHLD as usize];
                     if act.handler != SIG_IGN as u64 && act.handler != SIG_DFL as u64 {
                         p.sig_pending |= 1u64 << SIGCHLD;
-                        if p.state == TaskState::Blocked && p.blocked_on == SIGSUSPEND_MAGIC {
+                        // Wake a suspended supervisor (sigsuspend) OR a poller
+                        // waiting on its selfpipe. A runsv blocked in poll()
+                        // with a 3600s deadline would otherwise never learn the
+                        // child died: the SIGCHLD handler (which writes the
+                        // selfpipe wake byte) only runs once poll returns, and
+                        // poll only returns when the pipe wakes it. Break the
+                        // cycle by unblocking the poller; sys_poll's signal
+                        // check then returns 0 so the handler can run.
+                        if p.state == TaskState::Blocked
+                            && (p.blocked_on == SIGSUSPEND_MAGIC || p.poll_fds != 0) {
                             p.state = TaskState::Ready;
                             p.blocked_on = 0;
                             true
@@ -2172,6 +2201,7 @@ pub const SYS_exit: u64 = 60;
 pub const SYS_wait4: u64 = 61;
 pub const SYS_kill: u64 = 62;
 pub const SYS_uname: u64 = 63;
+pub const SYS_flock: u64 = 73;
 pub const SYS_fcntl: u64 = 72;
 pub const SYS_getcwd: u64 = 79;
 pub const SYS_chdir: u64 = 80;
@@ -2337,6 +2367,7 @@ pub extern "C" fn syscall_handler(
         SYS_kill => sys_kill(arg1 as i64, arg2 as i32),
         SYS_uname => sys_uname(arg1 as *mut u8),
         SYS_fcntl => sys_fcntl(arg1 as u32, arg2 as i32, arg3 as u64),
+        SYS_flock => sys_flock(arg1 as u32, arg2 as i32),
         SYS_getcwd => sys_getcwd(arg1 as *mut u8, arg2 as usize),
         SYS_chdir => sys_chdir(arg1 as *const u8),
 SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
@@ -2523,23 +2554,29 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
         None => return -EBADF,
     };
     // Pipe write end?
-    if inode_fd.inode_idx == crate::vfs::MAX_INODES - 2 {
-        let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-        let mut wrote = false;
-        unsafe {
-            for &c in slice {
-                if c == 0 { break; }
-                if PIPE_WPOS < 4096 {
-                    PIPE_BUF[PIPE_WPOS] = c;
-                    PIPE_WPOS += 1;
-                    wrote = true;
+    if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
+        if pipe_is_write_end(inode_fd.inode_idx) {
+            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+            let mut wrote = false;
+            unsafe {
+                // Write every byte, including NULs: runit's selfpipe wake byte
+                // is '\0' — stopping at NUL used to swallow it so pollers on
+                // the selfpipe never woke (breaking SIGCHLD notification).
+                for &c in slice {
+                    if PIPES[p].wpos < 4096 {
+                        PIPES[p].buf[PIPES[p].wpos] = c;
+                        PIPES[p].wpos += 1;
+                        wrote = true;
+                    }
                 }
             }
+            if wrote {
+                pipe_wake_waiters();
+            }
+            slice.len() as i64
+        } else {
+            -EBADF
         }
-        if wrote {
-            pipe_wake_waiters();
-        }
-        slice.len() as i64
     } else {
         let slice = unsafe { core::slice::from_raw_parts(buf, count) };
         match crate::vfs::inode_write(inode_fd.inode_idx, inode_fd.pos, slice) {
@@ -2582,10 +2619,7 @@ fn pipe_wake_waiters() {
             let tbl = crate::vfs::fd_table_for(t.id);
             let mut has_pipe = false;
             for fd in tbl.iter() {
-                if fd.used
-                    && (fd.inode_idx == crate::vfs::MAX_INODES - 1
-                        || fd.inode_idx == crate::vfs::MAX_INODES - 2)
-                {
+                if fd.used && pipe_idx_of(fd.inode_idx).is_some() {
                     has_pipe = true;
                     break;
                 }
@@ -3793,18 +3827,19 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
         None => return -EBADF,
     };
     // Pipe read end?
-    if inode_fd.inode_idx == crate::vfs::MAX_INODES - 1 {
+    if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
+        if pipe_is_write_end(inode_fd.inode_idx) { return -EBADF; }
         unsafe {
             let mut written = 0usize;
             loop {
-                if PIPE_RPOS < PIPE_WPOS {
-                    let avail = PIPE_WPOS - PIPE_RPOS;
+                if PIPES[p].rpos < PIPES[p].wpos {
+                    let avail = PIPES[p].wpos - PIPES[p].rpos;
                     let to_read = core::cmp::min(count - written, avail);
-                    core::ptr::copy_nonoverlapping(PIPE_BUF.as_ptr().add(PIPE_RPOS), buf.add(written), to_read);
-                    PIPE_RPOS += to_read;
+                    core::ptr::copy_nonoverlapping(PIPES[p].buf.as_ptr().add(PIPES[p].rpos), buf.add(written), to_read);
+                    PIPES[p].rpos += to_read;
                     written += to_read;
                     if written > 0 {
-                        if PIPE_RPOS == PIPE_WPOS { PIPE_RPOS = 0; PIPE_WPOS = 0; }
+                        if PIPES[p].rpos == PIPES[p].wpos { PIPES[p].rpos = 0; PIPES[p].wpos = 0; }
                         return written as i64;
                     }
                 }
@@ -3816,7 +3851,7 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
                     return -EAGAIN;
                 }
                 // No data - block
-                let addr = &raw mut PIPE_BUF as u64;
+                let addr = &raw mut PIPES[p].buf as u64;
                 let idx = task_idx(current_task_id());
                 TASKS[idx].blocked_on = addr;
                 TASKS[idx].state = TaskState::Blocked;
@@ -3844,8 +3879,19 @@ fn sys_open(pathname: *const u8, flags: i32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
     let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
-    let _ = flags;
-    match crate::vfs::resolve_or_register(name) {
+    let mut nbuf = [0u8; 512];
+    let nlen = crate::vfs::normalize_path(name, &mut nbuf).unwrap_or(0);
+    if nlen == 0 { return -ENOENT; }
+    let norm = &nbuf[..nlen];
+    // O_CREAT (0x40): materialize missing files instead of failing ENOENT.
+    // runsv relies on this for open("supervise/lock", O_WRONLY|O_CREAT|...);
+    // create_file mkdir_p's missing parents.
+    if flags & 0x40 != 0 && crate::vfs::find_inode(norm).is_none() {
+        if crate::vfs::create_file(norm, b"").is_none() {
+            return -ENOENT;
+        }
+    }
+    match crate::vfs::resolve_or_register(norm) {
         Some(flat_idx) => {
             match crate::vfs::alloc_fd(flat_idx, flags) {
                 Some(fd) => fd as i64,
@@ -3860,7 +3906,11 @@ fn sys_mkdir(pathname: *const u8, mode: u32) -> i64 {
     if pathname.is_null() { return -EFAULT; }
     let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
-    match crate::vfs_core::mkdir(name, mode) {
+    let mut nbuf = [0u8; 512];
+    let nlen = crate::vfs::normalize_path(name, &mut nbuf).unwrap_or(0);
+    if nlen == 0 { return -ENOENT; }
+    let norm = &nbuf[..nlen];
+    match crate::vfs_core::mkdir(norm, mode) {
         Ok(_) => 0,
         Err(_) => -EACCES,
     }
@@ -3891,8 +3941,38 @@ fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     let old = { cstr_from_ptr(oldpath) };
     let new = { cstr_from_ptr(newpath) };
     if old.is_empty() || new.is_empty() { return -ENOENT; }
-    match crate::vfs_core::rename(old, new) {
-        Ok(()) => 0,
+    // runsv renames relative paths every cycle ("supervise/pid.new" ->
+    // "supervise/pid"); normalize against the task's cwd or vfs_core would
+    // resolve the parent from VFS ROOT and fail with EACCES.
+    let mut obuf = [0u8; 512];
+    let mut nbuf = [0u8; 512];
+    let olen = crate::vfs::normalize_path(old, &mut obuf).unwrap_or(0);
+    let nlen = crate::vfs::normalize_path(new, &mut nbuf).unwrap_or(0);
+    if olen == 0 || nlen == 0 { return -ENOENT; }
+    let oldn = &obuf[..olen];
+    let newn = &nbuf[..nlen];
+    if oldn == newn { return 0; }
+    match crate::vfs_core::rename(oldn, newn) {
+        Ok(()) => {
+            // Keep the flat name table coherent with the VFS tree AND the
+            // vnode table balanced: the renamed-away inode keeps living under
+            // the new name, so drop its old flat entry (and any stale target
+            // flat) and rebind the new name exactly once. Dropping the old
+            // flat first orphans its vnode — free by ino, then re-allocate a
+            // single fresh binding, so the per-cycle pid/status churn does not
+            // leak vnodes (runit renames every respawn cycle).
+            if let Ok(mv_ino) = crate::vfs_core::resolve_ino(newn) {
+                crate::vfs_core::vnode_free_by_ino(mv_ino);
+            }
+            if let Some(old_f) = crate::vfs::find_inode(oldn) {
+                unsafe { crate::vfs::INODES[old_f].used = false; }
+            }
+            if let Some(tgt_f) = crate::vfs::find_inode(newn) {
+                unsafe { crate::vfs::INODES[tgt_f].used = false; }
+            }
+            let _ = crate::vfs::resolve_or_register(newn);
+            0
+        }
         Err(_) => -EACCES,
     }
 }
@@ -4173,6 +4253,10 @@ fn sys_fork() -> i64 {
         if let Some(pfds) = parent_fds {
             let cfds = crate::vfs::fd_table_for(child_tid);
             { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
+            // Child now holds its own references on any inherited pipe ends.
+            for i in 0..crate::vfs::MAX_FDS_PER_TASK {
+                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+            }
         }
 
         let parent_idx = task_idx(id);
@@ -4257,6 +4341,8 @@ fn sys_fork() -> i64 {
             sig_blocked: parent.sig_blocked,
             sig_pending: 0,
             comm: parent.comm,
+            cwd: parent.cwd,
+            cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
             futex_deadline: 0,
@@ -4334,6 +4420,10 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
                 cfds.as_ptr() as *mut crate::vfs::FileDesc,
                 crate::vfs::MAX_FDS_PER_TASK,
             );
+            // Child now holds its own references on any inherited pipe ends.
+            for i in 0..crate::vfs::MAX_FDS_PER_TASK {
+                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+            }
         }
 
         let parent_idx = task_idx(id);
@@ -4458,6 +4548,8 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             sig_blocked: parent.sig_blocked,
             sig_pending: 0,
             comm: parent.comm,
+            cwd: parent.cwd,
+            cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
             futex_deadline: 0,
@@ -5340,30 +5432,107 @@ fn sys_close(fd: u32) -> i64 {
 
 // ── Pipe ───────────────────────────────────────────────────────────
 
-static mut PIPE_BUF: [u8; 4096] = [0; 4096];
-static mut PIPE_RPOS: usize = 0;
-static mut PIPE_WPOS: usize = 0;
-static mut PIPE_OPEN: bool = false;
+// Per-pipe buffers. The old design had ONE global 4KB pipe that was never
+// released (PIPE_OPEN stayed true forever), so every pipe() after the first
+// failed with EMFILE — runit/runsv could never start a service. Now each
+// pipe() claims a slot; a slot is freed when the last read end AND the last
+// write end are closed (across all tasks, thanks to pipe_inc_refs on fork/dup).
+pub const PIPE_MAX: usize = 8;
+// Pseudo-inode range at the top of the inode table reserved for pipes.
+// Read end of pipe p  = PIPE_INODE_BASE + p*2     (even)
+// Write end of pipe p = PIPE_INODE_BASE + p*2 + 1 (odd)
+pub const PIPE_INODE_BASE: usize = crate::vfs::MAX_INODES - PIPE_MAX * 2;
+
+#[derive(Clone, Copy)]
+struct PipeSlot {
+    buf: [u8; 4096],
+    rpos: usize,
+    wpos: usize,
+    nread: u32,
+    nwrite: u32,
+    used: bool,
+}
+impl PipeSlot {
+    const fn empty() -> Self {
+        PipeSlot { buf: [0; 4096], rpos: 0, wpos: 0, nread: 0, nwrite: 0, used: false }
+    }
+}
+static mut PIPES: [PipeSlot; PIPE_MAX] = [PipeSlot::empty(); PIPE_MAX];
+
+/// Map a pseudo-inode index to its pipe slot index (None for real files).
+pub fn pipe_idx_of(inode: usize) -> Option<usize> {
+    if inode >= PIPE_INODE_BASE && inode < crate::vfs::MAX_INODES {
+        Some((inode - PIPE_INODE_BASE) >> 1)
+    } else {
+        None
+    }
+}
+
+fn pipe_is_write_end(inode: usize) -> bool {
+    inode & 1 == 1
+}
+
+/// Add one reference to a pipe end (fork/dup of a pipe fd).
+pub fn pipe_inc_refs(inode_idx: usize) {
+    if let Some(p) = pipe_idx_of(inode_idx) {
+        unsafe {
+            if pipe_is_write_end(inode_idx) {
+                PIPES[p].nwrite = PIPES[p].nwrite.saturating_add(1);
+            } else {
+                PIPES[p].nread = PIPES[p].nread.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Drop one reference to a pipe end; free the slot when both ends are closed.
+/// Called by vfs::close_fd for every pipe fd closed by any task.
+pub fn pipe_close(inode_idx: usize) {
+    if let Some(p) = pipe_idx_of(inode_idx) {
+        unsafe {
+            if pipe_is_write_end(inode_idx) {
+                if PIPES[p].nwrite > 0 { PIPES[p].nwrite -= 1; }
+            } else if PIPES[p].nread > 0 {
+                PIPES[p].nread -= 1;
+            }
+            if PIPES[p].nread == 0 && PIPES[p].nwrite == 0 {
+                PIPES[p].used = false;
+                PIPES[p].rpos = 0;
+                PIPES[p].wpos = 0;
+            }
+        }
+    }
+}
 
 fn sys_pipe(pipefd: *mut u32) -> i64 {
     if pipefd.is_null() { return -EFAULT; }
     unsafe {
-        if PIPE_OPEN { return -EMFILE; }
-        PIPE_RPOS = 0;
-        PIPE_WPOS = 0;
-        PIPE_OPEN = true;
-        // Create pseudo-inodes for pipe read/write ends
-        // We use inode index crate::vfs::MAX_INODES-1 and crate::vfs::MAX_INODES-2 as pipe markers
-        let r_fd = crate::vfs::alloc_fd(crate::vfs::MAX_INODES - 1, 0); // read end
-        let w_fd = crate::vfs::alloc_fd(crate::vfs::MAX_INODES - 2, 0); // write end
-        match (r_fd, w_fd) {
-            (Some(r), Some(w)) => {
-                core::ptr::write_volatile(pipefd, r as u32);
-                core::ptr::write_volatile(pipefd.add(1), w as u32);
-                0
+        for p in 0..PIPE_MAX {
+            if PIPES[p].used { continue; }
+            PIPES[p].rpos = 0;
+            PIPES[p].wpos = 0;
+            PIPES[p].nread = 1;
+            PIPES[p].nwrite = 1;
+            PIPES[p].used = true;
+            let r_inode = PIPE_INODE_BASE + p * 2;
+            let w_inode = r_inode + 1;
+            match crate::vfs::alloc_fd(r_inode, 0) {
+                Some(r) => match crate::vfs::alloc_fd(w_inode, 0) {
+                    Some(w) => {
+                        core::ptr::write_volatile(pipefd, r as u32);
+                        core::ptr::write_volatile(pipefd.add(1), w as u32);
+                        return 0;
+                    }
+                    None => {
+                        crate::vfs::close_fd(r as usize);
+                        PIPES[p].used = false;
+                        return -EMFILE;
+                    }
+                },
+                None => { PIPES[p].used = false; return -EMFILE; }
             }
-            _ => -EMFILE,
         }
+        -EMFILE
     }
 }
 
@@ -5384,6 +5553,8 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
         if (newfd as usize) < crate::vfs::MAX_FDS_PER_TASK {
             table[newfd as usize] = table[oldfd as usize];
             table[newfd as usize].pos = 0;
+            // dup adds a new reference on a pipe end.
+            pipe_inc_refs(table[newfd as usize].inode_idx);
         }
         newfd as i64
     }
@@ -6147,6 +6318,12 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
                 0
             } else { -EBADF }
         },
+        // F_GETLK(5)/F_SETLK(6)/F_SETLKW(7): advisory record locks. No real
+        // locking is enforced (single-supervisor model), so report success /
+        // "no conflict" to keep runit's lock_exnb(open_append fcntl) happy.
+        5 => 0,
+        6 => 0,
+        7 => 0,
         1030 => { // F_DUPFD_CLOEXEC
             // Find lowest available fd >= arg
             let table = match crate::vfs::get_fd_table() {
@@ -6162,6 +6339,8 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
                         }
                         table[newfd] = table[fd as usize];
                         table[newfd].pos = 0;
+                        // dup adds another reference on a pipe end.
+                        pipe_inc_refs(table[newfd].inode_idx);
                     }
                     return newfd as i64;
                 }
@@ -6172,20 +6351,31 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
     }
 }
 
+// ── Flock ──────────────────────────────────────────────────────────
+
+/// flock(fd, operation). runit's lock_exnb is flock(fd, LOCK_EX|LOCK_NB) on
+/// Linux (not fcntl F_SETLK); the kernel previously returned ENOSYS so runsv
+/// died with "unable to lock supervise/lock: system call not available".
+/// No locking is enforced (single-supervisor model) — succeed unconditionally
+/// so the lock handshake passes (LOCK_UN also accepted no-op).
+fn sys_flock(fd: u32, operation: i32) -> i64 {
+    let _ = (fd, operation);
+    0
+}
+
 // ── Getcwd ─────────────────────────────────────────────────────────
 
-static mut CWD_BUF: [u8; 256] = [0; 256];
-static mut CWD_LEN: usize = 0;
-static CWD_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static ROOT_SLASH: [u8; 1] = [b'/'];
 
+/// Current task's working directory as bytes. Per-task: each process has its
+/// own CWD (copied at fork, set by chdir), so siblings resolving relative
+/// paths (runsvdir's per-service chdir) never clobber each other.
 pub fn get_cwd_bytes() -> &'static [u8] {
+    let id = cur_task().load(Ordering::SeqCst);
+    if id == 0 { return &ROOT_SLASH; }
     unsafe {
-        if !CWD_INIT.load(core::sync::atomic::Ordering::Relaxed) {
-            CWD_BUF[0] = b'/';
-            CWD_LEN = 1;
-            CWD_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
-        }
-        &CWD_BUF[..CWD_LEN]
+        let t = &TASKS[task_idx(id)];
+        if t.cwd_len == 0 { &ROOT_SLASH } else { &t.cwd[..t.cwd_len] }
     }
 }
 
@@ -6227,10 +6417,12 @@ fn sys_chdir(path: *const u8) -> i64 {
     let norm_name = &norm[..norm_len];
     match crate::vfs_core::resolve_ino(norm_name) {
         Ok(_) => {
+            let l = core::cmp::min(norm_name.len(), 255);
             unsafe {
-                let l = core::cmp::min(norm_name.len(), 255);
-                CWD_BUF[..l].copy_from_slice(&norm_name[..l]);
-                CWD_LEN = l;
+                let id = cur_task().load(Ordering::SeqCst);
+                let t = &mut TASKS[task_idx(id)];
+                t.cwd[..l].copy_from_slice(&norm_name[..l]);
+                t.cwd_len = l;
             }
             0
         }
@@ -6264,7 +6456,8 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
         flat_idx = table[fd as usize].inode_idx;
         pos = table[fd as usize].pos;
     }
-    if flat_idx >= crate::vfs::MAX_INODES - 2 {
+    if flat_idx >= crate::task::PIPE_INODE_BASE {
+        // Pipe pseudo-inodes are not directories.
         return -ENOTDIR;
     }
     let vn_id = unsafe { crate::vfs::INODES[flat_idx].vnode_id };
@@ -6455,13 +6648,29 @@ fn sys_setrlimit(_resource: u32, buf: *mut u8) -> i64 {
     0
 }
 
-fn sys_mknod(pathname: *const u8, _mode: u32, _dev: u64) -> i64 {
+fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> i64 {
     if pathname.is_null() { return -EFAULT; }
     let name = { cstr_from_ptr(pathname) };
     if name.is_empty() { return -ENOENT; }
-    match crate::vfs::create_file(name, b"") {
-        Some(_) => 0,
-        None => -EIO,
+    // Normalize relative paths (runsv mkfifos "supervise/control" after
+    // chdir): without this the file landed at VFS ROOT while stat/normalize
+    // looked it up under the task's cwd -> invisible => ENOENT.
+    let mut nbuf = [0u8; 512];
+    let nlen = crate::vfs::normalize_path(name, &mut nbuf).unwrap_or(0);
+    if nlen == 0 { return -ENOENT; }
+    let norm = &nbuf[..nlen];
+    // FIFOs: create the vnode with a real S_IFIFO mode so S_ISFIFO in
+    // stat() works (runit's fifo_make for supervise/control).
+    if mode & S_IFMT == S_IFIFO {
+        match crate::vfs::create_file_mode(norm, b"", S_IFIFO | 0o600) {
+            Some(_) => 0,
+            None => -EIO,
+        }
+    } else {
+        match crate::vfs::create_file(norm, b"") {
+            Some(_) => 0,
+            None => -EIO,
+        }
     }
 }
 
@@ -6563,6 +6772,7 @@ struct LinuxStat {
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
+const S_IFIFO: u32 = 0o010000;
 const S_IRWXU: u32 = 0o700;
 const S_IRUSR: u32 = 0o400;
 
@@ -6787,15 +6997,15 @@ fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
     let mut revents = 0i16;
     let inode_idx = inode_fd.inode_idx;
 
-    // Pipe read end (MAX_INODES-1) / write end (MAX_INODES-2): report REAL
-    // readiness from the global PIPE_BUF positions, so a poller actually
-    // blocks until data/space exists instead of returning always-ready.
-    if inode_idx == crate::vfs::MAX_INODES - 1 || inode_idx == crate::vfs::MAX_INODES - 2 {
+    // Pipe ends (pseudo-inodes in the reserved range): report REAL readiness
+    // from that pipe's buffer positions, so a poller actually blocks until
+    // data/space exists instead of returning always-ready.
+    if let Some(p) = pipe_idx_of(inode_idx) {
         unsafe {
-            if events & POLLIN != 0 && PIPE_RPOS < PIPE_WPOS {
+            if events & POLLIN != 0 && PIPES[p].rpos < PIPES[p].wpos {
                 revents |= POLLIN;
             }
-            if events & POLLOUT != 0 && PIPE_WPOS < 4096 {
+            if events & POLLOUT != 0 && PIPES[p].wpos < 4096 {
                 revents |= POLLOUT;
             }
         }
@@ -6900,7 +7110,19 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
 
         force_schedule();
 
-        // Woken up — loop around, re-scan, re-block until ready or deadline.
+        // Woken up — check whether a signal (e.g. SIGCHLD from a dead child)
+        // is what interrupted the block. Return 0 (spurious, no events) so the
+        // syscall exit path can run user handlers; a supervisor's run loop then
+        // reaps the child and respawns its ./run. Without this a runsv would
+        // only resurface at its (3600s) poll deadline.
+        let st = task_mut(id);
+        if st.sig_pending & !st.sig_blocked != 0 {
+            st.poll_fds = 0;
+            st.poll_nfds = 0;
+            return 0;
+        }
+
+        // Loop around, re-scan, re-block until ready or deadline.
     }
 }
 
