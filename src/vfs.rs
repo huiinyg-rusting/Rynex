@@ -3,13 +3,13 @@ use crate::vfs_core::ramfs;
 use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 pub const MAX_INODES: usize = 256;
-pub const MAX_FDS_PER_TASK: usize = 16;
+pub const MAX_FDS_PER_TASK: usize = 64;
 
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub struct Inode {
-    pub name: [u8; 32],
+    pub name: [u8; 64],
     pub data_ptr: *mut u8,
     pub size: usize,
     pub used: bool,
@@ -19,7 +19,7 @@ pub struct Inode {
 impl Inode {
     pub const fn empty() -> Self {
         Inode {
-            name: [0; 32],
+            name: [0; 64],
             data_ptr: core::ptr::null_mut(),
             size: 0,
             used: false,
@@ -55,11 +55,14 @@ static NEXT_FLAT_INODE: AtomicU64 = AtomicU64::new(1);
 
 fn alloc_flat_inode(name: &[u8], size: usize) -> Option<usize> {
     unsafe {
-        for i in 0..MAX_INODES {
+        // Pseudo-inode slots at the top of the table are reserved for pipes
+        // (see task::PIPE_INODE_BASE); real files must never take them or a
+        // real fd would be misread as a pipe end.
+        for i in 0..crate::task::PIPE_INODE_BASE {
             if !INODES[i].used {
                 INODES[i] = Inode::empty();
                 INODES[i].used = true;
-                let name_len = core::cmp::min(name.len(), 31);
+                let name_len = core::cmp::min(name.len(), 63);
                 for j in 0..name_len {
                     INODES[i].name[j] = name[j];
                 }
@@ -185,15 +188,37 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
             } else if crate::vfs_core::is_userfs_path(norm) {
                 // Path lives under a user-space FS mount: resolve through the
                 // IPC bridge so reads/writes forward to the FS service.
-                crate::vfs_core::path_to_vnode(norm).ok()? as u16
+                match crate::vfs_core::path_to_vnode(norm).ok() {
+                    Some(v) => v as u16,
+                    None => {
+                        // Roll back: never leave a phantom flat entry behind,
+                        // or a later lookup would report the file as existing
+                        // (runit then tries to exec bogus ./finish / control
+                        // scripts and dies with "invalid argument").
+                        INODES[flat_idx].used = false;
+                        return None;
+                    }
+                }
             } else {
                 let _mode = crate::vfs_core::types::S_IFREG
                     | crate::vfs_core::types::S_IRUSR
                     | crate::vfs_core::types::S_IWUSR
                     | crate::vfs_core::types::S_IRGRP
                     | crate::vfs_core::types::S_IROTH;
-                let ino = crate::vfs_core::resolve_ino(norm).ok()?;
-                crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS)?
+                let ino = match crate::vfs_core::resolve_ino(norm).ok() {
+                    Some(i) => i,
+                    None => {
+                        INODES[flat_idx].used = false;
+                        return None;
+                    }
+                };
+                match crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS) {
+                    Some(v) => v,
+                    None => {
+                        INODES[flat_idx].used = false;
+                        return None;
+                    }
+                }
             }
         };
         unsafe { INODES[flat_idx].vnode_id = vn_id; }
@@ -209,8 +234,6 @@ pub fn create_symlink(path: &[u8], target: &[u8]) -> Option<usize> {
 }
 
 pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
-    let flat_idx = alloc_flat_inode(name, data.len())?;
-
     let mode = crate::vfs_core::types::S_IFREG
         | crate::vfs_core::types::S_IRUSR
         | crate::vfs_core::types::S_IWUSR
@@ -219,6 +242,14 @@ pub fn create_file(name: &[u8], data: &[u8]) -> Option<usize> {
         | crate::vfs_core::types::S_IXGRP
         | crate::vfs_core::types::S_IROTH
         | crate::vfs_core::types::S_IXOTH;
+    create_file_mode(name, data, mode)
+}
+
+/// Like create_file but with an explicit FileMode, so mknod can materialize
+/// FIFOs (S_IFIFO) whose stat() then reports the right type for
+/// S_ISFIFO checks (runit's fifo_make).
+pub fn create_file_mode(name: &[u8], data: &[u8], mode: crate::vfs_core::types::FileMode) -> Option<usize> {
+    let flat_idx = alloc_flat_inode(name, data.len())?;
 
     match crate::vfs_core::create(name, mode) {
         Ok(ino) => {
@@ -304,16 +335,22 @@ pub fn find_inode(name: &[u8]) -> Option<usize> {
     let mut buf = [0u8; 512];
     let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
     let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
+    // Exact match: the stored name must be byte-identical to the normalized
+    // query AND end right where the query ends (name[j] == 0 terminator).
+    // A prefix-match here would let a parent directory's entry shadow all
+    // lookups beneath it (e.g. a bogus "/etc/service/demo/finish" hit for
+    // open_read("finish")), and path names longer than 31 bytes must resolve
+    // exactly, not by truncated prefix.
     unsafe {
         for i in 0..MAX_INODES {
             if !INODES[i].used { continue; }
             let mut matches = true;
             let mut j = 0;
-            while j < norm.len() && j < 31 {
+            while j < norm.len() && j < 63 {
                 if INODES[i].name[j] != norm[j] { matches = false; break; }
                 j += 1;
             }
-            if matches && (j == norm.len() || norm.len() == 0) && (j >= INODES[i].name.len() || INODES[i].name[j] == 0) {
+            if matches && j == norm.len() && INODES[i].name[j] == 0 {
                 return Some(i);
             }
         }
@@ -436,6 +473,9 @@ pub fn close_fd(fd: usize) -> bool {
     if fd >= MAX_FDS_PER_TASK || !table[fd].used {
         return false;
     }
+    // Release this task's reference on a pipe end (frees the pipe slot once
+    // the last reader AND last writer have closed, across all tasks).
+    crate::task::pipe_close(table[fd].inode_idx);
     table[fd].used = false;
     true
 }
