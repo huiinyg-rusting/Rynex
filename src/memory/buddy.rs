@@ -205,11 +205,18 @@ fn page_type_assert(addr: u64, expected: u8, context: &str) {
 }
 
 // ── Quarantine for freed page-table pages (breaks free→realloc cycle) ──────
-const QUARANTINE_INIT_CAP: usize = 256;    // 初始容量
-const QUARANTINE_MAX_CAP: usize = 1024;    // 最大扩容上限
+// Capacity is fixed at QUARANTINE_MAX_CAP from the start. It MUST NOT grow
+// dynamically: the ring arithmetic on the write side (q_push) and the read
+// side (q_pop) must share one modulus. The old code wrote slots with
+// `% cap` (growing 256→1024) but read them with `% QUARANTINE_MAX_CAP`;
+// once the ring wrapped past cap the tail pointer landed on unwritten/stale
+// slots and `q_pop` handed out physical page 0 (or an already-deployed page)
+// as a fresh page table — the root cause of the double-alloc / pml4[255]=0x27
+// cascade behind the rare user-stack #PF.
+const QUARANTINE_MAX_CAP: usize = 1024;    // 固定容量（写端/读端共用同一模数）
 
 static mut QUARANTINE: [u64; QUARANTINE_MAX_CAP] = [0; QUARANTINE_MAX_CAP];
-static mut QUARANTINE_CAP: usize = QUARANTINE_INIT_CAP;
+static mut QUARANTINE_CAP: usize = QUARANTINE_MAX_CAP;
 static mut QUARANTINE_HEAD: usize = 0;
 static mut QUARANTINE_COUNT: usize = 0;
 static mut QUARANTINE_FULL_COUNT: u64 = 0;
@@ -249,29 +256,35 @@ fn q_push(addr: u64) -> bool {
         true
     } else {
         // 隔离区满：记录，并让调用方把该页归还 buddy（避免静默泄漏物理页）。
+        // 注意：绝不动态扩容——扩容会改变写端模数，使读端（q_pop 按当前容量
+        // 取模）与已写入的槽位错位，正是当年 #PF 级联的根因（见上注释）。
         *q_full_ref() += 1;
         if *q_full_ref() <= 10 || *q_full_ref() % 100 == 0 {
             q_log_full();
-        }
-        // 动态扩容（仅前几次，且未达上限）
-        if *q_cap_ref() < QUARANTINE_MAX_CAP && *q_full_ref() <= 5 {
-            let c = q_cap_ref();
-            *c = (*c * 2).min(QUARANTINE_MAX_CAP);
-            crate::serial::write_str("QUARANTINE: expanded to ");
-            crate::serial::write_dec(*q_cap_ref() as u64);
-            crate::serial::write_str("\n");
         }
         false
     }
 }
 
 fn q_pop() -> Option<u64> {
-    if *q_count_ref() == 0 { return None; }
-    let idx = (*q_head_ref() + QUARANTINE_MAX_CAP - *q_count_ref()) % QUARANTINE_MAX_CAP;
-    let addr = *q_slot_ref(idx);
-    *q_count_ref() -= 1;
-    pte_refc_inc(addr);
-    Some(addr)
+    loop {
+        if *q_count_ref() == 0 { return None; }
+        // 单一模数：与 q_push 共用当前容量（= QUARANTINE_MAX_CAP，恒定）。
+        // 旧实现读端取模 QUARANTINE_MAX_CAP、写端取模动态 cap，环形包绕后
+        // tail 错位 → 读到未写/陈旧槽 → 把物理页 0 或已在服役的页再发一次。
+        let cap = *q_cap_ref();
+        let idx = (*q_head_ref() + cap - *q_count_ref()) % cap;
+        let addr = *q_slot_ref(idx);
+        *q_slot_ref(idx) = 0; // 弹出即清槽，杜绝陈旧槽值被再次读出（double-alloc）
+        *q_count_ref() -= 1;
+        // 槽值守卫：绝不外发非托管地址（防意外脏槽）。
+        let base = alloc_base();
+        let end = base + alloc_pages() * PAGE_SIZE;
+        if addr != 0 && addr >= base && addr < end {
+            pte_refc_inc(addr);
+            return Some(addr);
+        }
+    }
 }
 
 fn q_log_full() {
@@ -660,6 +673,21 @@ impl BuddyAllocator {
                     h.next = ptr::null_mut();
                 }
                 let pidx = self.page_index(addr);
+                if used_set(pidx) {
+                    crate::serial::write_str("\n=== BUDDY DOUBLE-ALLOC === addr=0x");
+                    crate::serial::write_hex(addr);
+                    crate::serial::write_str(" order=");
+                    crate::serial::write_dec(o as u64);
+                    crate::serial::write_str(" tick=");
+                    crate::serial::write_dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+                    crate::serial::write_str(" caller=0x");
+                    crate::serial::write_hex(core::intrinsics::return_address() as u64);
+                    crate::serial::write_str(" ptype=");
+                    crate::serial::write_dec(page_type_get(addr) as u64);
+                    crate::serial::write_str(" task=");
+                    crate::serial::write_dec(crate::task::current_task_id());
+                    crate::serial::write_str("\n");
+                }
                 used_mark(pidx);
                 crate::memory::buddy::untrack_freed_page(addr);
                 self.free_lists[o] = next;

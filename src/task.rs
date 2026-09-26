@@ -2201,6 +2201,8 @@ pub const SYS_exit: u64 = 60;
 pub const SYS_wait4: u64 = 61;
 pub const SYS_kill: u64 = 62;
 pub const SYS_uname: u64 = 63;
+pub const SYS_gethostname: u64 = 104;
+pub const SYS_sethostname: u64 = 105;
 pub const SYS_flock: u64 = 73;
 pub const SYS_fcntl: u64 = 72;
 pub const SYS_getcwd: u64 = 79;
@@ -2366,6 +2368,8 @@ pub extern "C" fn syscall_handler(
         SYS_wait4 => sys_wait4(arg1 as i64, arg2 as *mut i32, arg3 as i32, arg4 as u64),
         SYS_kill => sys_kill(arg1 as i64, arg2 as i32),
         SYS_uname => sys_uname(arg1 as *mut u8),
+        SYS_gethostname => sys_gethostname(arg1 as *mut u8, arg2 as usize),
+        SYS_sethostname => sys_sethostname(arg1 as *const u8, arg2 as usize),
         SYS_fcntl => sys_fcntl(arg1 as u32, arg2 as i32, arg3 as u64),
         SYS_flock => sys_flock(arg1 as u32, arg2 as i32),
         SYS_getcwd => sys_getcwd(arg1 as *mut u8, arg2 as usize),
@@ -6210,6 +6214,64 @@ fn sys_uname(buf: *mut u8) -> i64 {
     0
 }
 
+// ── Hostname ────────────────────────────────────────────────────────
+
+static mut HOSTNAME: [u8; 64] = {
+    const fn make_hostname() -> [u8; 64] {
+        let mut h = [0u8; 64];
+        h[0] = b'r';
+        h[1] = b'y';
+        h[2] = b'n';
+        h[3] = b'e';
+        h[4] = b'x';
+        h
+    }
+    make_hostname()
+};
+
+fn hostname_str() -> [u8; 64] {
+    unsafe {
+        let mut out = [0u8; 64];
+        let mut i = 0usize;
+        while i < 64 && HOSTNAME[i] != 0 {
+            out[i] = HOSTNAME[i];
+            i += 1;
+        }
+        out[i] = 0;
+        out
+    }
+}
+
+fn sys_gethostname(name: *mut u8, len: usize) -> i64 {
+    if name.is_null() { return -EFAULT; }
+    if len == 0 { return -EINVAL; }
+    let host = hostname_str();
+    let mut n = 0usize;
+    while n < 64 && host[n] != 0 { n += 1; }
+    // Linux semantics: the buffer must hold name + terminating NUL.
+    if len < n + 1 { return -ENAMETOOLONG; }
+    unsafe {
+        core::ptr::copy_nonoverlapping(host.as_ptr(), name, n);
+        *name.add(n) = 0;
+    }
+    0
+}
+
+fn sys_sethostname(name: *const u8, len: usize) -> i64 {
+    if name.is_null() { return -EFAULT; }
+    if len > 63 { return -EINVAL; }
+    unsafe {
+        if !user_range_valid(name as u64, len, true) {
+            return -EFAULT;
+        }
+        for i in 0..len {
+            HOSTNAME[i] = core::ptr::read(name.add(i));
+        }
+        HOSTNAME[len] = 0;
+    }
+    0
+}
+
 // ── Ioctl ──────────────────────────────────────────────────────────
 
 fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
@@ -7281,7 +7343,7 @@ pub fn boot_userland() {
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     let mut init_tid = 0u64;
     if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 16];
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 24];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
         for i in 0..n {
             let mod_data = unsafe {

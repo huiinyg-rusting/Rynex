@@ -959,7 +959,7 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
     // TASKS[idx].pml4 (e.g. pointing into the module/ramfs area) would make
     // this walk read arbitrary data as page tables and free pages that were
     // never allocated, corrupting the buddy free lists (the DOUBLE-FREE bug).
-    if pml4 < base || pml4 >= end {
+    if pml4 < base || pml4 >= end || !crate::memory::buddy::page_is_used(pml4) {
         crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
         crate::klog::s("FAS BADPML4 pml4=0x");
         crate::klog::hex(pml4);
@@ -1029,13 +1029,38 @@ pub fn free_address_space(pml4: u64, free_ro: bool) {
         // Track visited page table pages to prevent double-free when the same
         // physical page table page is reachable through multiple paths.
         let mut visited_pt: [u64; 2048] = [0; 2048];
+        let mut visited_role: [u8; 2048] = [0; 2048]; // 1=PDPT 2=PD 3=PT 4=PML4
         let mut visited_count: usize = 0;
 
         let table = &*(pml4 as *const PageTable);
         for pml4_idx in 0..256 {
             let pml4e = table.0[pml4_idx];
             if pml4e & PTE_PRESENT == 0 { continue; }
-            let pdpt = (pml4e & PTE_ADDR_MASK) as *mut PageTable;
+            let pdpt_p = pml4e & PTE_ADDR_MASK;
+            // A present pml4 entry must point to a live, PTE-typed table page.
+            // A dangling entry (freed / recycled page) would make this walk
+            // descend into garbage and FREE OTHER TASKS' LIVE TABLES — the
+            // FAS cascade behind the rare user-stack #PF. Validate before
+            // descending; a broken slot is skipped (leaked), never walked.
+            if !(pdpt_p >= base && pdpt_p < end
+                && crate::memory::buddy::page_is_used(pdpt_p)
+                && crate::memory::buddy::page_type_get(pdpt_p) == crate::memory::buddy::PAGE_TYPE_PTE)
+            {
+                crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+                crate::klog::s("FAS BADPML4E pml4=0x");
+                crate::klog::hex(pml4);
+                crate::klog::s(" slot=");
+                crate::klog::dec(pml4_idx as u64);
+                crate::klog::s(" pml4e=0x");
+                crate::klog::hex(pml4e);
+                crate::klog::s(" used=");
+                crate::klog::dec(u64::from(crate::memory::buddy::page_is_used(pdpt_p)));
+                crate::klog::s(" type=");
+                crate::klog::dec(crate::memory::buddy::page_type_get(pdpt_p) as u64);
+                crate::klog::end();
+                continue;
+            }
+            let pdpt = pdpt_p as *mut PageTable;
 
 let mut pdpt_user = false;
             for pdpt_idx in 0..512 {
@@ -1043,7 +1068,10 @@ let mut pdpt_user = false;
                 if pdpte & PTE_PRESENT == 0 { continue; }
                 if pdpte & PTE_HUGE != 0 { continue; } // 1G kernel identity
                 let pdpt_phys = pdpte & PTE_ADDR_MASK;
-                if pdpt_phys < base || pdpt_phys >= end {
+                if pdpt_phys < base || pdpt_phys >= end
+                    || !crate::memory::buddy::page_is_used(pdpt_phys)
+                    || crate::memory::buddy::page_type_get(pdpt_phys) != crate::memory::buddy::PAGE_TYPE_PTE
+                {
                     crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                     crate::klog::s("FAS: BAD PDPT pml4=0x");
                     crate::klog::hex(pml4);
@@ -1056,21 +1084,11 @@ let mut pdpt_user = false;
                 }
                 // In-range page-table page: mark used so buddy bookkeeping stays
                 // consistent (some allocation paths don't set the used bit).
+                // NOTE: do NOT pre-store this PD page here. Dedup happens post-walk
+                // in the pd_user branch; a pre-store made that check see its own
+                // path's entry and skip the dec+free — silently leaking every user
+                // PD page on address-space teardown.
                 crate::memory::buddy::mark_page_used(pdpt_phys);
-                // Track visited PDPT to prevent double-free
-                if visited_count < 2048 {
-                    let mut found = false;
-                    for i in 0..visited_count {
-                        if visited_pt[i] == pdpt_phys {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        visited_pt[visited_count] = pdpt_phys;
-                        visited_count += 1;
-                    }
-                }
                 let pd = pdpt_phys as *mut PageTable;
 
                 let mut pd_user = false;
@@ -1079,7 +1097,10 @@ let mut pdpt_user = false;
                     if pde & PTE_PRESENT == 0 { continue; }
                     if pde & PTE_HUGE != 0 { continue; } // 2M kernel identity
                     let pd_phys = pde & PTE_ADDR_MASK;
-                    if pd_phys < base || pd_phys >= end {
+                    if pd_phys < base || pd_phys >= end
+                        || !crate::memory::buddy::page_is_used(pd_phys)
+                        || crate::memory::buddy::page_type_get(pd_phys) != crate::memory::buddy::PAGE_TYPE_PTE
+                    {
                         crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                         crate::klog::s("FAS: BAD PD pml4=0x");
                         crate::klog::hex(pml4);
@@ -1093,20 +1114,10 @@ let mut pdpt_user = false;
                         continue;
                     }
                     crate::memory::buddy::mark_page_used(pd_phys);
-                    // Track visited PD to prevent double-free
-                    if visited_count < 2048 {
-                        let mut found = false;
-                        for i in 0..visited_count {
-                            if visited_pt[i] == pd_phys {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            visited_pt[visited_count] = pd_phys;
-                            visited_count += 1;
-                        }
-                    }
+                    // NOTE: do NOT pre-store this PT page here. Dedup happens in
+                    // the pt_user branch (post-walk); a pre-store made the PT check
+                    // see its own path's entry and skip the dec+free — leaking
+                    // every user PT page on address-space teardown.
                     let pt = pd_phys as *mut PageTable;
 
                     let mut pt_user = false;
@@ -1210,21 +1221,35 @@ let mut pdpt_user = false;
                         // just the free, or a shared page's refcount is released
                         // twice and freed while a fork sibling still points at it.
                         let mut already = false;
+                        let mut ai = 0usize;
                         for i in 0..visited_count {
-                            if visited_pt[i] == pt_phys { already = true; break; }
+                            if visited_pt[i] == pt_phys { already = true; ai = i; break; }
                         }
                         if already {
                             crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                             crate::klog::s("FAS ALIAS PT pml4=0x");
                             crate::klog::hex(pml4);
+                            crate::klog::s(" pos=");
+                            crate::klog::dec(pml4_idx as u64);
+                            crate::klog::s("/");
+                            crate::klog::dec(pdpt_idx as u64);
+                            crate::klog::s("/");
+                            crate::klog::dec(pd_idx as u64);
                             crate::klog::s(" pt_phys=0x");
                             crate::klog::hex(pt_phys);
+                            crate::klog::s(" refc=");
+                            crate::klog::dec(crate::memory::buddy::pte_refc_get(pt_phys) as u64);
+                            crate::klog::s(" type=");
+                            crate::klog::dec(crate::memory::buddy::page_type_get(pt_phys) as u64);
+                            crate::klog::s(" firstrole=");
+                            crate::klog::dec(visited_role[ai] as u64);
                             crate::klog::s(" task=");
                             crate::klog::dec(crate::task::current_task_id());
                             crate::klog::end();
                         } else {
                             if visited_count < 2048 {
                                 visited_pt[visited_count] = pt_phys;
+                                visited_role[visited_count] = 3;
                                 visited_count += 1;
                             }
                             if crate::memory::buddy::pte_refc_dec(pt_phys) {
@@ -1240,21 +1265,33 @@ let mut pdpt_user = false;
                     let pd_phys = pdpte & PTE_ADDR_MASK;
                     // Track visited PD to prevent double-free AND double-dec.
                     let mut already = false;
+                    let mut ai = 0usize;
                     for i in 0..visited_count {
-                        if visited_pt[i] == pd_phys { already = true; break; }
+                        if visited_pt[i] == pd_phys { already = true; ai = i; break; }
                     }
                     if already {
                         crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
                         crate::klog::s("FAS ALIAS PD pml4=0x");
                         crate::klog::hex(pml4);
+                        crate::klog::s(" pos=");
+                        crate::klog::dec(pml4_idx as u64);
+                        crate::klog::s("/");
+                        crate::klog::dec(pdpt_idx as u64);
                         crate::klog::s(" pd_phys=0x");
                         crate::klog::hex(pd_phys);
+                        crate::klog::s(" refc=");
+                        crate::klog::dec(crate::memory::buddy::pte_refc_get(pd_phys) as u64);
+                        crate::klog::s(" type=");
+                        crate::klog::dec(crate::memory::buddy::page_type_get(pd_phys) as u64);
+                        crate::klog::s(" firstrole=");
+                        crate::klog::dec(visited_role[ai] as u64);
                         crate::klog::s(" task=");
                         crate::klog::dec(crate::task::current_task_id());
                         crate::klog::end();
                     } else {
                         if visited_count < 2048 {
                             visited_pt[visited_count] = pd_phys;
+                            visited_role[visited_count] = 2;
                             visited_count += 1;
                         }
                         if crate::memory::buddy::pte_refc_dec(pd_phys) {
@@ -1285,6 +1322,7 @@ let mut pdpt_user = false;
                 } else {
                     if visited_count < 2048 {
                         visited_pt[visited_count] = pdpt_phys;
+                        visited_role[visited_count] = 1;
                         visited_count += 1;
                     }
                     if crate::memory::buddy::pte_refc_dec(pdpt_phys) {
@@ -1306,6 +1344,7 @@ let mut pdpt_user = false;
             }
             if !found {
                 visited_pt[visited_count] = pml4;
+                visited_role[visited_count] = 4;
                 visited_count += 1;
             }
         }
@@ -1355,6 +1394,29 @@ pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
     for pml4_idx in 0..256 {
         let pml4e = old_table.0[pml4_idx];
         if pml4e & PTE_PRESENT == 0 { continue; }
+
+        // Sanity: the parent's PDPT must be a live PTE-typed table page. A
+        // dangling entry (freed/recycled page) must NOT propagate into the
+        // child (FAS-cascade protection: walking garbage would free other
+        // tasks' live tables when the child later exits).
+        let op_p = pml4e & PTE_ADDR_MASK;
+        let obase = crate::memory::buddy::alloc_base();
+        let oend = obase + crate::memory::buddy::alloc_pages() * crate::memory::buddy::PAGE_SIZE;
+        if !(op_p >= obase && op_p < oend
+            && crate::memory::buddy::page_is_used(op_p)
+            && crate::memory::buddy::page_type_get(op_p) == crate::memory::buddy::PAGE_TYPE_PTE)
+        {
+            crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+            crate::klog::s("FORK BADPML4E parent=0x");
+            crate::klog::hex(old_pml4);
+            crate::klog::s(" slot=");
+            crate::klog::dec(pml4_idx as u64);
+            crate::klog::s(" pml4e=0x");
+            crate::klog::hex(pml4e);
+            crate::klog::end();
+            new_table.0[pml4_idx] = 0;
+            continue;
+        }
 
         // Share the PDPT with the child
         new_table.0[pml4_idx] = pml4e;
