@@ -272,6 +272,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
             Some(p) => p,
             None => return Err("OOM for PML4"),
         };
+        crate::memory::buddy::page_type_set(p, crate::memory::buddy::PAGE_TYPE_PTE);
         let new_pt = unsafe { &mut *(p as *mut crate::paging::PageTable) };
         let kernel_pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::SeqCst);
         let old_pt = unsafe { &*(kernel_pml4 as *const crate::paging::PageTable) };
@@ -282,6 +283,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         if new_pt.0[0] & crate::paging::PTE_PRESENT != 0 {
             let old_pdpt = (new_pt.0[0] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
             let new_pdpt = alloc_page().ok_or("OOM: PDPT clone")?;
+            crate::memory::buddy::page_type_set(new_pdpt, crate::memory::buddy::PAGE_TYPE_PTE);
             unsafe {
                 core::ptr::copy(old_pdpt as *const u8, new_pdpt as *mut u8, 4096);
         let pdpt = &mut *(new_pdpt as *mut crate::paging::PageTable);
@@ -293,6 +295,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                 }
                 let old_pd = (pdpt.0[i] & crate::paging::PTE_ADDR_MASK) as *const crate::paging::PageTable;
                 let new_pd = alloc_page().ok_or("OOM: PD clone")?;
+                crate::memory::buddy::page_type_set(new_pd, crate::memory::buddy::PAGE_TYPE_PTE);
                 { core::ptr::copy(old_pd as *const u8, new_pd as *mut u8, 4096); }
                 pdpt.0[i] = new_pd | (pdpt.0[i] & !crate::paging::PTE_ADDR_MASK);
             }
@@ -331,6 +334,7 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
                             // 2 MB huge page – split into 4 KB pages
                             let huge_phys = pde0 & crate::paging::PTE_ADDR_MASK;
                             let new_pt = alloc_page().ok_or("OOM: null PT split")?;
+                            crate::memory::buddy::page_type_set(new_pt, crate::memory::buddy::PAGE_TYPE_PTE);
                             { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
                             let pt = { &mut *(new_pt as *mut crate::paging::PageTable) };
                             for i in 0..512 {
