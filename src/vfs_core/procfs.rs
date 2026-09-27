@@ -73,10 +73,28 @@ impl ProcFs {
     }
 
     fn meminfo_text(&self, buf: &mut [u8]) -> usize {
-        let s = b"MemTotal:       64000 kB\n";
-        let l = s.len().min(buf.len());
-        buf[..l].copy_from_slice(&s[..l]);
-        l
+        // Dynamic values: total/free from the buddy allocator. fastfetch's
+        // Memory module needs MemTotal + MemFree/MemAvailable or it shows a
+        // hardcoded 62.5MiB at 100%.
+        let total_kb = crate::memory::allocator().total_pages() * 4; // pages * 4KiB
+        let free_kb = crate::memory::allocator().free_page_count() * 4;
+        let mut n = 0usize;
+        let mut put_line = |tag: &[u8], val: u64| {
+            let mut d = 0usize;
+            let mut digits = [0u8; 20];
+            let mut v = val;
+            if v == 0 { digits[0] = b'0'; d = 1; }
+            while v > 0 { digits[d] = b'0' + (v % 10) as u8; v /= 10; d += 1; }
+            for i in 0..tag.len() { if n < buf.len() { buf[n] = tag[i]; n += 1; } }
+            for _ in 0..(16 - tag.len()).min(8) { if n < buf.len() { buf[n] = b' '; n += 1; } }
+            for i in (0..d).rev() { if n < buf.len() { buf[n] = digits[i]; n += 1; } }
+            let s = b" kB\n";
+            for &c in s { if n < buf.len() { buf[n] = c; n += 1; } }
+        };
+        put_line(b"MemTotal:", total_kb);
+        put_line(b"MemFree:", free_kb);
+        put_line(b"MemAvailable:", free_kb);
+        n
     }
 
     fn version_text(&self, buf: &mut [u8]) -> usize {

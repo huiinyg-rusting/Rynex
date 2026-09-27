@@ -359,6 +359,16 @@ pub fn load_elf_at(data: &[u8], load_addr: u64, existing_pml4: Option<u64>) -> R
         p
     };
 
+    // POISON-TRAP: arm the PAGE_TYPE write protection in THIS task's pml4
+    // (not the kernel master). Any kernel-mode write to the PAGE_TYPE array
+    // that does NOT go through page_type_set() now #PFs and is attributed
+    // (PGTYPE-TRAP with VA/RIP/CR3) in interrupts.rs before being let through.
+    // Re-enabled once the boot-hang root cause was fixed (kernel .bss moved to
+    // 128M: PAGE_TYPE no longer shares the fastfetch image VA window), so the
+    // trap's split of the identity huge page at the arena base can't alias user
+    // pages anymore.
+    let _ = crate::paging::arm_type_protect_for(pml4);
+
     // Highest mapped address (for stack placement)
     let mut max_end = 0u64;
     let mut interp_path = [0u8; 64];

@@ -30,14 +30,33 @@ static mut FREED_BMP: [u64; FREED_BMP_WORDS] = [0; FREED_BMP_WORDS];
 // Used by audit_free_lists to detect a page appearing in multiple orders' lists
 // (duplicate-free / overlapping-block bug).
 const OWNED_ORDER_SENTINEL: u8 = 0xFF;
-static mut PAGE_OWNED_BY: [u8; MAX_REFC_PAGES] = [OWNED_ORDER_SENTINEL; MAX_REFC_PAGES];
+// PAGE_OWNED_BY / PAGE_TYPE used to be kernel BSS statics at ~0x7AA1A0 /
+// ~0x5AA1A0 — INSIDE the user image window (image VAs start at 0x402000 and
+// the ET_EXEC fastfetch image reaches ~0x64B9C8). Metadata reads/writes at
+// those VAs were therefore VA-ALIASED to image pages: FAS validations read
+// FILE BYTES instead of the array (phantom BADPML4E + leaked tables) and
+// page_type_set writes landed in the image. memory::init now carves a 4 MiB
+// arena from the TOP of RAM (identity VA ~0x1FBAC000, far above any image),
+// zeroes it, reserves it, and points these bases at it. The BSS statics are
+// GONE (kernel end shrinks; the memory is returned to the buddy).
+static mut PAGE_OWNED_BASE: u64 = 0;
+static mut PAGE_TYPE_BASE: u64 = 0;
+
+/// Called by memory::init once the top-of-RAM arena is zeroed and before ANY
+/// buddy metadata use: routes PAGE_TYPE / PAGE_OWNED_BY access through the
+/// high identity VAs. There is no valid window between boot and this call
+/// where the array is touched (memory::init is the first metadata user).
+pub unsafe fn set_page_type_bases(page_type_base: u64, owned_base: u64) {
+    PAGE_TYPE_BASE = page_type_base;
+    PAGE_OWNED_BASE = owned_base;
+}
 
 // Centralized accessors for the static-mut tracking arrays (bug 86). Scalar
 // load/store only, so holding the returned reference briefly is safe; the
 // caller is responsible for the usual BUDDY_LOCK discipline.
 #[inline(always)]
 fn owned_ref(i: usize) -> &'static mut u8 {
-    unsafe { &mut PAGE_OWNED_BY[i] }
+    unsafe { &mut *(PAGE_OWNED_BASE as *mut u8).add(i) }
 }
 #[inline(always)]
 fn audit_counter_ref() -> &'static mut u64 {
@@ -49,7 +68,7 @@ fn audit_active_ref() -> &'static mut bool {
 }
 #[inline(always)]
 fn type_ref(i: usize) -> &'static mut u8 {
-    unsafe { &mut PAGE_TYPE[i] }
+    unsafe { &mut *(PAGE_TYPE_BASE as *mut u8).add(i) }
 }
 #[inline(always)]
 fn pte_refc_ref(i: usize) -> &'static mut u16 {
@@ -130,8 +149,7 @@ pub fn page_is_used(phys: u64) -> bool {
 
 // ── Page type tracking (2 bits per page, separate array) ────────────────────
 // Sized for up to 8 GiB of RAM (2^21 pages = 2,097,152)
-const MAX_REFC_PAGES: usize = 1 << 21;
-static mut PAGE_TYPE: [u8; MAX_REFC_PAGES] = [0; MAX_REFC_PAGES];
+pub const MAX_REFC_PAGES: usize = 1 << 21;
 
 pub const PAGE_TYPE_FREE: u8 = 0;      // on free list
 pub const PAGE_TYPE_PTE: u8 = 1;       // page table page (PML4/PDPT/PD/PT)
@@ -180,8 +198,27 @@ pub fn page_type_get(addr: u64) -> u8 {
 pub fn page_type_set(addr: u64, t: u8) {
     let idx = phys_to_idx(addr) as usize;
     if idx < MAX_REFC_PAGES {
+        let old = *type_ref(idx);
+        // The PAGE_TYPE array's physical pages are write-protected (POISON-TRAP)
+        // so ANY write that does not come through this function faults and is
+        // attributed. Toggle R/W around our own write so legit metadata updates
+        // never fault. (No-op when the page is not protected yet.)
+        unsafe { crate::paging::type_page_rw(idx, true); }
         *type_ref(idx) = t;
+        unsafe { crate::paging::type_page_rw(idx, false); }
     }
+}
+
+/// Runtime virtual (= physical, via identity map) base address of PAGE_TYPE
+/// (the top-of-RAM arena installed by memory::init).
+pub fn page_type_base() -> u64 {
+    unsafe { PAGE_TYPE_BASE }
+}
+
+/// [lo, hi) virtual range of the PAGE_TYPE array (identity-mapped).
+pub fn page_type_band() -> (u64, u64) {
+    let b = page_type_base();
+    (b, b + MAX_REFC_PAGES as u64)
 }
 
 fn page_type_assert(addr: u64, expected: u8, context: &str) {

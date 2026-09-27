@@ -183,7 +183,144 @@ pub fn kernel_ro_write_resolve(cr2: u64) -> bool {
         e.0[vpn[3]] |= PTE_WRITABLE;
         true
     }
-}impl PageTable {
+}
+
+// ── POISON-TRAP for the PAGE_TYPE array ─────────────────────────────────────
+// The PAGE_TYPE metadata array lives in kernel BSS (identity-mapped). Its real
+// deixis: a stray kernel write that does NOT go through page_type_set (e.g. a
+// wild memcpy with a corrupt destination) lands directly in the array's
+// physical pages. arm_type_protect() splits the covering identity 2MB huge
+// pages into 4K entries and write-protects every PAGE_TYPE page, so such a
+// stray write faults (#PF) and is attributed with RIP/CR3 before being let
+// through. page_type_set() toggles R/W around its own writes (below).
+
+/// Set or clear the writable bit on the 4K identity PTE covering PAGE_TYPE[idx]
+/// in the CURRENT task's page tables. Returns true when the PTE was found as a
+/// non-huge leaf (i.e. the protection is active for that page); returns false
+/// when the mapping is still a huge page or missing (no trap armed yet), in
+/// which case the caller must simply write through.
+pub fn type_page_rw(idx: usize, writable: bool) -> bool {
+    // Use the raw CR3, not current_task_pml4(): this is called from page_type_set
+    // deep in early boot (pre-scheduler/lapic) where current_cpu() would read
+    // LAPIC MMIO that is not mapped yet and #PF/hang. Raw CR3 is always valid.
+    let mut cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
+    if cr3 == 0 {
+        return false;
+    }
+    let va = crate::memory::buddy::page_type_base() + idx as u64;
+    let vpn = [
+        ((va >> 39) & 0x1FF) as usize,
+        ((va >> 30) & 0x1FF) as usize,
+        ((va >> 21) & 0x1FF) as usize,
+        ((va >> 12) & 0x1FF) as usize,
+    ];
+    unsafe {
+        let pml4t = &*(cr3 as *const PageTable);
+        if pml4t.0[vpn[0]] & PTE_PRESENT == 0 { return false; }
+        let pdpt = &*((pml4t.0[vpn[0]] & PTE_ADDR_MASK) as *const PageTable);
+        if pdpt.0[vpn[1]] & PTE_PRESENT == 0 { return false; }
+        if pdpt.0[vpn[1]] & PTE_HUGE != 0 { return false; }
+        let pd = &*((pdpt.0[vpn[1]] & PTE_ADDR_MASK) as *const PageTable);
+        if pd.0[vpn[2]] & PTE_PRESENT == 0 { return false; }
+        if pd.0[vpn[2]] & PTE_HUGE != 0 { return false; }
+        let pt = &mut *((pd.0[vpn[2]] & PTE_ADDR_MASK) as *mut PageTable);
+        if pt.0[vpn[3]] & PTE_PRESENT == 0 { return false; }
+        if writable {
+            pt.0[vpn[3]] |= PTE_WRITABLE;
+        } else {
+            pt.0[vpn[3]] &= !PTE_WRITABLE;
+        }
+    }
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)); }
+    true
+}
+
+/// Split the identity PD entries covering the PAGE_TYPE array into 4K
+/// pages and write-protect them, in the GIVEN pml4. This must be done on a
+/// USER-task pml4 (after the clone deep-copy), NOT on the kernel master:
+/// the kernel keeps its own 2MB identity huge pages so its global-data
+/// accesses and the ELF loader's huge-page split path stay unchanged. The
+/// split PTs are shared by fork clones (clone copies PDs verbatim), so arming
+/// every exec propagates the trap to the whole task tree. page_type_set()
+/// toggles R/W around its own writes via type_page_rw().
+pub fn arm_type_protect_for(pml4: u64) -> Result<(), &'static str> {
+    let (band_lo, band_hi) = crate::memory::buddy::page_type_band();
+    let mut va2m = band_lo & !0x1FFFFF; // 2MB-aligned start of the covering PD
+    let end = (band_hi + 0x1FFFFF) & !0x1FFFFF;
+    if pml4 == 0 {
+        return Err("no pml4");
+    }
+    while va2m < end {
+        let vpn = [
+            ((va2m >> 39) & 0x1FF) as usize,
+            ((va2m >> 30) & 0x1FF) as usize,
+            ((va2m >> 21) & 0x1FF) as usize,
+        ];
+        unsafe {
+            let pml4t = &mut *(pml4 as *mut PageTable);
+            if pml4t.0[vpn[0]] & PTE_PRESENT == 0 {
+                return Err("no pml4e covering PAGE_TYPE");
+            }
+            let pdpt = &mut *((pml4t.0[vpn[0]] & PTE_ADDR_MASK) as *mut PageTable);
+            if pdpt.0[vpn[1]] & PTE_PRESENT == 0 || pdpt.0[vpn[1]] & PTE_HUGE != 0 {
+                return Err("no pdpte covering PAGE_TYPE");
+            }
+            let pd = &mut *((pdpt.0[vpn[1]] & PTE_ADDR_MASK) as *mut PageTable);
+            let pde = pd.0[vpn[2]];
+            if pde & PTE_PRESENT == 0 {
+                return Err("no pde covering PAGE_TYPE");
+            }
+            let pt = if pde & PTE_HUGE != 0 {
+                // Split the 2MB identity huge page into 4K identity entries
+                // (non-USER, writable for now).
+                let huge_base = pde & (0xFFFFFFFFFF << 21);
+                let new_pt = PageTableManager::alloc_page()?;
+                unsafe { core::ptr::write_bytes(new_pt as *mut u8, 0, 4096); }
+                let flags = (pde & 0x7F) & !PTE_USER;
+                let pt_arr = unsafe { &mut *(new_pt as *mut PageTable) };
+                for i in 0..512u64 {
+                    pt_arr.0[i as usize] = (huge_base + i * 0x1000) | flags;
+                }
+                pd.0[vpn[2]] = new_pt | PTE_PRESENT | PTE_WRITABLE;
+                new_pt
+            } else {
+                pde & PTE_ADDR_MASK
+            };
+            // Write-protect the PTEs covering the band within this 2MB block.
+            let pt_arr = unsafe { &mut *(pt as *mut PageTable) };
+            let sub_lo = core::cmp::max(band_lo, va2m);
+            let sub_hi = core::cmp::min(band_hi, va2m + 0x200000);
+            let mut off = sub_lo - va2m;
+            while off < sub_hi - va2m {
+                let i = (off >> 12) as usize;
+                if pt_arr.0[i] & PTE_PRESENT != 0 && pt_arr.0[i] & PTE_USER == 0 {
+                    pt_arr.0[i] &= !PTE_WRITABLE;
+                    core::arch::asm!("invlpg [{}]", in(reg) (va2m + off), options(nostack, preserves_flags));
+                }
+                off += 0x1000;
+            }
+        }
+        va2m += 0x200000;
+    }
+    crate::serial::write_str("PAGING: PAGE_TYPE trap armed pml4=0x");
+    crate::serial::write_hex(pml4);
+    crate::serial::write_str("\n");
+    Ok(())
+}
+
+/// Arm the PAGE_TYPE write-protection on the kernel master pml4. NOTE: NOT
+/// used — arming the master remodels the shared identity PDs that the ELF
+/// loader depends on (huge→4K split breaks clone reuse). Use
+/// arm_type_protect_for(task_pml4) from the loader instead.
+pub fn arm_type_protect() -> Result<(), &'static str> {
+    let pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::SeqCst);
+    arm_type_protect_for(pml4)
+}
+
+// ── end poison-trap ─────────────────────────────────────────────────────────
+
+impl PageTable {
     fn get(&self, idx: usize) -> u64 {
         self.0[idx]
     }
@@ -296,6 +433,11 @@ impl PageTableManager {
 
         let pde = unsafe { (*pd).0[vpn[2]] };
         let pt: *mut PageTable = if pde & PTE_PRESENT != 0 && pde & PTE_HUGE == 0 {
+            // Reusing an existing 4K table (e.g. one created by the PAGE_TYPE
+            // poison-trap split). Ensure user mode can walk through the PDE:
+            // cloned identity PDs are non-USER, and without USER here user
+            // instruction/data fetches below it fault even with USER PTEs.
+            unsafe { (*pd).0[vpn[2]] |= PTE_USER; }
             (pde & PTE_ADDR_MASK) as *mut PageTable
         } else {
             let new_pt = Self::alloc_page()?;
@@ -1569,8 +1711,8 @@ pub fn cow_remap_in(pml4: u64, virt: u64) -> bool {
     if *pte & PTE_PRESENT == 0 { return false; }
     if *pte & PTE_WRITABLE != 0 { return false; }
 
-     let old_phys = *pte & PTE_ADDR_MASK;
-     let flags = *pte & !PTE_ADDR_MASK;
+    let old_phys = *pte & PTE_ADDR_MASK;
+    let flags = *pte & !PTE_ADDR_MASK;
  
      let alloc = { &mut *crate::memory::allocator() };
 

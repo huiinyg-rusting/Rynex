@@ -303,6 +303,25 @@ pub extern "x86-interrupt" fn page_fault_real(frame: InterruptStackFrame, code: 
     // non-user (identity) pages by marking them writable; for user COW pages
     // fall through to the normal handler.
     if (cs_val & 3) == 0 && (code.bits() & 2) != 0 && (code.bits() & 1) != 0 {
+        // POISON-TRAP: a supervisor write into the write-protected PAGE_TYPE
+        // array that did NOT go through page_type_set() is a stray/rogue write.
+        // Log it (VA + RIP + CR3) before letting the resolver let it through.
+        let (tlo, thi) = crate::memory::buddy::page_type_band();
+        if cr2 >= tlo && cr2 < thi {
+            let mut cr3v: u64 = 0;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3v, options(nostack, nomem)); }
+            crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_PAGING);
+            crate::klog::s("PGTYPE-TRAP va=0x");
+            crate::klog::hex(cr2);
+            crate::klog::s(" rip=0x");
+            crate::klog::hex(rip);
+            crate::klog::s(" cr3=0x");
+            crate::klog::hex(cr3v);
+            crate::klog::s(" task=");
+            crate::klog::dec(crate::task::current_task_id());
+            crate::klog::s("\n");
+            crate::klog::end();
+        }
         if crate::paging::kernel_ro_write_resolve(cr2) {
             return;
         }
