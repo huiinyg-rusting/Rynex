@@ -18,7 +18,7 @@ const IDENTITY_LIMIT: u64 = 1 << 30;
 // Module regions that must never be allocated by the buddy (GRUB loads them
 // and the kernel must treat them as reserved). Filled at init time.
 // Stored as compile-time constants after init for O(1) checks.
-const MAX_MODULE_REGIONS: usize = 16;
+const MAX_MODULE_REGIONS: usize = 32;
 static mut MODULE_REGIONS: [(u64, u64); MAX_MODULE_REGIONS] = [(0, 0); MAX_MODULE_REGIONS];
 static mut MODULE_REGIONS_COUNT: usize = 0;
 
@@ -43,6 +43,9 @@ pub fn page_in_module_region(addr: u64) -> bool {
 
 extern "Rust" {
     static _kernel_start: u64;
+    static _kernel_data_end: u64;
+    static _kernel_bss_start: u64;
+    static _kernel_bss_end: u64;
     static _kernel_end: u64;
 }
 
@@ -94,13 +97,33 @@ pub fn init(info_addr: u32) {
         ALLOC.init(base, pages);
     }
 
+    // ── Buddy metadata arena relocation ─────────────────────────────────────
+    // PAGE_TYPE / PAGE_OWNED_BY used to be BSS statics at VA == phys ~0x5AA1A0
+    // / ~0x7AA1A0 — INSIDE the user image window (images map 0x402000+ and the
+    // ET_EXEC fastfetch image reaches ~0x64B9C8). Their low bytes were VA-
+    // ALIASED to image pages: metadata reads returned FILE BYTES (phantom
+    // BADPML4E + leaked tables) and page_type_set writes landed in the image.
+    // Carve a 4 MiB backing arena from the TOP of RAM (identity VA ~0x1FBAC000,
+    // far above any image), zero it, and point the accessors at it. The arena
+    // is reserved from the buddy AFTER the free regions are registered below.
+    let arena_size = 2u64 * buddy::MAX_REFC_PAGES as u64; // PAGE_TYPE + PAGE_OWNED_BY
+    let arena_base = ((base + pages * buddy::PAGE_SIZE) - arena_size) & !(buddy::MAX_REFC_PAGES as u64 - 1);
+    unsafe {
+        core::ptr::write_bytes(arena_base as *mut u8, 0, arena_size as usize);
+        buddy::set_page_type_bases(arena_base, arena_base + buddy::MAX_REFC_PAGES as u64);
+    }
+
     let kstart = unsafe { &_kernel_start as *const _ as u64 };
-    let kend = unsafe { &_kernel_end as *const _ as u64 };
+    let kdata_end = unsafe { &_kernel_data_end as *const _ as u64 };
+    let kbss_start = unsafe { &_kernel_bss_start as *const _ as u64 };
+    let kbss_end = unsafe { &_kernel_bss_end as *const _ as u64 };
     let ks = buddy::page_align_down(kstart);
-    let ke = buddy::page_align_up(kend);
+    let kd = buddy::page_align_up(kdata_end);
+    let bs = buddy::page_align_down(kbss_start);
+    let be = buddy::page_align_up(kbss_end);
 
     // Find modules first so we can exclude their pages from free regions
-    let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 16];
+    let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 32];
     let nmodules = crate::multiboot2::find_modules(info_addr, &mut modules);
     for i in 0..nmodules {
         crate::serial::write_str("MEM: module ");
@@ -124,7 +147,7 @@ pub fn init(info_addr: u32) {
 
     let info_page = buddy::page_align_down(info_addr as u64);
 
-    // Reserve the gap between kernel end and first module (if any) so the
+    // Reserve the gap between kernel data end and first module (if any) so the
     // buddy doesn't hand out pages from the kernel-module gap for pml4s.
     let mut first_module_start = base + pages * buddy::PAGE_SIZE;
     for i in 0..nmodules {
@@ -137,16 +160,22 @@ pub fn init(info_addr: u32) {
     unsafe {
         if ks >= base && ks < base + pages * buddy::PAGE_SIZE {
             let adj_start = ks;
-            let adj_end = if ke > base + pages * buddy::PAGE_SIZE {
+            let adj_end = if kd > base + pages * buddy::PAGE_SIZE {
                 base + pages * buddy::PAGE_SIZE
             } else {
-                ke
+                kd
             };
             // lower region: base -> adj_start, skipping module + info pages
-            add_free_region_skipping(base, adj_start, &modules, nmodules, info_page);
+            add_free_region_skipping(base, adj_start, &modules, nmodules, info_page, arena_base, arena_size, bs, be);
             ALLOC.mark_allocated(adj_start, adj_end - adj_start);
 
-            // Also mark the gap between kernel end and first module as allocated
+            // Kernel BSS lives high (>= 0x8000000, above any user image) so
+            // user pml4s mapping ELF images at 0x400000-0x650000 can never
+            // alias kernel statics. Reserve it explicitly: it sits inside the
+            // upper free region range, so the buddy must never hand it out.
+            ALLOC.mark_allocated(bs, be - bs);
+
+            // Also mark the gap between kernel data end and first module as allocated
             // to prevent the buddy from using the kernel-module gap for pml4s.
             if adj_end < first_module_start {
                 ALLOC.mark_allocated(adj_end, first_module_start - adj_end);
@@ -154,11 +183,20 @@ pub fn init(info_addr: u32) {
 
             // upper region: first_module_start -> end (skip kernel-module gap entirely)
             if first_module_start < base + pages * buddy::PAGE_SIZE {
-                add_free_region_skipping(first_module_start, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
+                add_free_region_skipping(first_module_start, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page, arena_base, arena_size, bs, be);
             }
         } else {
-            add_free_region_skipping(base, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page);
+            add_free_region_skipping(base, base + pages * buddy::PAGE_SIZE, &modules, nmodules, info_page, arena_base, arena_size, bs, be);
         }
+    }
+
+    // Reserve the metadata arena from the top of the (just-registered) free
+    // region. Primary protection now happens in add_free_region_skipping()
+    // (arena carved out before free blocks form, so no block can span it);
+    // this mark_allocated() is belt-and-suspenders — it can only unlink exact
+    // addr+order matches left behind, and no-ops otherwise.
+    unsafe {
+        ALLOC.mark_allocated(arena_base, arena_size);
     }
 
     TOTAL_PAGES.store(pages, Ordering::SeqCst);
@@ -175,11 +213,33 @@ pub fn init(info_addr: u32) {
 }
 
 unsafe fn add_free_region_skipping(start: u64, end: u64,
-    modules: &[crate::multiboot2::ModuleInfo], nmodules: usize, info_page: u64)
+    modules: &[crate::multiboot2::ModuleInfo], nmodules: usize, info_page: u64,
+    arena_base: u64, arena_size: u64, kbss_start: u64, kbss_end: u64)
 {
     // Build a sorted list of reserved intervals [start, end) within [start, end)
-    let mut reserved = [(0u64, 0u64); 32]; // kernel + modules + info_page
+    let mut reserved = [(0u64, 0u64); 34]; // cursor: kernel bss + modules + info_page + metadata arena
     let mut rcount = 0;
+
+    // Metadata arena (PAGE_TYPE/PAGE_OWNED_BY backing): carve it out BEFORE
+    // any free block is formed. add_region() coalesces buddies, so blocks can
+    // end up spanning the arena; a later mark_allocated() can then FAIL to
+    // unlink them (remove_if_free only matches exact addr+order), leaving the
+    // arena pages allocatable — pml4s/tables land inside the metadata arrays
+    // and clobber them (boot hang). Excluding it here splits the free region
+    // around it so no block ever contains arena bytes.
+    if arena_base < end && arena_base + arena_size > start {
+        reserved[rcount] = (arena_base.max(start), (arena_base + arena_size).min(end));
+        rcount += 1;
+    }
+
+    // Kernel BSS (high identity, >= 0x8000000): carve it out the same way so
+    // no free block spans it. Marked allocated separately in init() as well;
+    // this is what actually prevents the buddy from forming a block that
+    // overlaps the BSS (which mark_allocated alone cannot guarantee).
+    if kbss_start < end && kbss_end > start {
+        reserved[rcount] = (kbss_start.max(start), kbss_end.min(end));
+        rcount += 1;
+    }
 
     // Kernel is already marked allocated separately, but add it as reserved here
     // for completeness in this region-splitting logic.

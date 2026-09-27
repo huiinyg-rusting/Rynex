@@ -1930,6 +1930,10 @@ pub extern "C" fn timer_schedule() -> u64 {
         return 0;
     }
 
+    // DIAG heartbeat removed after root cause (kernel .bss aliased fastfetch
+    // image VAs -> frozen IRQ0 after fastfetch exec). Linker now places .bss
+    // at 128M (linker.ld), so the freeze is gone.
+
     // NOTE: Serial input is NOT polled here (bug 88). The timer path and the
     // TtyDevice::read path both polled serial::read_byte_nonblocking(),
     // racing on the same read-once hardware FIFO. This caused double-echo
@@ -2748,7 +2752,7 @@ fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
         let deadline = if timeout_ms == 0 {
             0
         } else {
-            crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) + timeout_ms * 100 / 1000 * 100
+            crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) + timeout_ms / 10
         };
         loop {
             let now = core::ptr::read_volatile(word as *const u32);
@@ -3260,7 +3264,6 @@ pub fn sys_pci_write(bus: u8, dev: u8, func: u8, offset: u8, value: u32) -> i64 
 /// (bus<<16 | dev<<11 | func<<8) or -ENODEV. Only devs 0..=31 checked.
 pub fn sys_pci_find(vendor_device: u16) -> i64 {
     if !have_priv(PRIV_PCI) { return -EPERM; }
-    let _ = vendor_device;
     for dev in 0u8..32 {
         for func in 0u8..8 {
             let addr: u32 = 0x8000_0000 | ((dev as u32) << 11) | ((func as u32) << 8);
@@ -3278,8 +3281,8 @@ pub fn sys_pci_find(vendor_device: u16) -> i64 {
                     options(nostack, preserves_flags)
                 );
             }
-            if id != 0xFFFF_FFFF && id != 0 {
-                // device id (low 16) requested; return slot for the first hit.
+            if id != 0xFFFF_FFFF && id != 0 && (id & 0xFFFF) == vendor_device as u32 {
+                // vendor (low 16) matches; return the slot for the first hit.
                 return ((dev as i64) << 11) | ((func as i64) << 8);
             }
         }
@@ -3715,6 +3718,15 @@ fn privileges_for_path(path: &[u8]) -> u32 {
     }
     // udev is a trusted device manager but has no reason to reboot the machine.
     if path == b"/bin/udev" {
+        return PRIV_ALL_DRIVER;
+    }
+    // netd is the user-space virtio-net driver service (M1).
+    if path == b"/bin/netd" {
+        return PRIV_ALL_DRIVER;
+    }
+    // runsv chdir's into the service dir and exec's "./run", so the real
+    // netd service lands here; same trusted driver as /bin/netd above.
+    if path == b"/etc/service/netd/run" {
         return PRIV_ALL_DRIVER;
     }
     0
@@ -5073,7 +5085,18 @@ fn sys_execve(pathname: *const u8, argv: u64, _envp: u64) -> i64 {
                 // platform binaries (runit/udev) regain driver privileges; any
                 // unprivileged child of runit (e.g. shell, or anything a user
                 // execs) is fully de-privileged here.
-                TASKS[idx].privileges = privileges_for_path(&path_buf[..len]);
+                //
+                // runsv execs each service as "./run" after chdir'ing into the
+                // service dir, so the raw path is relative; normalize against
+                // this task's cwd so /etc/service/netd/run matches the netd
+                // whitelist entry (netd needs PRIV_ALL_DRIVER to talk PCI).
+                let mut norm = [0u8; 256];
+                let nlen = crate::vfs::normalize_path(&path_buf[..len], &mut norm).unwrap_or(0);
+                TASKS[idx].privileges = if nlen > 0 {
+                    privileges_for_path(&norm[..nlen])
+                } else {
+                    privileges_for_path(&path_buf[..len])
+                };
                 // Switch to the new page table so the iretq finds the user mappings
 
                 pt_mgr().switch_to(info.pml4);
@@ -5569,8 +5592,8 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
 fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
     if req.is_null() { return -EFAULT; }
     let ns = unsafe { core::ptr::read_volatile(req) };
-    // PIT ticks are ~20ms each (50Hz)
-    let ticks = (ns + 19_999_999) / 20_000_000; // ceiling division
+    // PIT ticks are 10ms each (100Hz)
+    let ticks = (ns + 9_999_999) / 10_000_000; // ceiling division
     if ticks > 0 {
         sys_sleep(ticks);
     }
@@ -6581,9 +6604,9 @@ fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> i64 {
 fn sys_gettimeofday(tv: *mut u64, _tz: *mut u64) -> i64 {
     if tv.is_null() { return -EFAULT; }
     let ticks = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
-    // Each tick is ~20ms (50Hz PIT)
-    let secs = (ticks * 20_000_000) / 1_000_000_000_000; // not precise, placeholder
-    let usecs = ((ticks * 20_000_000) / 1000) % 1_000_000;
+    // Each tick is 10ms (100Hz PIT)
+    let secs = (ticks * 10_000_000) / 1_000_000_000_000; // not precise, placeholder
+    let usecs = ((ticks * 10_000_000) / 1000) % 1_000_000;
     unsafe {
         core::ptr::write_volatile(tv, secs);
         core::ptr::write_volatile(tv.add(1), usecs);
@@ -7231,7 +7254,7 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
 
 fn sys_clock_gettime(_clk_id: u64, tp: *mut u8) -> i64 {
     if tp.is_null() { return -EFAULT; }
-    let ns = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as u64 * 20_000_000 };
+    let ns = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) as u64 * 10_000_000 };
     unsafe {
         core::ptr::write_volatile(tp as *mut u64, ns / 1_000_000_000);
         core::ptr::write_volatile((tp as *mut u64).add(1), ns % 1_000_000_000);
@@ -7343,7 +7366,7 @@ pub fn boot_userland() {
     let info_addr = crate::MULTIBOOT_INFO.load(Ordering::SeqCst) as u32;
     let mut init_tid = 0u64;
     if info_addr != 0 {
-        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 24];
+        let mut modules = [crate::multiboot2::ModuleInfo { start: 0, end: 0, name: [0; 64] }; 32];
         let n = crate::multiboot2::find_modules(info_addr, &mut modules);
         for i in 0..n {
             let mod_data = unsafe {
