@@ -386,3 +386,81 @@ pub extern "x86-interrupt" fn machine_check(_frame: InterruptStackFrame) -> ! {
     crate::serial::write_str("EXC: Machine Check\n");
     halt();
 }
+
+// ── Device IRQ dispatch (user-space driver edge delivery) ─────────────
+// PIC remaps IRQ n -> vector IRQ_BASE+n (0x30). IRQ 0 (PIT timer) and IRQ 1
+// (keyboard) keep their dedicated handlers; every other legacy device IRQ
+// (3,4,5,6,7,9,10,11,12,14,15 — 2 is the PIC2 cascade, 8 the RTC, 13 the FPU)
+// is wired to a stub that EOI's the PIC and bumps the driver's edge counter
+// (task::driver_irq_edge futex-wakes the blocked driver task). This is the
+// M2 seam netd's sys_irq_register/sys_irq_wait pair depends on: without an
+// IDT entry, a device INTA while unmasked would #GP instead of waking netd.
+
+pub extern "x86-interrupt" fn driver_irq_stub_irq3(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(3);
+    crate::task::driver_irq_edge(3);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq4(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(4);
+    crate::task::driver_irq_edge(4);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq5(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(5);
+    crate::task::driver_irq_edge(5);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq6(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(6);
+    crate::task::driver_irq_edge(6);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq7(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(7);
+    crate::task::driver_irq_edge(7);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq9(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(9);
+    crate::task::driver_irq_edge(9);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq10(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(10);
+    crate::task::driver_irq_edge(10);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq11(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(11);
+    crate::task::driver_irq_edge(11);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq12(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(12);
+    crate::task::driver_irq_edge(12);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq14(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(14);
+    crate::task::driver_irq_edge(14);
+}
+pub extern "x86-interrupt" fn driver_irq_stub_irq15(_frame: InterruptStackFrame) {
+    crate::pic::send_eoi(15);
+    crate::task::driver_irq_edge(15);
+}
+
+type DriverIrqFn = extern "x86-interrupt" fn(InterruptStackFrame);
+
+/// Register every device-IRQ stub at vector IRQ_BASE+irq. Safe to call on
+/// both BIOS (PIC) and UEFI (APIC) handoffs: IDT entries are inert until the
+/// corresponding PIC line is unmasked by a driver's sys_irq_register.
+pub fn register_driver_irqs() {
+    let stubs: &[(u8, DriverIrqFn)] = &[
+        (3, driver_irq_stub_irq3),
+        (4, driver_irq_stub_irq4),
+        (5, driver_irq_stub_irq5),
+        (6, driver_irq_stub_irq6),
+        (7, driver_irq_stub_irq7),
+        (9, driver_irq_stub_irq9),
+        (10, driver_irq_stub_irq10),
+        (11, driver_irq_stub_irq11),
+        (12, driver_irq_stub_irq12),
+        (14, driver_irq_stub_irq14),
+        (15, driver_irq_stub_irq15),
+    ];
+    for (irq, handler) in stubs {
+        crate::idt::register_irq(crate::pic::IRQ_BASE + irq, *handler as *const () as u64);
+    }
+}

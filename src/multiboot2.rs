@@ -86,6 +86,16 @@ pub struct ModuleInfo {
     pub name: [u8; 64],
 }
 
+// Multiboot2 tag type 1: "Boot loader command line" (the kernel command
+// line GRUB was invoked with). Stored verbatim for /proc/cmdline.
+const TAG_BOOT_CMDLINE: u32 = 1;
+static mut BOOT_CMDLINE: [u8; 256] = [0; 256];
+static mut BOOT_CMDLINE_LEN: usize = 0;
+
+pub fn boot_cmdline() -> &'static [u8] {
+    unsafe { &BOOT_CMDLINE[..BOOT_CMDLINE_LEN] }
+}
+
 pub fn find_modules(info_addr: u32, out: &mut [ModuleInfo]) -> usize {
     let total = unsafe { (*(info_addr as *const Info)).total_size };
     let mut count = 0;
@@ -100,6 +110,21 @@ pub fn find_modules(info_addr: u32, out: &mut [ModuleInfo]) -> usize {
         let size = unsafe { core::ptr::read_unaligned(p.add(4) as *const u32) };
         if size < 8 {
             break;
+        }
+        if typ == TAG_BOOT_CMDLINE {
+            // NUL-terminated string follows the 8-byte tag header.
+            let s = unsafe { p.add(8) };
+            let mut n = 0usize;
+            while n < 255 {
+                let c = unsafe { core::ptr::read_volatile(s.add(n)) };
+                if c == 0 { break; }
+                unsafe { BOOT_CMDLINE[n] = c; }
+                n += 1;
+            }
+            unsafe {
+                BOOT_CMDLINE[n] = 0;
+                BOOT_CMDLINE_LEN = n;
+            }
         }
         if typ == TAG_MODULE && count < out.len() {
             let start = unsafe { core::ptr::read_unaligned(p.add(8) as *const u32) } as u64;
