@@ -122,6 +122,11 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
         serial::write_str("KBD: OK\n");
     }
 
+    // Device IRQs (3,4,5,6,7,9,10,11,12,14,15) -> PIC EOI + driver edge.
+    // netd registers virtio-net INTA (IRQ 11 -> vector 0x3B) via
+    // sys_irq_register; without these IDT entries an unmasked INTA would #GP.
+    interrupts::register_driver_irqs();
+
 pit::init(100);
     vga::write_str("PIT: OK\n");
     if DEBUG_ENABLED.load(Ordering::Relaxed) {

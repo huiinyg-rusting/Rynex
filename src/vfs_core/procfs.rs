@@ -6,6 +6,7 @@ pub const PROC_ROOT_INO: u64 = 1;
 pub const PROC_UPTIME: u64 = 2;
 pub const PROC_MEMINFO: u64 = 3;
 pub const PROC_VERSION: u64 = 4;
+pub const PROC_CMDLINE: u64 = 5;
 
 // PID directory /and pid sub-file inodes live above the fixed files.
 pub const PID_DIR_INO: u64 = 0x100000;
@@ -198,6 +199,25 @@ impl ProcFs {
         if n < buf.len() { buf[n] = 0; n += 1; }
         n
     }
+
+    /// /proc/cmdline: the kernel command line GRUB booted us with. When GRUB
+    /// supplies none, report the image path the way Linux does, so tools that
+    /// stat/parse the file (busybox, fastfetch) get something sane.
+    fn cmdline_text_global(&self, buf: &mut [u8]) -> usize {
+        let cmd = crate::multiboot2::boot_cmdline();
+        let mut n = 0usize;
+        if cmd.is_empty() {
+            for &c in b"BOOT_IMAGE=/boot/rynex-kernel" {
+                if n < buf.len() { buf[n] = c; n += 1; }
+            }
+        } else {
+            for &c in cmd {
+                if n < buf.len() { buf[n] = c; n += 1; }
+            }
+        }
+        if n < buf.len() { buf[n] = 0; n += 1; }
+        n
+    }
 }
 
 impl VnodeOps for ProcFs {
@@ -206,6 +226,7 @@ impl VnodeOps for ProcFs {
             PROC_UPTIME => self.uptime_text(buf),
             PROC_MEMINFO => self.meminfo_text(buf),
             PROC_VERSION => self.version_text(buf),
+            PROC_CMDLINE => self.cmdline_text_global(buf),
             i if i >= PID_CMDLINE_INO => self.cmdline_text(i - PID_CMDLINE_INO, buf),
             i if i >= PID_STAT_INO => self.stat_text(i - PID_STAT_INO, buf),
             _ => return Err("not found"),
@@ -230,6 +251,7 @@ impl VnodeOps for ProcFs {
                 b"uptime" => Ok(PROC_UPTIME),
                 b"meminfo" => Ok(PROC_MEMINFO),
                 b"version" => Ok(PROC_VERSION),
+                b"cmdline" => Ok(PROC_CMDLINE),
                 _ => {
                     // Numeric name -> a /proc/<pid> directory.
                     if !name.is_empty() && name.iter().all(|&c| c >= b'0' && c <= b'9') {
@@ -259,6 +281,7 @@ impl VnodeOps for ProcFs {
                 (PROC_UPTIME, b"uptime"),
                 (PROC_MEMINFO, b"meminfo"),
                 (PROC_VERSION, b"version"),
+                (PROC_CMDLINE, b"cmdline"),
             ];
             let mut count = 0usize;
             let mut idx = 0usize;
@@ -415,6 +438,7 @@ pub fn mount_proc() {
         (PROC_UPTIME, b"uptime"),
         (PROC_MEMINFO, b"meminfo"),
         (PROC_VERSION, b"version"),
+        (PROC_CMDLINE, b"cmdline"),
     ];
     for &(ino, name) in files {
         // Build the full path "/proc/<name>".

@@ -2216,6 +2216,7 @@ pub const SYS_rename: u64 = 82;
 pub const SYS_mkdir: u64 = 83;
 pub const SYS_rmdir: u64 = 84;
 pub const SYS_unlink: u64 = 87;
+pub const SYS_symlink: u64 = 88;
 pub const SYS_readlink: u64 = 89;
 pub const SYS_gettimeofday: u64 = 96;
 pub const SYS_sysinfo: u64 = 99;
@@ -2390,6 +2391,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_unlink => sys_unlink(arg1 as *const u8),
         SYS_rename => sys_rename(arg1 as *const u8, arg2 as *const u8),
         SYS_openat => sys_openat(arg1 as i32, arg2 as *const u8, arg3 as i32, arg4 as u32),
+        SYS_symlink => sys_symlink(arg1 as *const u8, arg2 as *const u8),
         SYS_readlink => sys_readlink(arg1 as *const u8, arg2 as *mut u8, arg3 as usize),
         SYS_clone => sys_clone(arg1 as u64, arg2 as u64, arg3 as *mut u64, arg4 as *mut u64, arg5 as u64, arg6),
         SYS_vfork => sys_fork(), // vfork → fork
@@ -3990,6 +3992,19 @@ fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
             0
         }
         Err(_) => -EACCES,
+    }
+}
+
+// symlink(2): arg1 = target, arg2 = linkpath (Linux x86_64 ABI order).
+// The VFS wants (path, target), so swap the arguments here.
+fn sys_symlink(target: *const u8, linkpath: *const u8) -> i64 {
+    if target.is_null() || linkpath.is_null() { return -EFAULT; }
+    let tgt = cstr_from_ptr(target);
+    let link = cstr_from_ptr(linkpath);
+    if tgt.is_empty() || link.is_empty() { return -ENOENT; }
+    match crate::vfs::create_symlink(link, tgt) {
+        Some(_) => 0,
+        None => -EACCES,
     }
 }
 
