@@ -342,7 +342,9 @@ pit::init(100);
     vfs_core::init();
     let _root_vnode = vfs_core::mount_root();
 
-    drivers::virtio_blk::init_virtio_blk();
+    // init_block_device() already runs init_virtio_blk(); calling the driver
+    // probe separately would set up a second VirtQueue over the same PCI device
+    // and leak both, so the probe happens exactly once, here.
     if let Err(e) = drivers::block_device::init_block_device() {
         serial::write_str("WARN: block device not found: ");
         serial::write_str(e);
@@ -350,30 +352,49 @@ pit::init(100);
     }
 
     if drivers::block_device::is_block_device_ready() {
-        // Test block device read/write
-        serial::write_str(">>> Starting block test...\n");
-        {
-            use drivers::block_device::{block_read, block_write};
-            let test_data = b"Hello virtio-blk!";
-            serial::write_str(">>> Test: writing sector 10\n");
-            let write_ok = block_write(10, test_data);
-            serial::write_str("block: write sector 10 = ");
-            serial::write_str(if write_ok { "OK" } else { "FAIL" });
-            serial::write_str("\n");
-            
-            if let Some(ptr) = block_read(10) {
-                let read_data = unsafe { core::slice::from_raw_parts(ptr, test_data.len()) };
-                let read_ok = read_data == test_data;
-                serial::write_str("block: read sector 10 = ");
-                serial::write_str(if read_ok { "OK" } else { "FAIL" });
+        // Read-only probe. The previous test wrote "Hello virtio-blk!" to sector
+        // 10 on every boot; that offset is inside the filesystem's reserved
+        // GDT / resize-inode area, so on a mounted ext4 it corrupts the medium
+        // (verified with e2fsck). The medium is real data now, so the smoke
+        // test only reads.
+        serial::write_str(">>> block: reading sector 0\n");
+        match drivers::block_device::block_read(0) {
+            Some(ptr) => {
+                let head = unsafe { core::slice::from_raw_parts(ptr, 16) };
+                serial::write_str("block: sector 0 head=");
+                for &b in head.iter() {
+                    if b >= 0x20 && b < 0x7f {
+                        serial::write_char(b as char);
+                    } else {
+                        serial::write_str(".");
+                    }
+                }
                 serial::write_str("\n");
-            } else {
-                serial::write_str("block: read sector 10 = FAIL (null)\n");
+            }
+            None => serial::write_str("block: sector 0 read = FAIL\n"),
+        }
+
+        // Give the block device a filesystem. One entry point serves ext2/3
+        // (indirect blocks) and ext4 (extent tree): the driver picks the
+        // mapping per inode from i_flags, so the vfs layer never has to know.
+        match vfs_core::mount_ext4(
+            drivers::block_device::block_read,
+            drivers::block_device::block_write,
+            b"/mnt",
+        ) {
+            Ok(_) => {
+                // Prints an EXT4: report per mounted entity and the walked
+                // file/dir totals; the count is informational only.
+                let _ = vfs_core::ext3::selftest(b"/mnt");
+            }
+            Err(e) => {
+                serial::write_str("EXT4: mount failed: ");
+                serial::write_str(e);
+                serial::write_str("\n");
             }
         }
-        serial::write_str(">>> Block test complete\n");
     } else {
-        serial::write_str(">>> Block test skipped (no block device)\n");
+        serial::write_str(">>> no block device: /mnt stays absent\n");
     }
 
     // Register kernel services as named IPC ports. Clients connect to these by
