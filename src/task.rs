@@ -2766,7 +2766,10 @@ fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
             {
                 return -EAGAIN;
             }
-            if !block_on_futex(word as *const u32) {
+            // Arm the task's wakeup tick so the timer path re-enters this loop
+            // at the deadline; without it the block below could only ever be
+            // released by an IRQ edge and `timeout_ms` would be a lie.
+            if !block_on_futex_until(word as *const u32, deadline) {
                 return -EAGAIN;
             }
         }
@@ -3502,6 +3505,17 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
 /// `futex_wake` (or a spurious timer wake). Returns true if we were woken.
 /// Intended for the IPC mailbox send/recv loops.
 pub fn block_on_futex(uaddr: *const u32) -> bool {
+    block_on_futex_until(uaddr, 0)
+}
+
+/// Same, but with an optional PIT-tick deadline (`0` = no timeout). Arming
+/// `wakeup_tick` is what makes a *timeout* expressible at all: a bare futex
+/// wait can only ever be released by `futex_wake`, so `sys_irq_wait`'s
+/// `timeout_ms` would silently never fire and a driver that waits on an IRQ
+/// word would hang until the device happened to raise another edge. With a
+/// deadline the timer's `wakeup_expired_sleepers` wakes us at the deadline and
+/// the waiter's own deadline check runs.
+fn block_on_futex_until(uaddr: *const u32, deadline_tick: u64) -> bool {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return false; }
     remove_from_runqueue(id);
@@ -3519,6 +3533,8 @@ pub fn block_on_futex(uaddr: *const u32) -> bool {
         });
         TASKS[idx].blocked_on = uaddr as u64;
         TASKS[idx].state = TaskState::Blocked;
+        TASKS[idx].wakeup_tick = deadline_tick;
+        TASKS[idx].futex_deadline = deadline_tick;
     }
     force_schedule();
     true
