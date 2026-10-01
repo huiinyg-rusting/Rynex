@@ -200,19 +200,18 @@ pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
                     }
                 }
             } else {
-                let _mode = crate::vfs_core::types::S_IFREG
-                    | crate::vfs_core::types::S_IRUSR
-                    | crate::vfs_core::types::S_IWUSR
-                    | crate::vfs_core::types::S_IRGRP
-                    | crate::vfs_core::types::S_IROTH;
-                let ino = match crate::vfs_core::resolve_ino(norm).ok() {
-                    Some(i) => i,
+                // Non-userfs mounts: the ops come from the mount that owns the
+                // path. Hardcoding ramfs here would hand a /mnt (ext4) open to
+                // the in-memory filesystem, so reads would silently return
+                // ENOENT/empty instead of the medium's data.
+                let (ino, ops) = match crate::vfs_core::path_resolve(norm).ok() {
+                    Some(r) => r,
                     None => {
                         INODES[flat_idx].used = false;
                         return None;
                     }
                 };
-                match crate::vfs_core::vnode_alloc(ino, 0, 0, &ramfs::RAMFS) {
+                match crate::vfs_core::vnode_alloc(ino, 0, 0, ops) {
                     Some(v) => v,
                     None => {
                         INODES[flat_idx].used = false;

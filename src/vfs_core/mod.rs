@@ -335,13 +335,16 @@ impl MountTableInner {
             let mp = &self.mounts[i].mount_point[..self.mounts[i].mp_len];
             if path.len() < mp.len() { continue; }
             if &path[..mp.len()] == mp {
-                let _after_mp = if path.len() == mp.len() {
-                    0
-                } else if mp.len() == 1 && mp[0] == b'/' {
-                    path.len() - 1
-                } else {
-                    path.len() - mp.len()
-                };
+                // The match has to end on a component boundary: a bare prefix
+                // test lets a mount at /mnt swallow /mntfoo and hands an
+                // unrelated path to the wrong filesystem. The root mount is the
+                // exception -- "/" has no component after it, and every
+                // absolute path starts with it, so a boundary test would throw
+                // away the fallback mount for all of them.
+                let is_root = mp.len() == 1 && mp[0] == PATH_SEPARATOR;
+                if !is_root && path.len() > mp.len() && path[mp.len()] != PATH_SEPARATOR {
+                    continue;
+                }
                 if mp.len() > best_len {
                     best_len = mp.len();
                     best_idx = Some(i);
@@ -386,6 +389,29 @@ pub fn mount_root() -> Result<u16, &'static str> {
 
 pub fn mount_ext3(_device_read: fn(u64) -> Option<*mut u8>, _device_write: fn(u64, &[u8]) -> bool, _mount_mp: &[u8]) -> Result<u16, &'static str> {
     Err("ext3 not yet implemented as VnodeOps")
+}
+
+/// Mount the ext2/3/4 filesystem served by `device_read`/`device_write` at
+/// `mount_mp`. The driver validates the superblock and picks the block-mapping
+/// strategy (ext2/3 indirect blocks vs ext4 extent tree) per inode, so the vfs
+/// layer needs no way to tell the two apart.
+pub fn mount_ext4(device_read: fn(u64) -> Option<*mut u8>, device_write: fn(u64, &[u8]) -> bool, mount_mp: &[u8]) -> Result<u16, &'static str> {
+    if ext3::is_mounted() {
+        return Err("ext fs already mounted");
+    }
+    ext3::mount_ext(device_read, device_write)?;
+    let fs_id = alloc_fsid();
+    let root_ino = ext3::EXT3_ROOT_INO as u64;
+    let vnode_id = mount(mount_mp, fs_id, root_ino, &ext3::EXT_FS_OPS)?;
+
+    serial::write_str("VFS: ext2/3/4 mounted at ");
+    for &c in mount_mp { serial::write_char(c as char); }
+    serial::write_str(" (root_ino=");
+    serial::write_dec(root_ino);
+    serial::write_str(" fs_id=");
+    serial::write_dec(fs_id);
+    serial::write_str(")\n");
+    Ok(vnode_id)
 }
 
 /// Mount a filesystem at the given absolute path. `ops` is the VnodeOps and

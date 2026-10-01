@@ -73,6 +73,9 @@ impl Stat {
     }
 }
 
+/// Copy so a directory listing can be staged in a fixed-size array
+/// (`[Dirent::empty(); N]`) and filled in place, the way procfs does it.
+#[derive(Copy, Clone)]
 pub struct Dirent {
     pub ino: Ino,
     pub offset: u64,
