@@ -388,56 +388,137 @@ pub extern "x86-interrupt" fn machine_check(_frame: InterruptStackFrame) -> ! {
 }
 
 // ── Device IRQ dispatch (user-space driver edge delivery) ─────────────
-// PIC remaps IRQ n -> vector IRQ_BASE+n (0x30). IRQ 0 (PIT timer) and IRQ 1
-// (keyboard) keep their dedicated handlers; every other legacy device IRQ
-// (3,4,5,6,7,9,10,11,12,14,15 — 2 is the PIC2 cascade, 8 the RTC, 13 the FPU)
-// is wired to a stub that EOI's the PIC and bumps the driver's edge counter
-// (task::driver_irq_edge futex-wakes the blocked driver task). This is the
-// M2 seam netd's sys_irq_register/sys_irq_wait pair depends on: without an
+// IRQ n -> vector IRQ_BASE+n (0x30). IRQ 0 (PIT timer) and IRQ 1 (keyboard)
+// keep their dedicated handlers; every other legacy device IRQ (3,4,5,6,7,
+// 9,10,11,12,14,15 — 2 is the PIC2 cascade, 8 the RTC, 13 the FPU) is wired
+// to a stub that acknowledges the interrupt and bumps the driver's edge
+// counter (task::driver_irq_edge futex-wakes the blocked driver task). This is
+// the M2 seam netd's sys_irq_register/sys_irq_wait pair depends on: without an
 // IDT entry, a device INTA while unmasked would #GP instead of waking netd.
+//
+// Device IRQs are delivered through the IOAPIC when one is present, not the
+// 8259: a PCI device asserts its line until the driver clears it, which an
+// edge-triggered PIC cannot represent without either losing the first edge or
+// re-latching a high line into a storm. `route_device_irqs_ioapic` performs the
+// redirection, and `device_irq_eoi` acknowledges through whichever controller
+// the IRQ actually came in on -- sending a PIC EOI for an IOAPIC interrupt (or
+// the reverse) acknowledges the wrong chip and leaves the interrupt in flight.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Per-IRQ record of which controller is delivering it, so the stub can ack the
+/// right one. Default false = legacy 8259 path.
+static IOAPIC_ROUTED: [AtomicBool; 16] = [const { AtomicBool::new(false) }; 16];
+
+/// Acknowledge a device interrupt through the controller that delivered it.
+pub fn device_irq_eoi(irq: u8) {
+    if (irq as usize) < IOAPIC_ROUTED.len() && IOAPIC_ROUTED[irq as usize].load(Ordering::Relaxed)
+    {
+        unsafe { crate::apic::eoi() };
+    } else {
+        crate::pic::send_eoi(irq);
+    }
+}
+
+/// True if `irq` is being delivered through the IOAPIC. Device drivers must not
+/// unmask it in the 8259 as well, or the interrupt arrives twice by two
+/// different routes.
+pub fn irq_routed_via_ioapic(irq: u8) -> bool {
+    (irq as usize) < IOAPIC_ROUTED.len() && IOAPIC_ROUTED[irq as usize].load(Ordering::Relaxed)
+}
+
+/// Redirect every device IRQ through the IOAPIC. Call after the LAPIC is
+/// enabled and the IDT stubs are registered. Leaves everything on the 8259 if
+/// no IOAPIC is present, so this is safe to call unconditionally.
+///
+/// The mapping is IRQ -> GSI rather than assumed identity: the IOAPIC indexes
+/// its redirection table in global system interrupt space, and PCI devices sit
+/// at GSIs that have nothing to do with their 8259 IRQ number. Routing entry
+/// `irq` because it seemed the obvious thing produces a machine that boots and
+/// then never delivers an interrupt.
+pub fn route_device_irqs_ioapic() {
+    if !crate::apic::ioapic_present() {
+        crate::serial::write_str("IRQ: no IOAPIC, device IRQs stay on the 8259\n");
+        return;
+    }
+    let device_irqs = [3u8, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15];
+    let mut routed = 0u32;
+    for irq in device_irqs {
+        // Identity by default: on the QEMU `pc` machine the BIOS wires PCI INTA#
+        // to an ISA IRQ line, and the IOAPIC's GSIs 0-15 mirror those lines, so
+        // GSI == IRQ holds for every device IRQ here. `acpi::gsi_for_irq` is the
+        // override for firmware that says otherwise and stays wired up as a
+        // safety net -- but it cannot be the primary source, because this
+        // kernel's multiboot2 ACPI tag path does not actually yield RSDP
+        // addresses (measured: the "address" read back is a code pointer), so
+        // there is no MADT to consult yet. Assuming identity is the correct
+        // default for the ACPI spec and is verifiable here; inventing a GSI
+        // from a broken parse would not be.
+        let gsi = irq as usize;
+        let vector = crate::pic::IRQ_BASE + irq;
+        if unsafe { crate::apic::ioapic_route_gsi(gsi, vector) } {
+            IOAPIC_ROUTED[irq as usize].store(true, Ordering::Relaxed);
+            routed += 1;
+            if gsi != irq as usize {
+                crate::serial::write_str("IRQ: ");
+                crate::serial::write_dec(irq as u64);
+                crate::serial::write_str(" -> GSI ");
+                crate::serial::write_dec(gsi as u64);
+                crate::serial::write_str("\n");
+            }
+        } else {
+            crate::serial::write_str("IRQ: ");
+            crate::serial::write_dec(irq as u64);
+            crate::serial::write_str(" GSI out of range, left on the 8259\n");
+        }
+    }
+    crate::serial::write_str("IRQ: routed ");
+    crate::serial::write_dec(routed as u64);
+    crate::serial::write_str(" device IRQs via IOAPIC\n");
+}
 
 pub extern "x86-interrupt" fn driver_irq_stub_irq3(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(3);
+    device_irq_eoi(3);
     crate::task::driver_irq_edge(3);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq4(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(4);
+    device_irq_eoi(4);
     crate::task::driver_irq_edge(4);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq5(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(5);
+    device_irq_eoi(5);
     crate::task::driver_irq_edge(5);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq6(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(6);
+    device_irq_eoi(6);
     crate::task::driver_irq_edge(6);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq7(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(7);
+    device_irq_eoi(7);
     crate::task::driver_irq_edge(7);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq9(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(9);
+    device_irq_eoi(9);
     crate::task::driver_irq_edge(9);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq10(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(10);
+    device_irq_eoi(10);
     crate::task::driver_irq_edge(10);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq11(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(11);
+    device_irq_eoi(11);
     crate::task::driver_irq_edge(11);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq12(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(12);
+    device_irq_eoi(12);
     crate::task::driver_irq_edge(12);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq14(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(14);
+    device_irq_eoi(14);
     crate::task::driver_irq_edge(14);
 }
 pub extern "x86-interrupt" fn driver_irq_stub_irq15(_frame: InterruptStackFrame) {
-    crate::pic::send_eoi(15);
+    device_irq_eoi(15);
     crate::task::driver_irq_edge(15);
 }
 
@@ -462,5 +543,20 @@ pub fn register_driver_irqs() {
     ];
     for (irq, handler) in stubs {
         crate::idt::register_irq(crate::pic::IRQ_BASE + irq, *handler as *const () as u64);
+        // Level-triggered from the start. These lines belong to PCI devices that
+        // hold INTA# asserted until the driver clears their status register, and
+        // `driver_irq_edge` masks the line to stop the resulting re-latch flood.
+        // Edge triggering cannot survive that combination -- an edge raised while
+        // the line is masked is discarded outright -- so the driver would sleep
+        // through the packet that woke it. Level triggering re-delivers on
+        // unmask instead, which is what the mask needs to be safe.
+        crate::pic::set_level_triggered(*irq);
     }
+    let (m, s) = crate::pic::elcr_state();
+    crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+    crate::klog::s("[PIC] elcr master=0x");
+    crate::klog::hex(m as u64);
+    crate::klog::s(" slave=0x");
+    crate::klog::hex(s as u64);
+    crate::klog::end();
 }
