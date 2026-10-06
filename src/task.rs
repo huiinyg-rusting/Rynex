@@ -1999,19 +1999,50 @@ pub extern "C" fn timer_schedule() -> u64 {
         // Time slice expired — give a fresh time slice
         TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
 
-        // Try to find a different task; if only current task is waiting, just keep running
-        let next_id = match dequeue_task() {
+        // Find a different task to run.
+        //
+        // `dequeue_task` returns the highest-priority *ready* task, and the
+        // running task is frequently also sitting in the runqueue -- so the
+        // first pick is often the task whose slice just expired. Taking that
+        // pick and giving up hands it a brand-new full slice for the privilege
+        // of being at the front of its own queue, and that doubles the slice
+        // period for every wake.
+        //
+        // This is not a rounding error. It is the dominant term in device-wake
+        // latency: `futex_wake` makes the driver ready and enqueues it, then
+        // iretq returns to whatever held the CPU, and the runqueue is only
+        // drained here. With init (prio 10) ahead of the driver (prio 20), the
+        // measured delay from edge to driver running was k+7 ticks at 100Hz --
+        // one to two whole slices, k being whatever was left of the incumbent's
+        // slice. Measured driver RTT was 70-120ms, and the 7 was pure waste.
+        //
+        // So: skip picks of `current` and look again. Deliberately *not*
+        // re-enqueueing current on the way -- the switch path below already
+        // requeues it, and putting a Running task into the runqueue here would
+        // create a second copy of it competing with itself.
+        let mut next_id = None;
+        for _ in 0..2 {
+            match dequeue_task() {
+                Some(id) if id != current => {
+                    next_id = Some(id);
+                    break;
+                }
+                // Discarded, not requeued: see above.
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        let next_id = match next_id {
             Some(id) => id,
             None => {
+                // Nothing else runnable. current is off the runqueue and stays
+                // Running, which is the same state the single-pick version left
+                // behind.
                 TASKS[idx].state = TaskState::Running;
                 return 0;
             }
         };
-
-        if next_id == current {
-            TASKS[idx].state = TaskState::Running;
-            return 0;
-        }
 
         // Switch to a different task — requeue current first
         TASKS[idx].state = TaskState::Ready;
