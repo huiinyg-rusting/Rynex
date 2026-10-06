@@ -394,10 +394,21 @@ pub fn uefi_handoff(info_addr: u32) -> bool {
 /// Report which ACPI RSDP copies GRUB supplied: (acpi_old, acpi_new).
 /// Informational only — not a UEFI signal by itself.
 pub fn acpi_tags(info_addr: u32) -> (bool, bool) {
+    let (old, new) = acpi_rsdp_addrs(info_addr);
+    (old != 0, new != 0)
+}
+
+/// Physical addresses of the ACPI RSDP copies GRUB passed in multiboot tags:
+/// tag 14 = ACPI old RSDP (v1), tag 15 = ACPI new RSDP (v2, carries the XSDT
+/// pointer). Returns (0, 0) for copies that were absent.
+///
+/// The tag payloads are plain physical addresses, and low physical memory stays
+/// readable because paging::init preserves the bootloader's 0-1GB identity map.
+pub fn acpi_rsdp_addrs(info_addr: u32) -> (u64, u64) {
     let total = unsafe { (*(info_addr as *const Info)).total_size };
     let mut offset = mem::size_of::<Info>() as u32;
-    let mut old = false;
-    let mut new = false;
+    let mut old = 0u64;
+    let mut new = 0u64;
     while offset + 8 <= total {
         let p = (info_addr as u64 + offset as u64) as *const u8;
         let typ = unsafe { core::ptr::read_unaligned(p as *const u32) };
@@ -409,8 +420,15 @@ pub fn acpi_tags(info_addr: u32) -> (bool, bool) {
             break;
         }
         match typ {
-            TAG_ACPI_OLD => old = true,
-            TAG_ACPI_NEW => new = true,
+            TAG_ACPI_OLD | TAG_ACPI_NEW => {
+                // Payload is a bare u32 physical address at tag offset 8.
+                let a = unsafe { core::ptr::read_unaligned(p.add(8) as *const u32) } as u64;
+                if typ == TAG_ACPI_OLD {
+                    old = a;
+                } else {
+                    new = a;
+                }
+            }
             _ => {}
         }
         offset += size;

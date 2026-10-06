@@ -34,6 +34,7 @@ mod services;
 mod devfs;
 mod firmware;
 mod drivers;
+mod acpi;
 
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -68,6 +69,15 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     // and install the framebuffer console when GRUB provided one. Must happen
     // before the banner below so the banner already goes to the fb.
     bootmode::init(_info);
+    // Parse the MADT now so the IRQ -> GSI mapping is known before anything
+    // programs the IOAPIC (route_device_irqs_ioapic runs much later, after the
+    // LAPIC is up). Needed because the IOAPIC's redirection entries are indexed
+    // by GSI, which is not the 8259's IRQ number -- see acpi.rs.
+    {
+        let (rsdp_old, rsdp_new) = multiboot2::acpi_rsdp_addrs(_info);
+        acpi::set_rsdp(rsdp_new, rsdp_old);
+        acpi::parse_madt();
+    }
     // Console log level. DEBUG traces (SYS>, [RSM:], mmap VMA/MMAP/CTX, execve
     // markers) are *always* captured in the klog ring buffer (queryable via
     // klog::dump() on a fault); they are mirrored to the serial port only when
@@ -105,6 +115,19 @@ pub extern "C" fn kernel_main(_magic: u32, _info: u32) -> ! {
     } else {
         pic::remap(pic::IRQ_BASE, pic::IRQ_BASE + 8);
         pic::mask_all();
+        // Timer and keyboard only. IRQ2 (the cascade the slave drives its
+        // requests onto) is deliberately left masked here: `pic::unmask` opens
+        // it as a side effect of unmasking any irq >= 8, and every device IRQ
+        // arrives that way once its driver calls sys_irq_register. Unmasking it
+        // here without a slave line behind it would only let the slave's
+        // in-service state leak into the master's priority logic.
+        //
+        // This ordering was the original defect, recorded because the symptom
+        // pointed somewhere else entirely: with the cascade shut, IRQ 8..15 are
+        // structurally undeliverable no matter what the driver does, so netd's
+        // waits all expired on their 1000ms timeout with the interrupt counter
+        // pinned, and the only thing the master-side counters showed was that
+        // IRQ 0 and IRQ 1 were fine. See reports/pic-slave-cascade-defect.md.
         pic::unmask(0);
         pic::unmask(1);
     }
@@ -396,6 +419,12 @@ pit::init(100);
         crate::apic::init_lapic();
     }
     serial::write_str("DEBUG: LAPIC init done\n");
+    // Now that the BSP LAPIC is up and the driver IDT stubs are registered,
+    // move device IRQs off the 8259 onto the IOAPIC. PCI devices assert their
+    // line until the driver clears them, which the edge-triggered PIC turns
+    // into either a lost first interrupt or a re-latch storm. Falls back to
+    // the 8259 if no IOAPIC is present.
+    interrupts::route_device_irqs_ioapic();
     // 开启中断，否则 init_aps 里的 wait_ms 依赖的 PIT TICKS 不递增会永久自旋
     unsafe { core::arch::asm!("sti", options(nostack)); }
     // Calibrate the LAPIC timer rate (stores TICKS_PER_MS globally) so APs can

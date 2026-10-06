@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, AtomicBool};
 
 use crate::memory::buddy::PAGE_SIZE;
 use crate::paging::PageTableManager;
@@ -2714,12 +2714,28 @@ fn sys_port_out(port: u16, width: u32, value: u64) -> i64 {
     0
 }
 
-// IRQ delivery: each registered IRQ gets a user-space counter word. The kernel
-// bumps the counter and futex-wakes the driver task on each edge. Drivers wait
-// with rynex_irq_wait (a futex wait on the same word) so they can block
-// cleanly instead of spinning.
+// IRQ delivery: the kernel keeps one counter per registered IRQ, bumps it on
+// each edge, and futex-wakes the driver task. Drivers wait with rynex_irq_wait
+// (a futex wait on the same counter) so they can block cleanly instead of
+// spinning.
 const MAX_DRIVER_IRQS: usize = 16;
 static mut DRIVER_IRQ_WORD: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
+
+/// The counters themselves live here, in kernel memory, not in the driver's
+/// user page.
+///
+/// The user's pointer is still validated and recorded -- it is part of the ABI
+/// and netd may inspect it -- but it is not the synchronisation object. Storing
+/// the state in a user page means the kernel's "address of the counter" quietly
+/// stops being a stable reference: the page can be swapped out, unmapped and
+/// rebuilt, or collide with a later mapping, and the same virtual address then
+/// reads back a different physical page's contents. That showed up as a counter
+/// that stepped 0->1, then read back as 0 again at the same address, so the wait
+// never saw its own snapshot change and fell through to its 1000ms timeout
+// every single time. A counter whose whole job is to be compared against a
+// value read moments earlier has to live somewhere that cannot move underneath
+/// the comparison.
+static mut DRIVER_IRQ_COUNT: [u32; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
 
 /// Driver task registers a user-space u32 counter for `irq`. Returns 0.
 fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
@@ -2732,7 +2748,20 @@ fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
     }
     unsafe {
         DRIVER_IRQ_WORD[irq as usize] = counter as u64;
-        crate::pic::unmask(irq);
+        // Start the kernel-side count from what the user page already holds, so
+        // a re-register does not make a fresh snapshot look like an edge.
+        DRIVER_IRQ_COUNT[irq as usize] = core::ptr::read_volatile(counter);
+        // Unmask only on the controller that will actually deliver this IRQ.
+        // If it is routed through the IOAPIC, the 8259 stays masked: unmasking
+        // both would deliver one interrupt twice by two routes, and the 8259
+        // route is the edge-triggered one we moved off of in the first place.
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::unmask(irq);
+        }
+        // Print the mask state right after the change: if the cascade bit is
+        // still set here, no slave IRQ can be delivered no matter what else is
+        // correct, and that is invisible everywhere else.
+        crate::pic::dump_state("after-unmask");
     }
     0
 }
@@ -2750,26 +2779,85 @@ fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
         if word == 0 {
             return -EINVAL;
         }
-        let first = core::ptr::read_volatile(word as *const u32);
+        // Synchronise on the kernel-side counter, not on the user word.
+        let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
+        // Snapshot the counter BEFORE reopening the line. The order is load-bearing,
+        // and getting it backwards is silent rather than loud:
+        //
+        // The counter is the synchronisation point, not the interrupt. So the
+        // snapshot must come first and the arm second -- anything the device
+        // does after the snapshot is visible to the comparison below. Arming
+        // first means the edge lands in the gap, gets counted into `first`, and
+        // is then reported as "nothing happened" while the handler has already
+        // masked the line and no further edge can ever arrive to correct it.
+        // Measured: every single wait consumed exactly one edge that way and
+        // then sat out its full 1000ms, so ICMP RTT never left 1.0-1.3s.
+        //
+        // With the snapshot first, the same race resolves in our favour: the
+        // handler bumps the counter, the check below sees it differ, and the
+        // wait returns without ever blocking.
+        let first = core::ptr::read_volatile(ctr);
         let deadline = if timeout_ms == 0 {
             0
         } else {
             crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) + timeout_ms / 10
         };
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::unmask(irq);
+        }
+        // Every exit path is logged at LOG_DEBUG, which the console filter drops
+        // by default. netd's loop is `r = irq_wait(irq, 1000); if (ISR & 1)
+        // poll();` so a ~1000ms round trip is the signature of the timeout
+        // branch, not of a slow delivery -- and only these tell the two apart.
+        // Kept at DEBUG rather than deleted because they are what localised the
+        // cascade and masking bugs; they cost nothing until someone raises the
+        // level, and netd's own 1000ms poll means the rate is bounded anyway.
+        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+        crate::klog::s("[IRQWAIT] enter irq=");
+        crate::klog::dec(irq as u64);
+        crate::klog::s(" word=0x");
+        crate::klog::hex(word);
+        crate::klog::s(" first=0x");
+        crate::klog::hex(first as u64);
+        crate::klog::s(" tick=");
+        crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+        crate::klog::end();
+        let mut spins = 0u32;
         loop {
-            let now = core::ptr::read_volatile(word as *const u32);
+            let now = core::ptr::read_volatile(ctr);
             if now != first {
+                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+                crate::klog::s("[IRQWAIT] ret-counter irq=");
+                crate::klog::dec(irq as u64);
+                crate::klog::s(" first=0x");
+                crate::klog::hex(first as u64);
+                crate::klog::s(" now=0x");
+                crate::klog::hex(now as u64);
+                crate::klog::s(" spins=");
+                crate::klog::dec(spins as u64);
+                crate::klog::s(" tick=");
+                crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+                crate::klog::end();
                 return 0;
             }
             if deadline != 0
                 && crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) >= deadline
             {
+                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+                crate::klog::s("[IRQWAIT] timeout irq=");
+                crate::klog::dec(irq as u64);
+                crate::klog::s(" ctr=");
+                crate::klog::dec(now as u64);
+                crate::klog::s(" spins=");
+                crate::klog::dec(spins as u64);
+                crate::klog::end();
                 return -EAGAIN;
             }
+            spins += 1;
             // Arm the task's wakeup tick so the timer path re-enters this loop
             // at the deadline; without it the block below could only ever be
             // released by an IRQ edge and `timeout_ms` would be a lie.
-            if !block_on_futex_until(word as *const u32, deadline) {
+            if !block_on_futex_until(ctr, deadline) {
                 return -EAGAIN;
             }
         }
@@ -2787,11 +2875,73 @@ pub fn driver_irq_edge(irq: u8) {
         if word == 0 {
             return;
         }
-        let now = core::ptr::read_volatile(word as *const u32);
-        core::ptr::write_volatile(word as *mut u32, now.wrapping_add(1));
-        crate::task::futex_wake(word as *const u32, 1);
+        // Bump the kernel-side counter -- the object the driver synchronises on -- and
+        // mirror it into the user's word, which stays live for a driver that
+        // chooses to read it.
+        let now = DRIVER_IRQ_COUNT[irq as usize];
+        DRIVER_IRQ_COUNT[irq as usize] = now.wrapping_add(1);
+        core::ptr::write_volatile(word as *mut u32, DRIVER_IRQ_COUNT[irq as usize]);
+        let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
+        let woken = crate::task::futex_wake(ctr, 1);
+
+        // Stop re-delivering until the driver has drained the device.
+        //
+        // The device holds INTA# asserted until the driver reads its interrupt
+        // status register, and netd only does that after this wait returns. So
+        // between an edge and the driver's drain there is a window in which the
+        // line is still up -- and because the 8259's request latch outlives the
+        // EOI, every EOI hands another interrupt straight back. Measured: 67
+        // million deliveries, the CPU pinned in this stub, and netd starved out
+        // of a single loop turn, so it never got to clear the line and the
+        // flood never ended.
+        //
+        // Masking here closes that window. No edge is lost by doing so: the
+        // counter above is what the driver synchronises on, not the interrupt,
+        // and `sys_irq_wait` reopens the line before it blocks again. This is
+        // the same disable/re-enable discipline a real driver uses around a
+        // shared or self-clearing device interrupt.
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::mask(irq);
+        }
+
+        // The wake count distinguishes the two things that look identical from
+        // netd's side: an edge that finds nobody blocked means the driver was
+        // running (it will re-read the counter), an edge that wakes someone
+        // means the wait returned because of the interrupt. Rate limited,
+        // because a flooding line must not fill the serial port and destroy the
+        // log needed to diagnose it.
+        let n = IRQ_DBG_EDGES[irq as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n % 512 == 0 {
+            crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+            crate::klog::s("[IRQEDGE] irq=");
+            crate::klog::dec(irq as u64);
+            crate::klog::s(" word=0x");
+            crate::klog::hex(word);
+            crate::klog::s(" ctr 0x");
+            crate::klog::hex(now as u64);
+            crate::klog::s("->0x");
+            crate::klog::hex(now.wrapping_add(1) as u64);
+            crate::klog::s(" woken=");
+            crate::klog::dec(woken as u64);
+            // When the edge arrived, in PIT ticks. The wait's own enter/RET
+            // prints carry the same clock, so comparing them separates "the
+            // interrupt was slow to be delivered" from "the edge was already
+            // here and the wake took this long to reach the driver" -- two
+            // faults that look identical as a round-trip time.
+            crate::klog::s(" tick=");
+            crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+            crate::klog::end();
+        }
     }
 }
+
+/// Per-IRQ delivery count, for the `[IRQEDGE]` trace only.
+///
+/// Atomic because it is incremented from interrupt context while other CPUs can
+/// be doing the same: the IDT is shared, so a plain `static mut` read-modify-
+/// write here is a data race under the Rust model, not merely untidy. It is
+/// debug state, so paying for an atomic is free.
+static IRQ_DBG_EDGES: [AtomicU32; MAX_DRIVER_IRQS] = [const { AtomicU32::new(0) }; MAX_DRIVER_IRQS];
 
 /// User-space FS service registers its IPC port with the kernel. From then on
 /// every userfs mount forwards vnode ops to that port.
