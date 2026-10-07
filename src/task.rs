@@ -146,6 +146,27 @@ pub const fn prio_to_nice(prio: u8) -> i32 {
     (prio as i32) - 20
 }
 
+/// Ticks of CPU per scheduling round, at 100Hz. One tick is 10ms.
+///
+/// Originally `8 - prio*5/40`, giving 7 ticks (70ms) to a prio-10 task, and it
+/// is back to that. An intermediate version cut it to 2 ticks while chasing
+/// wake latency, which did cut latency -- but for the wrong reason, and at a
+/// cost.
+///
+/// What the gate counters showed, once they could attribute latency to a
+/// specific early return in `timer_schedule`, was that the slice mattered only
+/// because a woken task could not pre-empt into it: 12-17 of the 16-19 ticks
+/// between an edge and the driver running sat under "slice has not expired".
+/// Cutting the slice cuts that term proportionally, but it also multiplies the
+/// number of context switches by the same factor -- and each one goes through
+/// the preempt-frame path whose fragility is documented at the build site. BAD
+/// PREEMPT warnings went from 63-84 to 467.
+///
+/// The two changes that actually address the wake -- `NEED_RESCHED` bypassing
+/// this gate, and a woken task going to the front of its priority queue -- make
+/// the slice length irrelevant to wake latency: the switch now happens at the
+/// next tick rather than when the slice runs out, so there should be no reason
+/// to keep the quantum short.
 fn initial_time_slice(prio: u8) -> u32 {
     let t = 8u32.saturating_sub((prio as u32) * 5 / 40);
     if t < 2 { 2 } else { t }
@@ -668,6 +689,51 @@ fn enqueue_task(tid: u64, prio: u8) {
             TASKS[task_idx(tail_id)].runqueue_next = Some(tid);
             rq.tails[p] = Some(tid);
         }
+        rq.nr_running += 1;
+    }
+}
+
+/// Enqueue at the *front* of the priority queue rather than the tail.
+///
+/// Used only on the wake path. Within a priority level `enqueue_task` is FIFO,
+/// so a task that blocks on I/O and is then woken lands behind every task
+/// already queued at that level -- and it then has to wait for each of them to
+/// consume a whole time slice. Measured: netd queued behind three runit
+/// children, and the resulting wait was the dominant part of driver wake
+/// latency even after the slice itself was cut from 7 ticks to 2.
+///
+/// The task that has been waiting for data has had nothing to do while it
+/// waited; the tasks ahead of it have been running. Putting the waiter first is
+/// what wake-time preemption means in a round-robin scheme, and it is what
+/// makes an interrupt-driven driver respond to its own interrupt. It is not a
+/// general-purpose reorder -- ordinary re-queues stay FIFO -- and it cannot
+/// starve anyone, because a task only reaches this path by having blocked first.
+fn enqueue_task_front(tid: u64, prio: u8) {
+    let cpu = task_ref(tid).cpu as usize;
+    let _g = RUNQUEUE_LOCK[cpu].lock();
+    unsafe {
+        let rq = &mut RUNQUEUE[cpu];
+        let idx = task_idx(tid);
+        let p = prio as usize;
+        // Guard against linking the same task twice: a second copy would mean a
+        // task competing against itself in the runqueue, and nr_running would
+        // be counted twice. Checking only the head would miss a task already
+        // sitting further down the list. Wake paths hand us Blocked tasks that
+        // were removed on blocking, so this scan normally finds nothing -- it is
+        // here so that correctness does not depend on that.
+        let mut seen = rq.heads[p];
+        while let Some(sid) = seen {
+            if sid == tid {
+                return;
+            }
+            seen = TASKS[task_idx(sid)].runqueue_next;
+        }
+        TASKS[idx].runqueue_next = rq.heads[p];
+        rq.heads[p] = Some(tid);
+        if rq.tails[p].is_none() {
+            rq.tails[p] = Some(tid);
+        }
+        rq.bitmap |= 1u64 << p;
         rq.nr_running += 1;
     }
 }
@@ -1948,6 +2014,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
     let current = cur_task().load(Ordering::SeqCst);
     if current == 0 {
+        TIMER_GATES[GATE_NONE].fetch_add(1, Ordering::Relaxed);
         return 0;
     }
 
@@ -1958,6 +2025,7 @@ pub extern "C" fn timer_schedule() -> u64 {
     // the CPU-pushed interrupt frame (iretq), letting the syscall continue
     // unperturbed.
     if in_syscall() {
+        TIMER_GATES[GATE_SYSCALL].fetch_add(1, Ordering::Relaxed);
         return 0;
     }
 
@@ -1966,6 +2034,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         // Kernel tasks: return 0 to signal handler to use CPU-pushed frame directly
         if TASKS[idx].user_stack == 0 {
+            TIMER_GATES[GATE_KERNEL_TASK].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
@@ -1978,6 +2047,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         // iretq preserves the interrupted kernel context exactly, and is what
         // the kernel-task path below already does.
         if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
+            TIMER_GATES[GATE_KERNEL_MODE].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
@@ -1988,11 +2058,42 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         // If task not running, don't reschedule — resume it as-is
         if TASKS[idx].state != TaskState::Running {
+            TIMER_GATES[GATE_NOT_RUNNING].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
         // Time slice still positive → keep running current task
-        if TASKS[idx].time_slice > 0 {
+        //
+        // ...unless someone asked to be rescheduled. `futex_wake` makes a
+        // blocked task Ready and enqueues it, and then iretq returns to
+        // whatever held the CPU; nothing else drains the runqueue, so the
+        // woken task waits out the incumbent's whole slice. Measured: that was
+        // 12-17 of the 16-19 ticks between an edge and the driver running, and
+        // with the slice cut to 2 ticks the remaining cost is the number of
+        // same-priority tasks queued ahead of it -- `dequeue_task` is FIFO per
+        // priority, so a task readied at equal priority goes to the back.
+        //
+        // This flag is the wake-implies-schedule mechanism. It is checked here
+        // rather than in the interrupt stub because this is the only place that
+        // can safely build a preempt frame: the three gates above are all
+        // documented as unable to, and bypassing them would resume a syscall
+        // mid-call or iretq out of kernel mode. Only the slice gate is bypassed,
+        // which is exactly the gate that was doing the damage.
+        //
+        // Bypassing it means `dequeue_task` now runs while the incumbent still
+        // has slice left, and that pick does not compare priorities against the
+        // task being displaced -- so a wake can hand the CPU to a
+        // lower-priority ready task sooner than the slice would have. That is
+        // not a new kind of switch: this scheduler makes exactly that pick when
+        // a slice expires too, and a task requeued at a better priority is the
+        // first thing `dequeue_task` will find at the following switch point.
+        // What changes is only when it happens, not how the CPU is ultimately
+        // shared. Making the wake path priority-aware while the expiry path is
+        // not would mean two different policies at two switch points, which is
+        // a worse inconsistency than either one alone.
+        let resched = NEED_RESCHED.swap(false, Ordering::Relaxed);
+        if TASKS[idx].time_slice > 0 && !resched {
+            TIMER_GATES[GATE_SLICE_LEFT].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
@@ -2040,6 +2141,7 @@ pub extern "C" fn timer_schedule() -> u64 {
                 // Running, which is the same state the single-pick version left
                 // behind.
                 TASKS[idx].state = TaskState::Running;
+                TIMER_GATES[GATE_NOTHING_READY].fetch_add(1, Ordering::Relaxed);
                 return 0;
             }
         };
@@ -2050,6 +2152,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
+        TIMER_GATES[GATE_SWITCHED].fetch_add(1, Ordering::Relaxed);
         cur_task().store(next_id, Ordering::SeqCst);
         { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
@@ -2869,6 +2972,87 @@ fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
                 crate::klog::s(" tick=");
                 crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
                 crate::klog::end();
+                // Wake latency: ticks from the edge reaching the handler to
+                // this wait observing it and returning. This is the one
+                // measurement that separates "the edge took a while to arrive"
+                // from "the edge was already here and the woken task waited to
+                // be picked" -- the two are indistinguishable from netd's RTT,
+                // which is what made the earlier "one to two full time slices"
+                // explanation so hard to confirm or refute.
+                //
+                // Suppressed unless it is bad; see the threshold below.
+                let edge = WAKE_EDGE_TICK[irq as usize].load(Ordering::Relaxed);
+                if edge != 0 {
+                    let t = crate::pit::TICKS.load(Ordering::Relaxed);
+                    let i = irq as usize;
+                    WAKE_EDGE_TICK[i].store(0, Ordering::Relaxed);
+                    // Only when slow. A healthy wake is 1-3 ticks at 100Hz,
+                    // and printing on every one would put an unbounded line on
+                    // the serial port from inside a syscall, with interrupts
+                    // disabled while it waits -- exactly the failure this
+                    // session had to undo once already.
+                    //
+                    // So the good case prints nothing and this line *is* the
+                    // regression signal: if wake latency comes back, the
+                    // gates= breakdown below attributes it to a specific early
+                    // return in timer_schedule instead of leaving RTT as the
+                    // only symptom. Raise the threshold only with a reason;
+                    // 5 is enough headroom over 1-3 that noise does not
+                    // mask a real regression.
+                    let lat = t.wrapping_sub(edge);
+                    if lat > 5 {
+                        crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SCHED);
+                        crate::klog::s("[WAKE] irq=");
+                        crate::klog::dec(irq as u64);
+                        crate::klog::s(" edge_tick=");
+                        crate::klog::dec(edge);
+                        crate::klog::s(" ret_tick=");
+                        crate::klog::dec(t);
+                        crate::klog::s(" lat=");
+                        crate::klog::dec(t.wrapping_sub(edge));
+                        crate::klog::s(" | inc=");
+                        crate::klog::dec(WAKE_INC_TASK[i].load(Ordering::Relaxed));
+                        crate::klog::s(" inc_prio=");
+                        crate::klog::dec(WAKE_INC_PRIO[i].load(Ordering::Relaxed));
+                        crate::klog::s(" inc_slice=");
+                        crate::klog::dec(WAKE_INC_SLICE[i].load(Ordering::Relaxed));
+                        crate::klog::s(" rq=");
+                        crate::klog::hex(WAKE_RQ_BITMAP[i].load(Ordering::Relaxed));
+                        crate::klog::s(" | ret_task=");
+                        crate::klog::dec(cur_task().load(Ordering::Relaxed));
+                        crate::klog::s(" ret_prio=");
+                        crate::klog::dec(
+                            TASKS[task_idx(cur_task().load(Ordering::Relaxed))].prio as u64,
+                        );
+                        // Which gate held the CPU during the wait. One letter per
+                        // gate so the line stays short: 0=none (BSP hlt),
+                        // S=syscall, K=kernel-task, M=kernel-mode, N=not-running,
+                        // L=slice-left, .=nothing-ready, X=switched.
+                        if WAKE_GATE_IRQ[i].load(Ordering::Relaxed) != 0 {
+                            WAKE_GATE_IRQ[i].store(0, Ordering::Relaxed);
+                            crate::klog::s(" gates=");
+                            for g in 0..GATE_COUNT {
+                                let d = TIMER_GATES[g]
+                                    .load(Ordering::Relaxed)
+                                    .wrapping_sub(WAKE_GATE_SNAP[g].load(Ordering::Relaxed));
+                                if d != 0 {
+                                    crate::klog::s(match g {
+                                        GATE_NONE => "0",
+                                        GATE_SYSCALL => "S",
+                                        GATE_KERNEL_TASK => "K",
+                                        GATE_KERNEL_MODE => "M",
+                                        GATE_NOT_RUNNING => "N",
+                                        GATE_SLICE_LEFT => "L",
+                                        GATE_NOTHING_READY => ".",
+                                        _ => "X",
+                                    });
+                                    crate::klog::dec(d);
+                                }
+                            }
+                        }
+                        crate::klog::end();
+                    }
+                }
                 return 0;
             }
             if deadline != 0
@@ -2914,6 +3098,35 @@ pub fn driver_irq_edge(irq: u8) {
         core::ptr::write_volatile(word as *mut u32, DRIVER_IRQ_COUNT[irq as usize]);
         let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
         let woken = crate::task::futex_wake(ctr, 1);
+        // Stamp the edge only when it woke somebody. sys_irq_wait clears the
+        // stamp as it reads it, so an edge that wakes nobody cannot be charged
+        // to a later, unrelated wait.
+        if woken > 0 {
+            let i = irq as usize;
+            WAKE_EDGE_TICK[i].store(
+                crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            let inc = cur_task().load(Ordering::Relaxed);
+            WAKE_INC_TASK[i].store(inc, Ordering::Relaxed);
+            if inc != 0 {
+                let ii = task_idx(inc);
+                WAKE_INC_SLICE[i].store(TASKS[ii].time_slice as u64, Ordering::Relaxed);
+                WAKE_INC_PRIO[i].store(TASKS[ii].prio as u64, Ordering::Relaxed);
+            }
+            // Read under the runqueue lock, as dequeue_task does. Racy without
+            // it, and the value is only a snapshot for the log line.
+            {
+                let cpu = current_cpu();
+                let _g = RUNQUEUE_LOCK[cpu].lock();
+                let b = unsafe { RUNQUEUE[cpu].bitmap };
+                WAKE_RQ_BITMAP[i].store(b, Ordering::Relaxed);
+            }
+            for g in 0..GATE_COUNT {
+                WAKE_GATE_SNAP[g].store(TIMER_GATES[g].load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            WAKE_GATE_IRQ[i].store(1, Ordering::Relaxed);
+        }
 
         // Stop re-delivering until the driver has drained the device.
         //
@@ -2973,6 +3186,58 @@ pub fn driver_irq_edge(irq: u8) {
 /// write here is a data race under the Rust model, not merely untidy. It is
 /// debug state, so paying for an atomic is free.
 static IRQ_DBG_EDGES: [AtomicU32; MAX_DRIVER_IRQS] = [const { AtomicU32::new(0) }; MAX_DRIVER_IRQS];
+
+/// PIT tick at which an edge last woke a waiter on this IRQ; 0 when none
+/// outstanding. Written in interrupt context, read and cleared by the waiter,
+/// so it is atomic rather than a bare cell. Paired with the `[WAKE]` line to
+/// measure edge-to-dispatch latency without turning on debug output globally.
+static WAKE_EDGE_TICK: [AtomicU64; MAX_DRIVER_IRQS] =
+    [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// State of the machine at the instant the edge was delivered: who held the
+/// CPU, how much of their slice was left, and what was queued. Printed next to
+/// the latency figure, because the latency alone cannot distinguish "the
+/// incumbent's slice had N ticks left" (which would show a wide spread) from
+/// "something re-checks on a fixed period" (which shows a tight cluster, as
+/// measured: 16-20 ticks every time).
+static WAKE_INC_TASK: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_INC_SLICE: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_INC_PRIO: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_RQ_BITMAP: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// Why `timer_schedule` declined to switch, counted per gate. Every tick lands
+/// in exactly one of these, so the sum over a wake window is the number of
+/// ticks that passed -- and the breakdown says which condition was holding the
+/// woken task off the CPU. Without this the only way to tell "the incumbent's
+/// slice had not expired" from "the incumbent is inside a syscall and cannot be
+/// preempted at all" is to read every gate and guess.
+pub const GATE_NONE: usize = 0; // current == 0: BSP bare hlt loop
+pub const GATE_SYSCALL: usize = 1; // in_syscall(): preempt frame unsafe
+pub const GATE_KERNEL_TASK: usize = 2; // user_stack == 0
+pub const GATE_KERNEL_MODE: usize = 3; // user task interrupted in kernel mode
+pub const GATE_NOT_RUNNING: usize = 4; // state != Running
+pub const GATE_SLICE_LEFT: usize = 5; // slice not yet expired
+pub const GATE_NOTHING_READY: usize = 6; // queue held nothing else
+pub const GATE_SWITCHED: usize = 7; // switched away
+pub const GATE_COUNT: usize = 8;
+
+static TIMER_GATES: [AtomicU64; GATE_COUNT] = [const { AtomicU64::new(0) }; GATE_COUNT];
+
+/// Snapshot of TIMER_GATES taken at the edge, diffed when the wait returns.
+static WAKE_GATE_SNAP: [AtomicU64; GATE_COUNT] = [const { AtomicU64::new(0) }; GATE_COUNT];
+static WAKE_GATE_IRQ: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// Set when `futex_wake` put a task into the runqueue, cleared by the next
+/// `timer_schedule` that gets far enough to honour it.
+///
+/// This is the wake-implies-schedule request. Without it a task made Ready has
+/// to wait out the incumbent's entire slice, because iretq returns to whatever
+/// held the CPU and nothing else drains the runqueue -- measured at 12-17 of
+/// the 16-19 ticks of driver wake latency. It is a request, not a mandate:
+/// `timer_schedule` still refuses to switch from a syscall or kernel mode, so a
+/// set flag that meets those gates stays set for the next attempt rather than
+/// switching where it is unsafe to.
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
 /// User-space FS service registers its IPC port with the kernel. From then on
 /// every userfs mount forwards vnode ops to that port.
@@ -3671,7 +3936,8 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 // Resume on the live regs from the last context_switch; do NOT
                 // stamp the zeroed saved_user_regs snapshot (would clobber r15).
                 let _ = TASKS[i].saved_user_regs.take();
-                enqueue_task(TASKS[i].id, TASKS[i].prio);
+                enqueue_task_front(TASKS[i].id, TASKS[i].prio);
+                NEED_RESCHED.store(true, Ordering::Relaxed);
                 woken += 1;
             }
         }
