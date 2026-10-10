@@ -121,12 +121,13 @@ pub extern "x86-interrupt" fn debug(mut frame: InterruptStackFrame) {
                 crate::serial::write_dec(wbn as u64);
                 crate::serial::write_str("\n");
             }
-            core::arch::asm!("mov {}, dr6", in(reg) (dr6 & !0xF), options(nostack, nomem));
+            core::arch::asm!("mov dr6, {}", in(reg) (dr6 & !0xF), options(nostack, nomem));
         }
         // clear TF
-        let v = frame.as_mut();
+        let mut v = frame.as_mut();
         let mut inner = v.read();
         inner.cpu_flags.remove(x86_64::registers::rflags::RFlags::TRAP_FLAG);
+        v.write(inner);
     }
     return;
 }
