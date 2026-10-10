@@ -106,6 +106,25 @@ pub unsafe fn init_aps(ap_entry_fn: u64) {
 
 #[no_mangle]
 pub extern "C" fn ap_entry(apic_id: u32) -> ! {
+    // The SIPI trampoline (asm/ap_trampoline.S) only ever sets PE/PAE/PG in
+    // CR0/CR4 and never mirrors the BSP's OSFXSR/OSXMMEXCPT (main.rs enables
+    // them), nor CR0.WP. Without them the AP's kernel-mode writes to
+    // read-only pages silently succeed (page-type protection bypassed) and
+    // any SSE instruction faults #UD. Sync both before running Rust code
+    // (alloc_stack, GDT setup) that could use SSE or depend on WP.
+    unsafe {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, nomem));
+        cr0 |= 0x10000; // WP
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, nomem));
+    }
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+        cr4 |= 0x600; // OSFXSR (9) + OSXMMEXCPT (10)
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, nomem));
+    }
+
     // 1. Set up per-CPU GDT/TSS/IST stacks.
     // Kernel stacks are addressed by raw physical address (identity-mapped in low 1GB).
     let pc = crate::percpu::percpu(apic_id);

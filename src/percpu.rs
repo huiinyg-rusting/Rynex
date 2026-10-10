@@ -1,7 +1,12 @@
 use core::sync::atomic::AtomicU64;
 use core::mem::MaybeUninit;
 
-pub const MAX_CPUS: usize = 256;
+// Single source of truth for the CPU count; task::MAX_CPUS aliases this.
+// The SMP probe (smp::detect_cpus) hardcodes BSP + one AP, so 2 is the
+// honest maximum today — raise it when MADT/CPUID-driven discovery lands.
+// Previously this was 256 while task.rs used 2, so current_cpu() %2 and
+// percpu() %256 diverged for any third APIC id.
+pub const MAX_CPUS: usize = 2;
 
 #[repr(C, align(4096))]
 pub struct PerCpu {
