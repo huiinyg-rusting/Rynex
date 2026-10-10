@@ -15,7 +15,9 @@ SECTIONS
     }
 
     .text : ALIGN(4K) {
+        _kernel_text_start = .;
         *(.text .text.*)
+        _kernel_text_end = .;
     }
 
     .rodata : ALIGN(4K) {
