@@ -1735,6 +1735,23 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
     )
 }
 
+// Bounds of the kernel's own .text, from linker.ld. A kernel-mode resume RIP
+// must land inside them; outside means the interrupted stream was already
+// corrupt (ret/jump landed in .data/.rodata). The end bound used to be a
+// hardcoded address that drifted as the kernel grew — every binary with more
+// than ~86 KiB of .text flagged legitimate tail-of-.text RIPs — so read the
+// real section limits from the link instead.
+extern "Rust" {
+    static _kernel_text_start: u64;
+    static _kernel_text_end: u64;
+}
+
+fn rip_in_kernel_text(rip: u64) -> bool {
+    let start = unsafe { &_kernel_text_start as *const _ as u64 };
+    let end = unsafe { &_kernel_text_end as *const _ as u64 };
+    rip >= start && rip < end
+}
+
 #[no_mangle]
 pub extern "C" fn save_interrupt_context(frame: *mut u64) {
     unsafe {
@@ -1810,12 +1827,13 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.ss     = KERNEL_DATA_SELECTOR;
 
             // Diagnostics: flag kernel-mode RIPs that fall outside .text
-            // (0x106000..0x11AF6F). A kernel task should never be "running"
+            // (start/end come from the linker script, see rip_in_kernel_text).
+            // A kernel task should never be "running"
             // from .data/.rodata — this indicates the interrupted stream was
             // already corrupt (ret/jump landed in data). Captured via klog so
             // it is queryable (klog::dump()) and hideable by console level.
             let rip = regs.rip;
-            let in_text = rip >= 0x106000 && rip < 0x11AF6F;
+            let in_text = rip_in_kernel_text(rip);
             if !in_text {
                 crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_SCHED);
                 crate::klog::s("[BADKERNELRIP] task=");
@@ -2209,13 +2227,13 @@ fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
         // Guard: a kernel-mode (cs.RPL==0) preempt frame whose resume RIP is
-        // outside .text (0x106000..0x11AF6F) means the interrupted stream was
+        // outside .text (bounds from linker.ld, see rip_in_kernel_text) means the interrupted stream was
         // already corrupt (ret/jump landed in .data/.rodata). Captured via klog
         // (WARNING) so it is queryable via klog::dump() and hideable by console
         // level; user-mode RIPs legitimately exceed .text, so only warn for
         // kernel code.
         let rip = regs.rip;
-        let in_text = rip >= 0x106000 && rip < 0x11AF6F;
+        let in_text = rip_in_kernel_text(rip);
         if (regs.cs & 3) == 0 && !in_text {
             crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SCHED);
             crate::klog::s("[BADPREEMPT] task=");
@@ -6790,6 +6808,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
         match request {
             TCGETS => {
                 if arg3 != 0 {
+                    if !user_range_valid(arg3, 60, true) {
+                        return -EFAULT;
+                    }
                     let termios = [0u8; 60];
                     unsafe { core::ptr::copy_nonoverlapping(termios.as_ptr(), arg3 as *mut u8, 60); }
                 }
@@ -6797,6 +6818,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
             }
             TIOCGWINSZ => {
                 if arg3 != 0 {
+                    if !user_range_valid(arg3, 8, true) {
+                        return -EFAULT;
+                    }
                     let winsz = [0u16; 4];
                     unsafe { core::ptr::copy_nonoverlapping(winsz.as_ptr(), arg3 as *mut u16, 4); }
                 }
@@ -6814,6 +6838,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
             TIOCSPGRP | TIOCGPGRP => {
                 if request == TIOCSPGRP {
                     if arg3 != 0 {
+                        if !user_range_valid(arg3, 4, false) {
+                            return -EFAULT;
+                        }
                         let pg = unsafe { *(arg3 as *const i32) };
                         crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
                     }
@@ -6831,6 +6858,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
                         crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
                     }
                     if arg3 != 0 {
+                        if !user_range_valid(arg3, 4, true) {
+                            return -EFAULT;
+                        }
                         unsafe { *(arg3 as *mut i32) = pg; }
                     }
                     return 0;
