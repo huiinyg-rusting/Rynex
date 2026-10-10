@@ -170,6 +170,12 @@ pub fn read_char() -> u8 {
 }
 
 pub fn read_line(buf: &mut [u8]) -> usize {
+    // An empty buffer makes every `buf.len() - 1` below underflow to
+    // usize::MAX, so the write branch would store past the end. Refuse
+    // outright instead of touching memory.
+    if buf.is_empty() {
+        return 0;
+    }
     let mut i = 0;
     loop {
         let c = read_char();

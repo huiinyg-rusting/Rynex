@@ -217,7 +217,12 @@ unsafe fn add_free_region_skipping(start: u64, end: u64,
     arena_base: u64, arena_size: u64, kbss_start: u64, kbss_end: u64)
 {
     // Build a sorted list of reserved intervals [start, end) within [start, end)
-    let mut reserved = [(0u64, 0u64); 34]; // cursor: kernel bss + modules + info_page + metadata arena
+    // Worst case: metadata arena + kernel BSS + up to 32 module regions +
+    // info page = 35 intervals. Size generously past that so the fixed arrays
+    // cannot overflow; add_free_region_skipping runs under the memory lock at
+    // boot, so a stack overrun here would corrupt the allocator state.
+    const MAX_RESERVED: usize = 64;
+    let mut reserved = [(0u64, 0u64); MAX_RESERVED];
     let mut rcount = 0;
 
     // Metadata arena (PAGE_TYPE/PAGE_OWNED_BY backing): carve it out BEFORE
@@ -275,7 +280,7 @@ unsafe fn add_free_region_skipping(start: u64, end: u64,
     }
 
     // Merge overlapping/adjacent reserved intervals
-    let mut merged = [(0u64, 0u64); 32];
+    let mut merged = [(0u64, 0u64); MAX_RESERVED];
     let mut mcount = 0;
     for i in 0..rcount {
         let (rs, re) = reserved[i];
@@ -314,33 +319,49 @@ unsafe impl GlobalAlloc for GlobalBuddyAllocator {
             (layout.size() + 4095) & !4095,
             layout.align().max(4096),
         );
-        
-        let order = {
-            let _size = layout.size();
-            let mut o = 0;
-            while (4096 << o) < layout.size() && o < 10 {
-                o += 1;
-            }
-            o
-        };
-        
+
+        // A buddy block of order o is naturally aligned to 4096<<o, so the
+        // order must cover BOTH the size and the alignment: a 2 MiB-aligned
+        // request needs order 9 even if its size is tiny. The loop must not
+        // clamp at MAX_ORDER (10 = 4 MiB): beyond it no block exists that is
+        // large enough, and handing out a smaller block would overflow. Reject
+        // the allocation instead.
+        let max_order = crate::memory::buddy::MAX_ORDER;
+        let mut o = 0;
+        while (4096 << o) < layout.size() && o < max_order {
+            o += 1;
+        }
+        let mut ao = 0;
+        while (4096 << ao) < layout.align() && ao < max_order {
+            ao += 1;
+        }
+        if (4096 << o) < layout.size() || (4096 << ao) < layout.align() {
+            return ptr::null_mut();
+        }
+        let order = o.max(ao);
+
         let alloc = unsafe { &mut ALLOC };
         alloc.alloc(order).map(|p| p as *mut u8).unwrap_or(ptr::null_mut())
     }
     
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size();
-        let _size = (size + 4095) & !4095;
-        let order = {
-            let size = layout.size();
-            let _size = (size + 4095) & !4095;
-            let mut o = 0;
-            while (4096 << o) < layout.size() && o < 10 {
-                o += 1;
-            }
-            o
-        };
-        
+        // Rust guarantees dealloc receives the same layout as the matching
+        // alloc, so mirror the alloc side's max(size, align) order: freeing at
+        // a different order would unlink the wrong buddy node and corrupt the
+        // free lists.
+        let size = (layout.size() + 4095) & !4095;
+        let align = layout.align().max(4096);
+        let max_order = crate::memory::buddy::MAX_ORDER;
+        let mut o = 0;
+        while (4096 << o) < size && o < max_order {
+            o += 1;
+        }
+        let mut ao = 0;
+        while (4096 << ao) < align && ao < max_order {
+            ao += 1;
+        }
+        let order = o.max(ao).min(max_order);
+
         let alloc = unsafe { &mut ALLOC };
         alloc.free(ptr as u64, order);
     }
