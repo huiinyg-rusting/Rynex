@@ -618,6 +618,14 @@ pub fn dispatch(msg: &mut VfsMessage) -> i64 {
                 Some(v) => v,
                 None => { msg.result = -1; return -1; }
             };
+            // The caller must attach a buffer sized for a full Stat. The
+            // services.rs handler points msg.data into its IPC request payload
+            // and sets data_len from it, so a short request would make the
+            // write below run past the end of the message buffer.
+            if msg.data_len < core::mem::size_of::<Stat>() {
+                msg.result = -1;
+                return -1;
+            }
             match vnode.ops.stat(vnode.ino) {
                 Ok(st) => unsafe {
                     core::ptr::write(msg.data as *mut Stat, st);

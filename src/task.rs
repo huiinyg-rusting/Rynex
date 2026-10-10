@@ -479,7 +479,7 @@ fn task_mut(tid: u64) -> &'static mut Task {
 // SMP: maximum number of logical CPUs the scheduler is built for. The BSP is CPU 0;
 // APIC IDs above the physical count simply stay unwired. Each CPU has its OWN current
 // task, runqueue, and runqueue lock (per-CPU scheduling).
-pub const MAX_CPUS: usize = 2;
+pub const MAX_CPUS: usize = crate::percpu::MAX_CPUS;
 static mut RUNQUEUE: [RunQueue; MAX_CPUS] = [const { RunQueue::new() }; MAX_CPUS];
 // Serializes all runqueue mutations. IRQ-safe so the timer ISR and syscalls can
 // both touch the runqueue without corrupting the linked lists / bitmap. One lock per CPU.
@@ -7370,6 +7370,14 @@ const S_IRWXU: u32 = 0o700;
 const S_IRUSR: u32 = 0o400;
 
 fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
+    // statbuf is a raw user pointer from stat/fstat; writing LinuxStat through
+    // it without a range check is the same hole the ioctl fix closed — a user
+    // task could pass any kernel address and have the kernel scribble a stat
+    // struct over it.
+    if statbuf.is_null()
+        || !user_range_valid(statbuf as u64, core::mem::size_of::<LinuxStat>(), true) {
+        return -EFAULT;
+    }
     let st = match crate::vfs_core::stat(vnode_id) {
         Ok(s) => s,
         Err(_) => return -EIO,
