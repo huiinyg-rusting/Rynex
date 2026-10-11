@@ -4800,6 +4800,18 @@ fn sys_fork() -> i64 {
         child_regs.rsp = SYSCALL_USER_RSP;
         child_regs.rflags = SYSCALL_USER_RFLAGS;
         child_regs.fs_base = SYSCALL_USER_FS_BASE;
+        // The child must resume in USER mode (RING 3), not inherit the CS/SS
+        // that parent.regs may still hold from a kernel-mode context switch.
+        // If the parent happened to be last sampled in kernel mode (regs.cs=0x8)
+        // when it made this fork call, leaving cs untouched makes the child
+        // resume at a user RIP with a ring-0 CS: context_switch takes the
+        // kernel->kernel preempt path, the resumed stream runs user code in
+        // ring 0 (or faults on its first user-memory access), and the scheduler
+        // logs [BADPREEMPT] for it. sys_clone already forces this; sys_fork
+        // was missing it. A fork child always returns to user mode, so pin the
+        // selectors unconditionally.
+        child_regs.cs = USER_CODE_SELECTOR | 3;
+        child_regs.ss = USER_DATA_SELECTOR | 3;
         child_regs.rax = 0; // Child gets 0 from fork
         // parent.regs holds stale callee-saved regs (last context switch);
         // use the live values captured by syscall_entry instead.
