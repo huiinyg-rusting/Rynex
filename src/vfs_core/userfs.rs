@@ -171,7 +171,17 @@ impl super::VnodeOps for UserFs {
             return Err("userfs readlink");
         }
         let n = result as usize;
-        // Leak a small copy so the returned slice stays alive.
+        // out is [result:8 || payload]; a service that reports more bytes than
+        // the reply buffer holds would make the slice below panic or read OOB.
+        if n > out.len() - 8 {
+            return Err("userfs readlink");
+        }
+        // NOTE: the VnodeOps trait returns a slice borrowed from &self, so this
+        // copy must outlive self; Box::leak keeps it alive but leaks `n` bytes
+        // on every call (unbounded under repeated calls, e.g. a symlink loop).
+        // The proper fix is a caller-provided buffer like read(); that changes
+        // the trait and all impls, so it is deferred and only the panic/OOB
+        // path is closed here.
         let boxed = alloc::boxed::Box::from(&out[8..8 + n]);
         Ok(alloc::boxed::Box::leak(boxed))
     }
@@ -186,6 +196,12 @@ impl super::VnodeOps for UserFs {
 
     fn rename(&self, old_parent: u64, old_name: &[u8], new_parent: u64, new_name: &[u8]) -> Result<(), &'static str> {
         let mut payload = [0u8; MAX_REQ - 48];
+        // old_name + NUL + new_name must fit the scratch before any copy,
+        // otherwise the slice assignments below panic (index out of range)
+        // rather than returning an error.
+        if old_name.len() + new_name.len() + 1 > payload.len() {
+            return Err("userfs rename: name too long");
+        }
         let mut pos = 0;
         payload[pos..pos + old_name.len()].copy_from_slice(old_name);
         pos += old_name.len();
