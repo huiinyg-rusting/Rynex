@@ -255,8 +255,20 @@ impl VnodeOps for ProcFs {
                 _ => {
                     // Numeric name -> a /proc/<pid> directory.
                     if !name.is_empty() && name.iter().all(|&c| c >= b'0' && c <= b'9') {
+                        // Checked parse: an arbitrarily long digit string would
+                        // otherwise wrap u64. Also cap the pid so PID_DIR_INO +
+                        // pid stays below PID_STAT_INO, or a crafted number
+                        // could alias into the stat/cmdline inode ranges.
                         let mut pid = 0u64;
-                        for &c in name { pid = pid * 10 + (c - b'0') as u64; }
+                        for &c in name {
+                            pid = match pid.checked_mul(10).and_then(|p| p.checked_add((c - b'0') as u64)) {
+                                Some(p) => p,
+                                None => return Err("not found"),
+                            };
+                        }
+                        if pid >= PID_STAT_INO - PID_DIR_INO {
+                            return Err("not found");
+                        }
                         return Ok(pid_dir_ino(pid));
                     }
                     Err("not found")
