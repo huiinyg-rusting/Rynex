@@ -33,6 +33,7 @@ mod tty;
 mod services;
 mod devfs;
 mod firmware;
+mod netsock;
 mod drivers;
 mod acpi;
 

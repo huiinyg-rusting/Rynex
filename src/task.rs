@@ -2349,6 +2349,19 @@ pub const SYS_dup: u64 = 32;
 pub const SYS_dup2: u64 = 33;
 pub const SYS_nanosleep: u64 = 35;
 pub const SYS_getpid: u64 = 39;
+
+// Sockets. There is no TCP/IP in the kernel — these are a facade that
+// marshals each call to netd over IPC (see `netsock.rs`). The numbers are
+// Linux x86-64 so static musl binaries reach them unmodified.
+pub const SYS_socket: u64 = 41;
+pub const SYS_connect: u64 = 42;
+pub const SYS_accept: u64 = 43;
+pub const SYS_sendto: u64 = 44;
+pub const SYS_recvfrom: u64 = 45;
+pub const SYS_shutdown: u64 = 48;
+pub const SYS_bind: u64 = 49;
+pub const SYS_listen: u64 = 50;
+
 pub const SYS_clone: u64 = 56;
 pub const SYS_fork: u64 = 57;
 pub const SYS_vfork: u64 = 58;
@@ -2466,6 +2479,7 @@ pub const SYS_rynex_pci_read: u64 = 2032;
 pub const SYS_rynex_pci_write: u64 = 2033;
 pub const SYS_rynex_pci_find: u64 = 2034;
 pub const SYS_rynex_request_firmware: u64 = 2035;
+pub const SYS_rynex_ipc_peek: u64 = 2036;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -2504,6 +2518,18 @@ pub extern "C" fn syscall_handler(
         SYS_write => sys_write(arg1 as u32, arg2 as *const u8, arg3 as usize),
         SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
         SYS_close => sys_close(arg1 as u32),
+        // Socket facade: no protocol lives here, each call is one IPC round
+        // trip to netd. See `netsock.rs`.
+        SYS_socket => crate::netsock::sock_socket(arg1 as i32, arg2 as i32, arg3 as i32),
+        SYS_connect => sys_connect(arg1 as u32, arg2 as *const u8, arg3 as u32),
+        SYS_accept => crate::netsock::sock_accept(arg1 as u32),
+        SYS_sendto => sys_sendto(arg1 as u32, arg2 as *const u8, arg3 as usize, arg4 as i32,
+                                  arg5 as *const u8, arg6 as u32),
+        SYS_recvfrom => sys_recvfrom(arg1 as u32, arg2 as *mut u8, arg3 as usize, arg4 as i32,
+                                      arg5 as *mut u8, arg6 as *mut u32),
+        SYS_shutdown => crate::netsock::sock_shutdown(arg1 as u32, arg2 as u32),
+        SYS_bind => sys_bind(arg1 as u32, arg2 as *const u8, arg3 as u32),
+        SYS_listen => crate::netsock::sock_listen(arg1 as u32, arg2 as u32),
         SYS_stat => sys_stat(arg1 as *const u8, arg2 as *mut u8),
         SYS_fstat => sys_fstat(arg1 as u32, arg2 as *mut u8),
         SYS_lstat => sys_stat(arg1 as *const u8, arg2 as *mut u8), // lstat = stat in flat fs
@@ -2609,7 +2635,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_ipc_close => crate::ipc::ipc_close(arg1 as u64),
         SYS_rynex_ipc_call => crate::ipc::ipc_call(arg1 as u64, arg2 as *const u8, arg3 as usize, arg4 as *mut u8, arg5 as usize),
         SYS_rynex_ipc_recv_ex => crate::ipc::ipc_recv_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
-        SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize),
+        SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize) as i64,
         SYS_rynex_fs_register => sys_fs_register(arg1 as u64),
         SYS_rynex_fs_mount => sys_fs_mount(arg1 as *const u8),
         SYS_rynex_phys_map => sys_phys_map(arg1 as u64, arg2 as u64),
@@ -2620,6 +2646,13 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_pci_find => sys_pci_find(arg1 as u16),
         SYS_rynex_request_firmware =>
             crate::firmware::sys_request_firmware(arg1 as *const u8, arg2 as usize, arg3 as *mut u8, arg4 as usize),
+        // Non-blocking receive: returns immediately with 0 when the mailbox is
+        // empty, rather than sleeping until a message arrives. A service that
+        // has other work to do in its main loop (netd drives virtio itself and
+        // cannot sleep in recv) needs this; a client that wants to block uses
+        // SYS_rynex_ipc_recv_ex instead. Packed identically to recv_ex: the
+        // reply token in the high 32 bits, the length in the low 32.
+        SYS_rynex_ipc_peek => crate::ipc::ipc_peek_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -2715,6 +2748,10 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
         Some(f) => f,
         None => return -EBADF,
     };
+    // Socket fd? netd transmits; this is a single IPC round trip.
+    if crate::netsock::sock_idx_of(inode_fd.inode_idx).is_some() {
+        return crate::netsock::sock_send(fd, buf, count, 0);
+    }
     // Pipe write end?
     if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
         if pipe_is_write_end(inode_fd.inode_idx) {
@@ -4167,6 +4204,15 @@ pub const ETIMEDOUT: i64 = 110;
 pub const ENOTEMPTY: i64 = 39;
 pub const EMSGSIZE: i64 = 90;
 pub const EADDRNOTAVAIL: i64 = 99;
+pub const ESOCKTYPE: i64 = 94;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const ENETUNREACH: i64 = 101;
+pub const ENETDOWN: i64 = 100;
+pub const ECONNRESET: i64 = 104;
+pub const ENOTCONN: i64 = 107;
+pub const ECONNREFUSED: i64 = 111;
+pub const EHOSTUNREACH: i64 = 113;
+pub const EINPROGRESS: i64 = 115;
 
 // ── Privileges (bug 15) ─────────────────────────────────────────
 // Bitmask of privileged operations a task is allowed to perform. Gates the
@@ -4325,6 +4371,10 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
         Some(f) => f,
         None => return -EBADF,
     };
+    // Socket fd? netd owns the receive buffer; this is a single IPC round trip.
+    if crate::netsock::sock_idx_of(inode_fd.inode_idx).is_some() {
+        return crate::netsock::sock_recv(fd, buf, count, 0);
+    }
     // Pipe read end?
     if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
         if pipe_is_write_end(inode_fd.inode_idx) { return -EBADF; }
@@ -5959,9 +6009,101 @@ fn sys_brk(addr: u64) -> i64 {
     }
 }
 
+// ── Socket address decoding ────────────────────────────────────────
+
+/// Decode a user-space `struct sockaddr_in` into (IPv4 address in network
+/// byte order, port in host byte order).
+///
+/// ```c
+/// struct sockaddr_in {
+///     sa_family_t sin_family;   /* u16, little-endian on x86 */
+///     in_port_t   sin_port;     /* u16, NETWORK byte order  */
+///     struct in_addr sin_addr;  /* u32, NETWORK byte order  */
+///     char        sin_zero[8];
+/// };
+/// ```
+fn parse_sockaddr_in(sa: *const u8, len: u32) -> Result<(u32, u16), i64> {
+    const AF_INET: u16 = 2;
+    // family + port + addr is the minimum that carries anything useful.
+    if sa.is_null() || (len as usize) < 8 {
+        return Err(-EINVAL);
+    }
+    if !user_range_valid(sa as u64, 8, false) {
+        return Err(-EFAULT);
+    }
+    let mut b = [0u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(sa, b.as_mut_ptr(), 8); }
+    let family = u16::from_le_bytes([b[0], b[1]]);
+    if family != AF_INET {
+        return Err(-EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    let addr = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+    Ok((addr, port))
+}
+
+/// `connect(2)`. musl also reaches this through `sendto`/`recvfrom` with a
+/// non-null address, so the two share the decode helper.
+fn sys_connect(fd: u32, sa: *const u8, len: u32) -> i64 {
+    match parse_sockaddr_in(sa, len) {
+        Ok((addr, port)) => crate::netsock::sock_connect(fd, addr, port),
+        Err(e) => e,
+    }
+}
+
+/// `bind(2)`.
+fn sys_bind(fd: u32, sa: *const u8, len: u32) -> i64 {
+    match parse_sockaddr_in(sa, len) {
+        Ok((addr, port)) => crate::netsock::sock_bind(fd, addr, port),
+        Err(e) => e,
+    }
+}
+
+/// `sendto(2)`. A null `dest` means "the connected peer", which is all netd's
+/// client sockets support today; an explicit destination is rejected rather
+/// than silently misdirected.
+fn sys_sendto(fd: u32, buf: *const u8, len: usize, flags: i32,
+              dest: *const u8, destlen: u32) -> i64 {
+    if !dest.is_null() && destlen >= 8 {
+        // Unconnected datagram send: not wired through the facade yet.
+        return -ENOSYS;
+    }
+    crate::netsock::sock_send(fd, buf, len, flags as u16)
+}
+
+/// `recvfrom(2)`. Peer-address reporting is not plumbed back through the
+/// facade, so `from` is filled with a bare `AF_INET` sockaddr and zeroed
+/// address — enough for callers that only check the family, and honest about
+/// what the kernel does not know.
+fn sys_recvfrom(fd: u32, buf: *mut u8, len: usize, flags: i32,
+                from: *mut u8, fromlen: *mut u32) -> i64 {
+    let n = crate::netsock::sock_recv(fd, buf, len, flags as u16);
+    if n >= 0 && !from.is_null() && !fromlen.is_null()
+        && user_range_valid(from as u64, 16, true)
+        && user_range_valid(fromlen as u64, 4, true)
+    {
+        let mut sa = [0u8; 16];
+        sa[0] = 2; // AF_INET, little-endian u16
+        unsafe {
+            core::ptr::copy_nonoverlapping(sa.as_ptr(), from, 16);
+            let want = core::ptr::read_volatile(fromlen);
+            let clipped = core::cmp::min(want, 16u32);
+            core::ptr::write_volatile(fromlen, clipped);
+        }
+    }
+    n
+}
+
 // ── Close ──────────────────────────────────────────────────────────
 
+/// `FileDesc.flags` bit marking a socket fd. The VFS only ever stores small
+/// `O_*` values (0/1 today) in this field, so a high bit is unambiguous, and
+/// it lets `poll` and friends recognise a socket without re-entering the VFS.
+pub const FD_SOCK: i32 = 1 << 8;
+
 fn sys_close(fd: u32) -> i64 {
+    // Socket teardown happens inside `close_fd` (mirroring how it releases
+    // pipe ends), so exit and close share one path and cannot drift.
     if crate::vfs::close_fd(fd as usize) { 0 } else { -EBADF }
 }
 
@@ -7743,13 +7885,58 @@ fn sys_lseek(_fd: u32, _offset: i64, _whence: i32) -> i64 {
     -ENOSYS
 }
 
-fn sys_readv(_fd: u32, _iov: u64, _iovcnt: i32) -> i64 {
-    -ENOSYS
+/// `readv(2)` on a scatter list. musl stdio builds every buffered read as a
+/// two-entry readv {user buffer, FILE internal buffer}, so there is no facing
+/// ordinary programs that use `<stdio.h>` over a socket without it.
+///
+/// One syscall fills one destination: the first iovec with room. The caller
+/// (stdio) treats a partial fill as a short read, which is exactly right for
+/// a stream, and touching the second iovec too would need a second blocking
+/// round trip for data that may not be there yet.
+fn sys_readv(fd: u32, iov: u64, iovcnt: i32) -> i64 {
+    if iov == 0 {
+        return -EFAULT;
+    }
+    if iovcnt <= 0 {
+        return 0;
+    }
+    if iovcnt > 1024 {
+        return -EINVAL;
+    }
+    if !user_range_valid(iov, iovcnt as usize * 16, false) {
+        return -EFAULT;
+    }
+    for i in 0..iovcnt as usize {
+        let base: u64;
+        let len: usize;
+        unsafe {
+            base = core::ptr::read_volatile((iov + i as u64 * 16) as *const u64);
+            len = core::ptr::read_volatile((iov + i as u64 * 16 + 8) as *const usize);
+        }
+        if base == 0 || len == 0 {
+            continue;
+        }
+        if !user_range_valid(base, len, true) {
+            return -EFAULT;
+        }
+        return sys_read(fd, base as *mut u8, len);
+    }
+    0
 }
 
 fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
-    if fd != 1 && fd != 2 { return -ENOSYS; }
-    if iovcnt <= 0 { return 0; }
+    if iov == 0 {
+        return -EFAULT;
+    }
+    if iovcnt <= 0 {
+        return 0;
+    }
+    if iovcnt > 1024 {
+        return -EINVAL;
+    }
+    if !user_range_valid(iov, iovcnt as usize * 16, false) {
+        return -EFAULT;
+    }
     let mut total = 0i64;
     for i in 0..iovcnt as usize {
         let base: u64;
@@ -7761,6 +7948,9 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
         if base == 0 || len == 0 { continue; }
         let r = sys_write(fd, base as *const u8, len);
         if r < 0 {
+            // Record what actually failed (stdio swallows the errno into its
+            // error flag, and a silent ENOSYS here is indistinguishable from
+            // "the peer never answered").
             crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SYSCALL);
             crate::klog::s("writev fd=");
             crate::klog::dec(fd as u64);
@@ -7841,6 +8031,9 @@ fn create_applet_links() {
         b"dd", b"cp", b"mv", b"rm", b"mkdir", b"rmdir", b"ln", b"touch",
         b"chmod", b"md5sum", b"sha1sum", b"hexdump", b"tee", b"which", b"grep",
         b"sed", b"awk", b"find", b"stat", b"uptime",
+        // Network applets: these are the reason the socket facade exists, and
+        // without the links `wget http://...` is just "not found".
+        b"wget", b"nc", b"nslookup", b"ping",
     ];
     let mut path_buf = [0u8; 64];
     for a in APPLETS {

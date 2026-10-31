@@ -489,6 +489,10 @@ pub fn close_fd(fd: usize) -> bool {
     // Release this task's reference on a pipe end (frees the pipe slot once
     // the last reader AND last writer have closed, across all tasks).
     crate::task::pipe_close(table[fd].inode_idx);
+    // Same choke point for sockets: tell netd to tear the connection down and
+    // free the kernel slot. Task exit lands here too, so a crashed `wget`
+    // cannot leave half-open connections pinned in netd.
+    crate::netsock::sock_close_inode(table[fd].inode_idx);
     table[fd].used = false;
     true
 }

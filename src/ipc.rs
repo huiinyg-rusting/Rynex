@@ -27,6 +27,7 @@
 //! freed while holding IPC_LOCK). Nothing takes BUDDY_LOCK and then IPC_LOCK.
 
 use crate::spinlock::RawSpin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_PORTS: usize = 32;
 pub const PORT_SLOTS: usize = 64;
@@ -84,8 +85,8 @@ fn port_ref(idx: usize) -> &'static mut Port {
     unsafe { &mut PORTS[idx] }
 }
 
-fn reply_ref(idx: usize) -> &'static mut ReplySlot {
-    unsafe { &mut REPLIES[idx] }
+fn reply_ref(idx: usize) -> &'static ReplySlot {
+    unsafe { &*core::ptr::addr_of!(REPLIES[idx]) }
 }
 
 fn msg_hdr_ref(page: u64) -> &'static MsgHeader {
@@ -139,22 +140,35 @@ fn port_idx_by_name_locked(name: &[u8]) -> Option<usize> {
 
 const MAX_REPLIES: usize = 64;
 
-#[derive(Clone, Copy)]
+/// A reply channel. The fields are atomic because a slot is handed to another
+/// task (the service) the moment the request is posted: the caller polls `done`
+/// while the replier fills `page`/`len` and flips `done`. Modelling them as
+/// plain fields reached through `&mut` made that sharing undefined behaviour,
+/// and optimized builds happily read `len` as 0 because a `&mut` to the slot
+/// promised nothing else could write it. Ordering: `len`/`page` are published
+/// before `done` is stored with Release, and the waiter reads `done` with
+/// Acquire, so a set `done` always implies a visible `len`.
 struct ReplySlot {
-    used: bool,
-    page: u64,
-    len: u32,
-    done: bool,
-    wake: u32,
+    used: AtomicBool,
+    page: AtomicU64,
+    len: AtomicU32,
+    done: AtomicBool,
+    wake: AtomicU32,
 }
 
 impl ReplySlot {
     const fn empty() -> Self {
-        ReplySlot { used: false, page: 0, len: 0, done: false, wake: 0 }
+        ReplySlot {
+            used: AtomicBool::new(false),
+            page: AtomicU64::new(0),
+            len: AtomicU32::new(0),
+            done: AtomicBool::new(false),
+            wake: AtomicU32::new(0),
+        }
     }
 }
 
-static mut REPLIES: [ReplySlot; MAX_REPLIES] = [ReplySlot::empty(); MAX_REPLIES];
+static mut REPLIES: [ReplySlot; MAX_REPLIES] = [const { ReplySlot::empty() }; MAX_REPLIES];
 
 fn reply_alloc() -> Option<u64> {
     let _g = RawSpin::lock(&IPC_LOCK);
@@ -167,13 +181,14 @@ fn reply_alloc_locked() -> Option<u64> {
     // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
     // expected), so a real synchronous reply token must never be 0.
     for i in 1..MAX_REPLIES {
-        if !reply_ref(i).used {
+        if !reply_ref(i).used.load(Ordering::Relaxed) {
             let r = reply_ref(i);
-            r.used = true;
-            r.page = page;
-            r.len = 0;
-            r.done = false;
-            r.wake = 0;
+            r.page.store(page, Ordering::Relaxed);
+            r.len.store(0, Ordering::Relaxed);
+            r.done.store(false, Ordering::Relaxed);
+            r.wake.store(0, Ordering::Relaxed);
+            // Publish last: `used` is what tells a scanner the slot is taken.
+            r.used.store(true, Ordering::Release);
             return Some(i as u64);
         }
     }
@@ -188,13 +203,15 @@ fn reply_free(id: u64) {
 
 /// IPC_LOCK must be held.
 fn reply_free_locked(id: u64) {
-    if id < MAX_REPLIES as u64 && reply_ref(id as usize).used {
+    if id < MAX_REPLIES as u64 && reply_ref(id as usize).used.load(Ordering::Relaxed) {
         let s = reply_ref(id as usize);
-        if s.page != 0 {
-            free_page(s.page);
-            s.page = 0;
+        let page = s.page.load(Ordering::Relaxed);
+        if page != 0 {
+            free_page(page);
+            s.page.store(0, Ordering::Relaxed);
         }
-        s.used = false;
+        s.done.store(false, Ordering::Relaxed);
+        s.used.store(false, Ordering::Release);
     }
 }
 
@@ -209,12 +226,14 @@ pub fn ipc_call(port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len:
 
 /// In-kernel variant: request/out buffers live in kernel space, so the
 /// user-range check is skipped. Used only by kernel tasks (services/clients).
+#[inline(never)]
 pub fn ipc_call_internal(
     port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len: usize,
 ) -> i64 {
     ipc_call_impl(port_id, buf, len, out, out_len, true)
 }
 
+#[inline(never)]
 fn ipc_call_impl(
     port_id: u64, buf: *const u8, len: usize, out: *mut u8, out_len: usize,
     kernel_buf: bool,
@@ -281,9 +300,16 @@ fn ipc_call_impl(
     loop {
         let (exists, done, slot_page, wake_addr) = {
             let _g = RawSpin::lock(&IPC_LOCK);
-            if reply_id < MAX_REPLIES as u64 && reply_ref(reply_id as usize).used {
+            if reply_id < MAX_REPLIES as u64
+                && reply_ref(reply_id as usize).used.load(Ordering::Relaxed)
+            {
                 let s = reply_ref(reply_id as usize);
-                (true, s.done, s.page, &raw const s.wake as *const u32)
+                (
+                    true,
+                    s.done.load(Ordering::Acquire),
+                    s.page.load(Ordering::Relaxed),
+                    (&raw const s.wake) as *const u32,
+                )
             } else {
                 (false, false, 0, core::ptr::null())
             }
@@ -303,7 +329,7 @@ fn ipc_call_impl(
     }
     let len = {
         let _g = RawSpin::lock(&IPC_LOCK);
-        reply_ref(reply_id as usize).len as usize
+        reply_ref(reply_id as usize).len.load(Ordering::Acquire) as usize
     };
     let rlen = core::cmp::min(len, out_len);
     if rlen > 0 && !out.is_null() {
@@ -323,21 +349,24 @@ fn ipc_call_impl(
 pub fn ipc_reply(reply_id: u64, buf: *const u8, len: usize) -> i64 {
     let (n, wake_addr) = {
         let _g = RawSpin::lock(&IPC_LOCK);
-        if reply_id >= MAX_REPLIES as u64 || !reply_ref(reply_id as usize).used {
+        if reply_id >= MAX_REPLIES as u64
+            || !reply_ref(reply_id as usize).used.load(Ordering::Relaxed)
+        {
             return -crate::task::ESRCH;
         }
         let s = reply_ref(reply_id as usize);
-        if s.done {
+        if s.done.load(Ordering::Acquire) {
             return 0;
         }
-        let page = s.page;
+        let page = s.page.load(Ordering::Relaxed);
         let n = core::cmp::min(len, IPC_MSG_MAX);
         if n > 0 && !buf.is_null() {
             unsafe { core::ptr::copy_nonoverlapping(buf, page as *mut u8, n); }
         }
-        s.len = n as u32;
-        s.done = true;
-        (n, &raw const s.wake as *const u32)
+        s.len.store(n as u32, Ordering::Relaxed);
+        // Release: `len`/page must be visible before the waiter sees `done`.
+        s.done.store(true, Ordering::Release);
+        (n, (&raw const s.wake) as *const u32)
     };
     crate::task::futex_wake(wake_addr, 1);
     n as i64
@@ -497,6 +526,21 @@ pub fn ipc_recv(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
 /// use `ipc_peek_ex_internal` so their kernel-stack buffers are accepted.
 pub fn ipc_peek_ex(port_id: u64, buf: *mut u8, max_len: usize) -> (i64, u64) {
     ipc_peek_ex_impl(port_id, buf, max_len, false)
+}
+
+/// User-space syscall wrapper for `ipc_peek_ex`: packs (len, reply_id) into a
+/// single i64 the same way `ipc_recv_ex_user` does — the reply token in the
+/// high 32 bits, the length in the low 32. Returns 0 immediately when the
+/// mailbox is empty, which is the whole point of the peek: a service loop that
+/// also has packet work to do (netd) cannot afford to sleep in recv.
+pub fn ipc_peek_ex_user(port_id: u64, buf: *mut u8, max_len: usize) -> i64 {
+    let (len, reply_id) = ipc_peek_ex_impl(port_id, buf, max_len, false);
+    if len < 0 {
+        return len;
+    }
+    let rl = if len > i64::from(u32::MAX) { u32::MAX as i64 } else { len };
+    let rid = (reply_id & 0xFFFF_FFFF) << 32;
+    rid as i64 | rl
 }
 
 /// In-kernel variant of `ipc_peek_ex`: `buf` lives in kernel space, so the
