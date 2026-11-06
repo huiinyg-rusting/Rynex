@@ -53,6 +53,7 @@ const OP_SHUTDOWN: u8 = 6;
 const OP_BIND: u8 = 7;
 const OP_LISTEN: u8 = 8;
 const OP_ACCEPT: u8 = 9;
+const OP_POLL: u8 = 10;
 
 /// Request header, little-endian, packed:
 ///
@@ -88,11 +89,20 @@ struct SockSlot {
     used: bool,
     /// netd's own socket id; the kernel never interprets it.
     netd_id: u32,
+    /// How many fd entries reference this slot. A socket is destroyed when
+    /// the last one goes away, not at the first close(2): fork and dup2 both
+    /// hand out new fd entries pointing at the same slot, and busybox builds
+    /// every socket through exactly that pair (`xmove_fd` = dup2 + close of
+    /// the original). Without the count, closing the original fd freed the
+    /// TCB under the duped fd — the program's subsequent bind(2) came back
+    /// EBADF from netd, and every nc-style program died before its first
+    /// connection, while wget-style programs (no dup) ran untouched.
+    refs: u32,
 }
 
 impl SockSlot {
     const fn empty() -> Self {
-        SockSlot { used: false, netd_id: 0 }
+        SockSlot { used: false, netd_id: 0, refs: 0 }
     }
 }
 
@@ -120,6 +130,7 @@ fn alloc_slot(netd_id: u32) -> Option<usize> {
         if !s.used {
             s.used = true;
             s.netd_id = netd_id;
+            s.refs = 1;
             return Some(i);
         }
     }
@@ -294,6 +305,47 @@ pub fn sock_send(fd: u32, buf: *const u8, len: usize, flags: u16) -> i64 {
     netd_call(OP_SEND, netd_id, 0, 0, flags, data, &mut out)
 }
 
+/// poll(2)/select(2) readiness for a socket fd, answered by one synchronous
+/// round trip that netd completes immediately (it only reads TCB fields).
+///
+/// Why a synchronous query instead of a cached flag: state lives in netd, and
+/// data arrival wakes a blocked *reader*, not a poll sleeper — there is no
+/// wake-on-data path to a poller today. Compensating: the caller re-scans on
+/// a 20ms cadence while a socket fd is in its poll set, so readiness staleness
+/// is bounded and a poller gets fresh answers each pass.
+///
+/// Returns bits matching what the caller asked for, or a negative errno.
+/// `-EBADF` means netd does not know the socket (caller maps it to POLLNVAL);
+/// facade-less answers (`-ENETDOWN`/`-ESRCH`) map to "not ready" rather than
+/// an error, since a program legitimately polls before netd is up.
+pub fn poll_readiness(fd: u32, events: i16) -> i64 {
+    const R_IN: i64 = 1; // readable: buffered bytes, or EOF is next up
+    const R_OUT: i64 = 2; // writable: a connection can take bytes
+    const POLLIN_BIT: i16 = 0x0001; // keep in step with task::POLLIN
+    const POLLOUT_BIT: i16 = 0x0004; // ...and task::POLLOUT
+
+    let netd_id = match slot_of(fd) {
+        Some(i) => unsafe { SOCKS[i].netd_id },
+        None => return -task::EBADF,
+    };
+    let mut sink = [0u8; 8];
+    let ret = netd_call(OP_POLL, netd_id, 0, 0, 0, &[], &mut sink);
+    if ret == -task::ENETDOWN || ret == -task::ESRCH {
+        return 0;
+    }
+    if ret < 0 {
+        return ret;
+    }
+    let mut out = 0i64;
+    if ret & R_IN != 0 && events & POLLIN_BIT != 0 {
+        out |= POLLIN_BIT as i64;
+    }
+    if ret & R_OUT != 0 && events & POLLOUT_BIT != 0 {
+        out |= POLLOUT_BIT as i64;
+    }
+    out
+}
+
 /// `recvfrom(2)` on a connected socket. `from`/`fromlen` are ignored for now:
 /// netd's proxy does not report peer addresses back through the facade.
 pub fn sock_recv(fd: u32, buf: *mut u8, len: usize, _flags: u16) -> i64 {
@@ -407,9 +459,31 @@ pub fn sock_close_inode(inode: usize) {
     if !socks[idx].used {
         return;
     }
+    // Reference counting, pr modelled on pipes: one fd entry closing is a
+    // reference release, not a teardown. The last close is the one that
+    // reaches netd, which is what keeps a dup2'd socket alive after the
+    // program drops the fd it was first allocated on.
+    if socks[idx].refs > 1 {
+        unsafe { SOCKS[idx].refs -= 1; }
+        return;
+    }
     let netd_id = socks[idx].netd_id;
     let mut out = [0u8; 0];
     netd_call(OP_CLOSE, netd_id, 0, 0, 0, &[], &mut out);
     free_slot(idx);
+}
+
+/// A new fd entry now points at this slot (fork inheritance and dup2). One
+/// increment per new entry, matching the pipe scheme; unbalanced increments
+/// would pin sockets forever, so every duplication site pairs with a close
+/// site through `sock_close_inode`.
+pub fn sock_inc_refs(inode: usize) {
+    if let Some(i) = sock_idx_of(inode) {
+        unsafe {
+            if SOCKS[i].used {
+                SOCKS[i].refs += 1;
+            }
+        }
+    }
 }
 

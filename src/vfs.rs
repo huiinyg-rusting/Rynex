@@ -389,6 +389,24 @@ pub fn inode_size(idx: usize) -> Option<usize> {
     }
 }
 
+/// poll(2) clustering of inodes by whether their reads can block.
+///
+/// Everything is vnode-backed in this kernel (the flat table only caches),
+/// so `data_ptr` cannot discriminate; the fs *backend* the vnode cites can:
+/// ramfs nodes are kernel memory and their read(2) is plain copyout, while
+/// devfs/procfs/tty etc. may block inside their own implementation. Which is
+/// what POSIX asks: poll on a regular file is "always ready", poll on a
+/// character device waits for real input.
+pub fn inode_poll_is_file(idx: usize) -> bool {
+    unsafe {
+        if idx >= MAX_INODES || !INODES[idx].used {
+            return false;
+        }
+        let vn = INODES[idx].vnode_id;
+        vn != 0 && crate::vfs_core::vnode_is_ramfs(vn)
+    }
+}
+
 pub fn inode_read(idx: usize, pos: usize, buf: &mut [u8]) -> Option<usize> {
     unsafe {
         if idx >= MAX_INODES || !INODES[idx].used {

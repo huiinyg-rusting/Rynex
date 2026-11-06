@@ -4815,9 +4815,14 @@ fn sys_fork() -> i64 {
         if let Some(pfds) = parent_fds {
             let cfds = crate::vfs::fd_table_for(child_tid);
             { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
-            // Child now holds its own references on any inherited pipe ends.
+            // Child now holds its own references on any inherited pipe ends
+            // and socket slots, so a child's close(2) cannot free a resource
+            // the parent still holds.
             for i in 0..crate::vfs::MAX_FDS_PER_TASK {
-                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+                if cfds[i].used {
+                    pipe_inc_refs(cfds[i].inode_idx);
+                    crate::netsock::sock_inc_refs(cfds[i].inode_idx);
+                }
             }
         }
 
@@ -4994,9 +4999,14 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
                 cfds.as_ptr() as *mut crate::vfs::FileDesc,
                 crate::vfs::MAX_FDS_PER_TASK,
             );
-            // Child now holds its own references on any inherited pipe ends.
+            // Child now holds its own references on any inherited pipe ends
+            // and socket slots, so a child's close(2) cannot free a resource
+            // the parent still holds.
             for i in 0..crate::vfs::MAX_FDS_PER_TASK {
-                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+                if cfds[i].used {
+                    pipe_inc_refs(cfds[i].inode_idx);
+                    crate::netsock::sock_inc_refs(cfds[i].inode_idx);
+                }
             }
         }
 
@@ -6230,8 +6240,11 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
         if (newfd as usize) < crate::vfs::MAX_FDS_PER_TASK {
             table[newfd as usize] = table[oldfd as usize];
             table[newfd as usize].pos = 0;
-            // dup adds a new reference on a pipe end.
+            // dup adds a new reference on a pipe end and on a socket slot:
+            // the program is about to close oldfd, and the socket's life is
+            // now tied to newfd, not to the original entry.
             pipe_inc_refs(table[newfd as usize].inode_idx);
+            crate::netsock::sock_inc_refs(table[newfd as usize].inode_idx);
         }
         newfd as i64
     }
@@ -7086,8 +7099,11 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
                         }
                         table[newfd] = table[fd as usize];
                         table[newfd].pos = 0;
-                        // dup adds another reference on a pipe end.
+                        // dup adds another reference on a pipe end and on a
+                        // socket slot alike (nc's xmove_fd is dup2+close; the
+                        // close must not reach netd over the dup's head).
                         pipe_inc_refs(table[newfd].inode_idx);
+                        crate::netsock::sock_inc_refs(table[newfd].inode_idx);
                     }
                     return newfd as i64;
                 }
@@ -7752,10 +7768,20 @@ fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
     let mut revents = 0i16;
     let inode_idx = inode_fd.inode_idx;
 
-    // Pipe ends (pseudo-inodes in the reserved range): report REAL readiness
-    // from that pipe's buffer positions, so a poller actually blocks until
-    // data/space exists instead of returning always-ready.
-    if let Some(p) = pipe_idx_of(inode_idx) {
+    // Socket ends (pseudo-inodes in the reserved range): ask netd what the
+    // connection can do right now. One synchronous round trip per fd; the
+    // caller re-scans every tick, so the answer is only ever 20ms stale.
+    if crate::netsock::sock_idx_of(inode_idx).is_some() {
+        match crate::netsock::poll_readiness(fd, events) {
+            b if b >= 0 => revents |= b as i16,
+            _ => {
+                // netd does not know this socket (freed or reused): the fd
+                // is not usable, which POLLNVAL exists to report.
+                unsafe { core::ptr::write_volatile(revents_ptr, POLLNVAL); }
+                return POLLNVAL;
+            }
+        }
+    } else if let Some(p) = pipe_idx_of(inode_idx) {
         unsafe {
             if events & POLLIN != 0 && PIPES[p].rpos < PIPES[p].wpos {
                 revents |= POLLIN;
@@ -7765,13 +7791,27 @@ fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
             }
         }
     } else {
-        // TTY / console / other character device: become ready on pending
-        // keyboard input only. POLLOUT on a tty is always ready.
-        if events & POLLIN != 0 && crate::keyboard::has_pending_input() {
-            revents |= POLLIN;
-        }
-        if events & POLLOUT != 0 {
-            revents |= POLLOUT;
+        // This branch is everything that is neither a pipe nor a socket.
+        // Two very different kinds land here, and poll(2) owes them
+        // different answers:
+        //
+        // Regular files (bytes in kernel memory) can only yield data or EOF,
+        // so POSIX says they are always ready. nc polls its stdin, which is
+        // exactly such a file — gating it made the newline waiting for the
+        // console, and nc hung before sending a thing.
+        if crate::vfs::inode_poll_is_file(inode_idx) {
+            if events & POLLIN != 0 { revents |= POLLIN; }
+            if events & POLLOUT != 0 { revents |= POLLOUT; }
+        } else {
+            // Char device (console): become ready on pending keyboard input
+            // only, so a tty poller blocks instead of spinning. POLLOUT on
+            // a tty is always ready.
+            if events & POLLIN != 0 && crate::keyboard::has_pending_input() {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
         }
     }
 
@@ -7791,10 +7831,26 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
     // timeout < 0 polls forever (event wakeups only); timeout == 0 is
     // non-blocking; timeout > 0 is an absolute deadline in ticks.
     let infinite = timeout < 0;
+    // A poller watching a socket fd has no wake-on-data path (data arrival
+    // resumes a blocked reader, not a poll sleeper), so cap its sleep at one
+    // tick: the re-scan issues a fresh readiness query and picks the data up
+    // within 20ms. Piping-only pollers (runit free of sockets) keep their
+    // deadline event-driven as before.
+    let mut sleeps_socket = false;
+    for i in 0..nfds as usize {
+        let fd = unsafe { core::ptr::read_volatile((fds + i as u64 * 8) as *const u32) };
+        if let Some(f) = crate::vfs::fd_to_inode(fd as usize) {
+            if crate::netsock::sock_idx_of(f.inode_idx).is_some() {
+                sleeps_socket = true;
+                break;
+            }
+        }
+    }
     let deadline = if timeout == 0 {
         0
-    } else if infinite {
-        u64::MAX
+    } else if infinite || sleeps_socket {
+        let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        now + 1
     } else {
         let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         // ms -> ticks at 50Hz; clamp so a sub-tick timeout still sleeps >= 1 tick.
