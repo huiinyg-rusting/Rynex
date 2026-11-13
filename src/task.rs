@@ -346,6 +346,12 @@ pub struct Task {
     // For sleep syscall
     pub wakeup_tick: u64,
 
+    // ITIMER_REAL (alarm(2)/setitimer(2)): absolute PIT tick and reload
+    // interval in ticks. 0 deadline means disarmed. The timer ISR sets
+    // SIGALRM pending when the deadline passes.
+    pub alarm_deadline: u64,
+    pub alarm_interval: u64,
+
     // Preserved user context when blocking in a syscall (sys_sleep, futex_wait, etc.)
     // context_switch saves kernel context to regs, overwriting user context.
     // We save user regs here before blocking, and restore on wakeup.
@@ -425,6 +431,8 @@ blocked_on: 0,
             cwd_len: 0,
             privileges: 0,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: false,
@@ -1996,6 +2004,31 @@ pub fn wakeup_expired_sleepers() {
                 enqueue_task(TASKS[i].id, TASKS[i].prio);
             }
         }
+
+        // ITIMER_REAL expiry. busybox ping re-arms a one-shot timer before each
+        // probe; the ISR raises SIGALRM, which the syscall-exit path turns into
+        // a handler call. Without this, only the first ping ever leaves.
+        for i in 0..MAX_TASKS {
+            let h;
+            {
+                let t = &TASKS[i];
+                if t.id == 0 || t.alarm_deadline == 0 || t.alarm_deadline > now {
+                    continue;
+                }
+                h = t.sig_handlers[SIGALRM as usize].handler;
+            }
+            let interval = TASKS[i].alarm_interval;
+            TASKS[i].alarm_deadline = if interval != 0 { now + interval } else { 0 };
+            if h == SIG_IGN as u64 {
+                continue;
+            }
+            if h == SIG_DFL as u64 {
+                let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
+                TASKS[i].sig_pending |= 1u64 << (SIGALRM as usize);
+            } else {
+                let _ = sig_deliver_to_task(i, SIGALRM);
+            }
+        }
     }
 }
 
@@ -2358,9 +2391,17 @@ pub const SYS_connect: u64 = 42;
 pub const SYS_accept: u64 = 43;
 pub const SYS_sendto: u64 = 44;
 pub const SYS_recvfrom: u64 = 45;
+pub const SYS_sendmsg: u64 = 46;
+pub const SYS_recvmsg: u64 = 47;
 pub const SYS_shutdown: u64 = 48;
 pub const SYS_bind: u64 = 49;
 pub const SYS_listen: u64 = 50;
+pub const SYS_getsockname: u64 = 51;
+pub const SYS_getpeername: u64 = 52;
+pub const SYS_setsockopt: u64 = 54;
+pub const SYS_getsockopt: u64 = 55;
+pub const SYS_alarm: u64 = 37;
+pub const SYS_setitimer: u64 = 38;
 
 pub const SYS_clone: u64 = 56;
 pub const SYS_fork: u64 = 57;
@@ -2527,6 +2568,16 @@ pub extern "C" fn syscall_handler(
                                   arg5 as *const u8, arg6 as u32),
         SYS_recvfrom => sys_recvfrom(arg1 as u32, arg2 as *mut u8, arg3 as usize, arg4 as i32,
                                       arg5 as *mut u8, arg6 as *mut u32),
+        SYS_sendmsg => sys_sendmsg(arg1 as u32, arg2 as *const u8, arg3 as i32),
+        SYS_recvmsg => sys_recvmsg(arg1 as u32, arg2 as *mut u8, arg3 as i32),
+        SYS_getsockname => sys_getsockname(arg1 as u32, arg2 as *mut u8, arg3 as *mut u32),
+        SYS_getpeername => sys_getpeername(arg1 as u32, arg2 as *mut u8, arg3 as *mut u32),
+        SYS_setsockopt => sys_setsockopt(arg1 as u32, arg2 as i32, arg3 as i32,
+                                         arg4 as *const u8, arg5 as u32),
+        SYS_getsockopt => sys_getsockopt(arg1 as u32, arg2 as i32, arg3 as i32,
+                                         arg4 as *mut u8, arg5 as *mut u32),
+        SYS_alarm => sys_alarm(arg1 as u32),
+        SYS_setitimer => sys_setitimer(arg1 as i32, arg2 as *const u8, arg3 as *mut u8),
         SYS_shutdown => crate::netsock::sock_shutdown(arg1 as u32, arg2 as u32),
         SYS_bind => sys_bind(arg1 as u32, arg2 as *const u8, arg3 as u32),
         SYS_listen => crate::netsock::sock_listen(arg1 as u32, arg2 as u32),
@@ -4205,6 +4256,7 @@ pub const ENOTEMPTY: i64 = 39;
 pub const EMSGSIZE: i64 = 90;
 pub const EADDRNOTAVAIL: i64 = 99;
 pub const ESOCKTYPE: i64 = 94;
+pub const ENOPROTOOPT: i64 = 92;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const ENETUNREACH: i64 = 101;
 pub const ENETDOWN: i64 = 100;
@@ -4924,6 +4976,8 @@ fn sys_fork() -> i64 {
             cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: true,
@@ -5136,6 +5190,8 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: if flags & CLONE_CHILD_CLEARTID != 0 {
                 child_tidptr as u64
@@ -6069,31 +6125,39 @@ fn sys_bind(fd: u32, sa: *const u8, len: u32) -> i64 {
     }
 }
 
-/// `sendto(2)`. A null `dest` means "the connected peer", which is all netd's
-/// client sockets support today; an explicit destination is rejected rather
-/// than silently misdirected.
+/// `sendto(2)`. A null `dest` means "the connected peer"; an explicit
+/// destination is used by datagram/raw sockets (DNS, ICMP ping).
 fn sys_sendto(fd: u32, buf: *const u8, len: usize, flags: i32,
               dest: *const u8, destlen: u32) -> i64 {
-    if !dest.is_null() && destlen >= 8 {
-        // Unconnected datagram send: not wired through the facade yet.
-        return -ENOSYS;
+    if dest.is_null() {
+        return crate::netsock::sock_send(fd, buf, len, flags as u16);
     }
-    crate::netsock::sock_send(fd, buf, len, flags as u16)
+    match parse_sockaddr_in(dest, destlen) {
+        Ok((addr, port)) => {
+            crate::netsock::sock_sendto(fd, buf, len, flags as u16, addr, port)
+        }
+        Err(e) => e,
+    }
 }
 
-/// `recvfrom(2)`. Peer-address reporting is not plumbed back through the
-/// facade, so `from` is filled with a bare `AF_INET` sockaddr and zeroed
-/// address — enough for callers that only check the family, and honest about
-/// what the kernel does not know.
+/// `recvfrom(2)`. netd reports the packet's source (or the connected peer for
+/// TCP) in the reply header, so the caller's sockaddr is filled accurately.
 fn sys_recvfrom(fd: u32, buf: *mut u8, len: usize, flags: i32,
                 from: *mut u8, fromlen: *mut u32) -> i64 {
-    let n = crate::netsock::sock_recv(fd, buf, len, flags as u16);
+    let mut saddr = 0u32;
+    let mut sport = 0u16;
+    let n = crate::netsock::sock_recvfrom(
+        fd, buf, len, flags as u16, &mut saddr, &mut sport,
+    );
     if n >= 0 && !from.is_null() && !fromlen.is_null()
         && user_range_valid(from as u64, 16, true)
         && user_range_valid(fromlen as u64, 4, true)
     {
         let mut sa = [0u8; 16];
         sa[0] = 2; // AF_INET, little-endian u16
+        sa[1] = 0;
+        sa[2..4].copy_from_slice(&sport.to_be_bytes());
+        sa[4..8].copy_from_slice(&saddr.to_be_bytes());
         unsafe {
             core::ptr::copy_nonoverlapping(sa.as_ptr(), from, 16);
             let want = core::ptr::read_volatile(fromlen);
@@ -6102,6 +6166,236 @@ fn sys_recvfrom(fd: u32, buf: *mut u8, len: usize, flags: i32,
         }
     }
     n
+}
+
+/// Write an IPv4 sockaddr into a user buffer, the common tail of
+/// getsockname/getpeername.
+fn write_sockaddr_in(dst: *mut u8, lenp: *mut u32, addr: u32, port: u16) -> i64 {
+    if dst.is_null() || lenp.is_null() {
+        return -EFAULT;
+    }
+    if !user_range_valid(dst as u64, 16, true)
+        || !user_range_valid(lenp as u64, 4, true)
+    {
+        return -EFAULT;
+    }
+    let mut sa = [0u8; 16];
+    sa[0] = 2;
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&addr.to_be_bytes());
+    unsafe {
+        core::ptr::copy_nonoverlapping(sa.as_ptr(), dst, 16);
+        let want = core::ptr::read_volatile(lenp);
+        core::ptr::write_volatile(lenp, core::cmp::min(want, 16u32));
+    }
+    0
+}
+
+fn sys_getsockname(fd: u32, addr: *mut u8, lenp: *mut u32) -> i64 {
+    let mut a = 0u32;
+    let mut p = 0u16;
+    let r = crate::netsock::sock_name(fd, false, &mut a, &mut p);
+    if r < 0 { return r; }
+    write_sockaddr_in(addr, lenp, a, p)
+}
+
+fn sys_getpeername(fd: u32, addr: *mut u8, lenp: *mut u32) -> i64 {
+    let mut a = 0u32;
+    let mut p = 0u16;
+    let r = crate::netsock::sock_name(fd, true, &mut a, &mut p);
+    if r < 0 { return r; }
+    write_sockaddr_in(addr, lenp, a, p)
+}
+
+/// `setsockopt(2)`. The stack has no tunable options a program depends on for
+/// correctness (busybox ping sets SO_RCVBUF/IP_TTL and ignores failures), so
+/// accept and ignore rather than failing the whole program.
+fn sys_setsockopt(_fd: u32, _level: i32, _optname: i32,
+                  _optval: *const u8, _optlen: u32) -> i64 {
+    0
+}
+
+fn sys_getsockopt(_fd: u32, _level: i32, _optname: i32,
+                  _optval: *mut u8, optlen: *mut u32) -> i64 {
+    if !optlen.is_null() && user_range_valid(optlen as u64, 4, true) {
+        unsafe { core::ptr::write_volatile(optlen, 0); }
+    }
+    -ENOPROTOOPT
+}
+
+// ── sendmsg(2) / recvmsg(2) ────────────────────────────────────────
+
+/// x86-64 `struct msghdr` prefix: name, namelen, iov, iovlen, control,
+/// controllen. Only the first three fields are decoded; ancillary data is not
+/// produced or consumed by the facade.
+fn sys_sendmsg(fd: u32, msg: *const u8, flags: i32) -> i64 {
+    if msg.is_null() || !user_range_valid(msg as u64, 32, false) {
+        return -EFAULT;
+    }
+    let mut h = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(msg, h.as_mut_ptr(), 32); }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap()) as *const u8;
+    let namelen = u32::from_le_bytes(h[8..12].try_into().unwrap());
+    let iov = u64::from_le_bytes(h[16..24].try_into().unwrap()) as *const u8;
+    let iovcnt = u64::from_le_bytes(h[24..32].try_into().unwrap()) as usize;
+
+    // Flatten the iovec into one contiguous request. netd's send path is a
+    // single datagram/stream write, so scattered buffers have to be joined.
+    let mut total = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        let e = unsafe { iov.add(i * 16) };
+        if !user_range_valid(e as u64, 16, false) { return -EFAULT; }
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        total += u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+    }
+    if total > crate::netsock::MAX_XFER { total = crate::netsock::MAX_XFER; }
+
+    let mut flat = [0u8; crate::netsock::MAX_XFER];
+    let mut off = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        if off >= total { break; }
+        let e = unsafe { iov.add(i * 16) };
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        let base = u64::from_le_bytes(ie[0..8].try_into().unwrap()) as *const u8;
+        let l = u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        let take = core::cmp::min(l, total - off);
+        if take == 0 { continue; }
+        if !user_range_valid(base as u64, take, false) { return -EFAULT; }
+        unsafe { core::ptr::copy_nonoverlapping(base, flat.as_mut_ptr().add(off), take); }
+        off += take;
+    }
+
+    let dest = if name.is_null() {
+        None
+    } else {
+        match parse_sockaddr_in(name, namelen) {
+            Ok((a, p)) => Some((a, p)),
+            Err(e) => return e,
+        }
+    };
+    match dest {
+        Some((a, p)) => crate::netsock::sock_sendto(fd, flat.as_ptr(), off, flags as u16, a, p),
+        None => crate::netsock::sock_send(fd, flat.as_ptr(), off, flags as u16),
+    }
+}
+
+/// `recvmsg(2)`. The facade has no ancillary data, so this is recvfrom plus a
+/// scatter into the caller's iovec.
+fn sys_recvmsg(fd: u32, msg: *mut u8, flags: i32) -> i64 {
+    if msg.is_null() || !user_range_valid(msg as u64, 32, true) {
+        return -EFAULT;
+    }
+    let mut h = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(msg, h.as_mut_ptr(), 32); }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap()) as *mut u8;
+    let namelenp = u64::from_le_bytes(h[8..16].try_into().unwrap()) as *mut u32;
+    let iov = u64::from_le_bytes(h[16..24].try_into().unwrap()) as *mut u8;
+    let iovcnt = u64::from_le_bytes(h[24..32].try_into().unwrap()) as usize;
+
+    // Sum what fits, capped by the facade's single-shot limit.
+    let mut total = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        let e = unsafe { iov.add(i * 16) };
+        if !user_range_valid(e as u64, 16, false) { return -EFAULT; }
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        total += u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        if total >= crate::netsock::MAX_XFER { total = crate::netsock::MAX_XFER; break; }
+    }
+
+    let mut tmp = [0u8; crate::netsock::MAX_XFER];
+    let mut saddr = 0u32;
+    let mut sport = 0u16;
+    let n = crate::netsock::sock_recvfrom(
+        fd, tmp.as_mut_ptr(), total, flags as u16, &mut saddr, &mut sport,
+    );
+    if n <= 0 { return n; }
+
+    let mut left = n as usize;
+    let mut off = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        if left == 0 { break; }
+        let e = unsafe { iov.add(i * 16) };
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        let base = u64::from_le_bytes(ie[0..8].try_into().unwrap()) as *mut u8;
+        let l = u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        let take = core::cmp::min(l, left);
+        if take == 0 { continue; }
+        unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr().add(off), base, take); }
+        off += take;
+        left -= take;
+    }
+    if !name.is_null() && !namelenp.is_null() {
+        let _ = write_sockaddr_in(name, namelenp, saddr, sport);
+    }
+    n
+}
+
+// ── Interval timers ────────────────────────────────────────────────
+
+/// `setitimer(2)` for ITIMER_REAL. busybox ping arms a one-shot timer per
+/// probe; the kernel records a tick deadline and the timer ISR raises
+/// SIGALRM, which is what lets `ping -c N` send more than one request.
+fn sys_setitimer(which: i32, new: *const u8, old: *mut u8) -> i64 {
+    const ITIMER_REAL: i32 = 0;
+    if which != ITIMER_REAL { return -EINVAL; }
+    if !old.is_null() && user_range_valid(old as u64, 32, true) {
+        let zero = [0u8; 32];
+        unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), old, 32); }
+    }
+    if new.is_null() { return 0; }
+    if !user_range_valid(new as u64, 32, false) { return -EFAULT; }
+
+    let mut b = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(new, b.as_mut_ptr(), 32); }
+    let iv_sec = i64::from_le_bytes(b[0..8].try_into().unwrap());
+    let iv_usec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    let v_sec = i64::from_le_bytes(b[16..24].try_into().unwrap());
+    let v_usec = i64::from_le_bytes(b[24..32].try_into().unwrap());
+    if iv_sec < 0 || iv_usec < 0 || iv_usec >= 1_000_000
+        || v_sec < 0 || v_usec < 0 || v_usec >= 1_000_000
+    {
+        return -EINVAL;
+    }
+    // PIT runs at 100 Hz: one tick is 10 ms.
+    let iv_us = (iv_sec as u64).saturating_mul(1_000_000) + iv_usec as u64;
+    let v_us = (v_sec as u64).saturating_mul(1_000_000) + v_usec as u64;
+    let interval = (iv_us + 9_999) / 10_000;
+    let value = (v_us + 9_999) / 10_000;
+
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        TASKS[idx].alarm_interval = interval;
+        TASKS[idx].alarm_deadline = if value == 0 { 0 } else { now + value };
+    }
+    0
+}
+
+fn sys_alarm(seconds: u32) -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    let mut remaining = 0i64;
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        if TASKS[idx].alarm_deadline > now {
+            remaining = ((TASKS[idx].alarm_deadline - now) / 100) as i64;
+        }
+    }
+    let ticks = (seconds as u64) * 100; // 100 ticks per second
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        TASKS[idx].alarm_interval = 0;
+        TASKS[idx].alarm_deadline = if ticks == 0 { 0 } else { now + ticks };
+    }
+    remaining
 }
 
 // ── Close ──────────────────────────────────────────────────────────
@@ -6314,6 +6608,17 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
 }
 
 // ── Kill / signal delivery ────────────────────────────────────────
+
+/// True when the current task has a real SIGALRM handler installed. The
+/// socket facade uses this to tell netd that a blocking recv may return EINTR
+/// after a short wait, so the alarm handler regains control (ping).
+pub fn has_alarm_handler() -> bool {
+    let id = current_task_id();
+    if id == 0 { return false; }
+    let idx = task_idx(id);
+    let h = unsafe { TASKS[idx].sig_handlers[SIGALRM as usize].handler };
+    h != SIG_DFL as u64 && h != SIG_IGN as u64
+}
 
 /// Deliver `sig` to a single task slot. Returns 0 ok / -ESRCH.
 fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {

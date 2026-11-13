@@ -54,6 +54,9 @@ const OP_BIND: u8 = 7;
 const OP_LISTEN: u8 = 8;
 const OP_ACCEPT: u8 = 9;
 const OP_POLL: u8 = 10;
+const OP_RECVFROM: u8 = 11;
+const OP_CANCEL: u8 = 12;
+const OP_NAME: u8 = 13;
 
 /// Request header, little-endian, packed:
 ///
@@ -82,7 +85,14 @@ const REP_HDR: usize = 8;
 /// never needs segmentation, and comfortably under `IPC_MSG_MAX - REQ_HDR`
 /// (4064 - 20 = 4044), which is the real ceiling on how much one IPC message
 /// can carry.
-const MAX_XFER: usize = 1460;
+pub const MAX_XFER: usize = 1460;
+/// recvfrom(2) replies carry an 8-byte peer address before the payload.
+const META: usize = 8;
+/// High bit of the 16-bit flags word on OP_RECV/OP_RECVFROM: the caller has a
+/// SIGALRM handler, so netd should stop parking the read after a short while
+/// and answer EINTR. Without it, `ping` would never regain control to send its
+/// next request (the alarm handler can only run at a syscall boundary).
+const RX_INTR: u16 = 0x8000;
 
 #[derive(Clone, Copy)]
 struct SockSlot {
@@ -202,7 +212,7 @@ fn netd_call(
 
     // The reply lands in a scratch buffer so the caller's `out` only sees the
     // payload, never the `ret` header.
-    let mut rep = [0u8; REP_HDR + MAX_XFER];
+    let mut rep = [0u8; REP_HDR + META + MAX_XFER];
     let got = ipc::ipc_call_internal(
         port_id,
         req.as_ptr(),
@@ -235,19 +245,22 @@ fn netd_call(
 /// matching socket id. Only `AF_INET` + `SOCK_STREAM`/`SOCK_DGRAM` reach netd;
 /// everything else is rejected here so the error is cheap and immediate.
 #[inline(never)]
-pub fn sock_socket(domain: i32, ty: i32, _proto: i32) -> i64 {
+pub fn sock_socket(domain: i32, ty: i32, proto: i32) -> i64 {
     const AF_INET: i32 = 2;
     const SOCK_STREAM: i32 = 1;
     const SOCK_DGRAM: i32 = 2;
+    const SOCK_RAW: i32 = 3;
     if domain != AF_INET {
         return -task::EAFNOSUPPORT;
     }
-    if ty != SOCK_STREAM && ty != SOCK_DGRAM {
+    if ty != SOCK_STREAM && ty != SOCK_DGRAM && ty != SOCK_RAW {
         return -task::ESOCKTYPE;
     }
 
     let mut out = [0u8; 0];
-    let ret = netd_call(OP_SOCKET, 0, 0, 0, ty as u16, &[], &mut out);
+    // For OP_SOCKET the addr field carries the protocol (OP_RAW needs it),
+    // since a newly created socket has no peer address yet.
+    let ret = netd_call(OP_SOCKET, 0, proto as u32, 0, ty as u16, &[], &mut out);
     if ret < 0 {
         return ret;
     }
@@ -287,8 +300,16 @@ pub fn sock_connect(fd: u32, addr: u32, port: u16) -> i64 {
     netd_call(OP_CONNECT, netd_id, addr, port, 0, &[], &mut out)
 }
 
-/// `sendto(2)` with no destination (connected socket).
-pub fn sock_send(fd: u32, buf: *const u8, len: usize, flags: u16) -> i64 {
+/// `sendto(2)`. `addr == 0` means "the connected peer"; otherwise the address
+/// is the datagram/raw destination (netd decides from the socket type).
+pub fn sock_sendto(
+    fd: u32,
+    buf: *const u8,
+    len: usize,
+    flags: u16,
+    addr: u32,
+    port: u16,
+) -> i64 {
     if buf.is_null() || len == 0 {
         return 0;
     }
@@ -302,7 +323,12 @@ pub fn sock_send(fd: u32, buf: *const u8, len: usize, flags: u16) -> i64 {
     let netd_id = unsafe { SOCKS[idx].netd_id };
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
     let mut out = [0u8; 0];
-    netd_call(OP_SEND, netd_id, 0, 0, flags, data, &mut out)
+    netd_call(OP_SEND, netd_id, addr, port, flags, data, &mut out)
+}
+
+/// `send(2)`/`write(2)` on a connected socket.
+pub fn sock_send(fd: u32, buf: *const u8, len: usize, flags: u16) -> i64 {
+    sock_sendto(fd, buf, len, flags, 0, 0)
 }
 
 /// poll(2)/select(2) readiness for a socket fd, answered by one synchronous
@@ -364,13 +390,64 @@ pub fn sock_recv(fd: u32, buf: *mut u8, len: usize, _flags: u16) -> i64 {
     let mut out = [0u8; MAX_XFER];
     // The max read rides in the flags word (u16, and MAX_XFER = 1460 fits);
     // the request carries no payload, so the header's len field is 0.
-    let ret = netd_call(OP_RECV, netd_id, 0, 0, want as u16, &[], &mut out);
+    let mut fl = want as u16;
+    if task::has_alarm_handler() {
+        fl |= RX_INTR;
+    }
+    let ret = netd_call(OP_RECV, netd_id, 0, 0, fl, &[], &mut out);
     if ret <= 0 {
         return ret;
     }
     let n = core::cmp::min(ret as usize, want);
     unsafe {
         core::ptr::copy_nonoverlapping(out.as_ptr(), buf, n);
+    }
+    n as i64
+}
+
+/// `recvfrom(2)`. netd prefixes the payload with the 8-byte peer address, so
+/// the kernel can fill the caller's `struct sockaddr_in` itself.
+pub fn sock_recvfrom(
+    fd: u32,
+    buf: *mut u8,
+    len: usize,
+    _flags: u16,
+    out_addr: &mut u32,
+    out_port: &mut u16,
+) -> i64 {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    if !task::user_range_valid(buf as u64, len, true) {
+        return -task::EFAULT;
+    }
+    let idx = match slot_of(fd) {
+        Some(i) => i,
+        None => return -task::EBADF,
+    };
+    let netd_id = unsafe { SOCKS[idx].netd_id };
+    let want = core::cmp::min(len, MAX_XFER);
+    let mut out = [0u8; META + MAX_XFER];
+    let mut fl = want as u16;
+    if task::has_alarm_handler() {
+        fl |= RX_INTR;
+    }
+    let ret = netd_call(OP_RECVFROM, netd_id, 0, 0, fl, &[], &mut out);
+    if ret <= 0 {
+        return ret;
+    }
+    let total = core::cmp::min(ret as usize, META + want);
+    if total < META {
+        // Defensive: netd should always prefix a peer address here.
+        let n = core::cmp::min(total, want);
+        unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf, n); }
+        return n as i64;
+    }
+    *out_addr = u32::from_be_bytes([out[0], out[1], out[2], out[3]]);
+    *out_port = u16::from_be_bytes([out[4], out[5]]);
+    let n = core::cmp::min(total - META, want);
+    unsafe {
+        core::ptr::copy_nonoverlapping(out.as_ptr().add(META), buf, n);
     }
     n as i64
 }
@@ -396,6 +473,37 @@ pub fn sock_bind(fd: u32, addr: u32, port: u16) -> i64 {
     let netd_id = unsafe { SOCKS[idx].netd_id };
     let mut out = [0u8; 0];
     netd_call(OP_BIND, netd_id, addr, port, 0, &[], &mut out)
+}
+
+/// `getsockname(2)` / `getpeername(2)`.
+pub fn sock_name(fd: u32, peer: bool, addr: &mut u32, port: &mut u16) -> i64 {
+    let idx = match slot_of(fd) {
+        Some(i) => i,
+        None => return -task::EBADF,
+    };
+    let netd_id = unsafe { SOCKS[idx].netd_id };
+    let mut out = [0u8; META];
+    let ret = netd_call(OP_NAME, netd_id, 0, 0, peer as u16, &[], &mut out);
+    if ret < 0 {
+        return ret;
+    }
+    if ret < META as i64 {
+        return -task::EIO;
+    }
+    *addr = u32::from_be_bytes([out[0], out[1], out[2], out[3]]);
+    *port = u16::from_be_bytes([out[4], out[5]]);
+    0
+}
+
+/// Release a parked recv(2) token after a signal interrupted the syscall.
+pub fn sock_cancel(fd: u32) -> i64 {
+    let idx = match slot_of(fd) {
+        Some(i) => i,
+        None => return -task::EBADF,
+    };
+    let netd_id = unsafe { SOCKS[idx].netd_id };
+    let mut out = [0u8; 0];
+    netd_call(OP_CANCEL, netd_id, 0, 0, 0, &[], &mut out)
 }
 
 /// `listen(2)`.
