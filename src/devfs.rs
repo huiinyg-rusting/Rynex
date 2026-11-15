@@ -165,7 +165,6 @@ impl VnodeOps for UeventDevice {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut wait: u64 = 0;
         loop {
             {
                 let mut q = UEVENT_QUEUE.lock();
@@ -175,12 +174,15 @@ impl VnodeOps for UeventDevice {
                     Err(e) => return Err(e),
                 }
             }
-            // Queue empty. Yields so the scheduler runs other tasks; we
-            // re-check on every resume (same pattern as the TTY devices).
-            wait += 1;
-            if wait % 100000 == 0 {
-                crate::task::yield_now_force();
-            }
+            // Queue empty. Sleep one PIT tick instead of spinning: a busy-spin
+            // here kept the CPU in syscall context (never timer-preemptible)
+            // and never returned to user mode, so IF stayed 0 and the pending
+            // PIT edge was never delivered -- every timed wakeup in the
+            // system (sleepers, service scripts, runit spawn delays) froze
+            // and the boot stalled in stage 2. A blocked reader lets the
+            // scheduler reach its idle loop (sti; hlt), which delivers the
+            // pending tick; the timer wakeup scan then re-queues this task.
+            crate::task::sys_sleep(1);
         }
     }
     fn write(&self, _ino: u64, _offset: u64, buf: &[u8]) -> Result<usize, &'static str> {

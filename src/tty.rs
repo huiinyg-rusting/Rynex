@@ -44,6 +44,16 @@ struct OutputBuffer {
     tail: usize,
 }
 
+/// Termios mirrored from the user TCSETS/TCGETS buffers. Field order must stay
+/// fixed (it is read/written across the syscall boundary without an explicit
+/// layout contract on the other side), so pin it with repr(C).
+///
+/// NOTE: this is 48 bytes; glibc/musl's struct termios on x86-64 is 60. The
+/// ioctl handlers copy only size_of::<Termios>() bytes in either direction,
+/// so userland keeps its own tail bytes; flags still line up because the four
+/// c_*flag fields match Linux's offsets. A future port should grow c_cc[] to
+/// 44 and the TCGETS/TCSETS copy length to 60 for full parity.
+#[repr(C)]
 struct Termios {
     c_iflag: u32,
     c_oflag: u32,
@@ -102,8 +112,12 @@ impl TtyDevice {
         let isig: bool;
         let vintr: u8;
         {
-            let input = self.input_buf.lock();
+            // Lock order must match set_termios() (termios then input_buf),
+            // else an SMP interleave with TCSETS deadlocks: keyboard IRQ holds
+            // input_buf and waits on termios while a syscall holds termios and
+            // waits on input_buf (ABBA).
             let termios = self.termios.lock();
+            let input = self.input_buf.lock();
             echo = termios.c_lflag & ECHO != 0 && input.echo;
             canonical = termios.c_lflag & ICANON != 0;
             isig = termios.c_lflag & ISIG != 0;
@@ -317,7 +331,6 @@ impl VnodeOps for TtyDevice {
             return Ok(0);
         }
         crate::serial::write_str("");
-        let mut wait_count = 0u64;
         loop {
             let n = self.pop_input(buf);
             if n > 0 {
@@ -334,12 +347,13 @@ impl VnodeOps for TtyDevice {
             // syscall (syscall_entry cli + timer_schedule's in_syscall() guard),
             // so a bare spin here would monopolize the CPU and starve every
             // other task (observed: a blocking console read in the runit shell
-            // service froze wthit's threads forever). Yield periodically so the
-            // scheduler runs other tasks; we re-check input on every resume.
-            wait_count += 1;
-            if wait_count % 100000 == 0 {
-                crate::task::yield_now_force();
-            }
+            // service froze with its threads forever). Sleep one PIT tick per
+            // iteration and re-check input on every resume -- and, critically,
+            // a BLOCKED reader lets the scheduler reach its idle loop
+            // (sti; hlt), which is what actually delivers the pending PIT
+            // edge: with only spinners on the CPU, IF stayed 0 and every
+            // timed wakeup in the system froze.
+            crate::task::sys_sleep(1);
         }
     }
 
@@ -359,6 +373,9 @@ impl VnodeOps for TtyDevice {
                 if arg == 0 {
                     return Err("EFAULT");
                 }
+                if !crate::task::user_range_valid(arg, core::mem::size_of::<Termios>(), true) {
+                    return Err("EFAULT");
+                }
                 let mut termios = [0u8; core::mem::size_of::<Termios>()];
                 self.get_termios(&mut termios)?;
                 unsafe {
@@ -372,6 +389,9 @@ impl VnodeOps for TtyDevice {
             }
             TCSETS | TCSETSW | TCSETSF => {
                 if arg == 0 {
+                    return Err("EFAULT");
+                }
+                if !crate::task::user_range_valid(arg, core::mem::size_of::<Termios>(), false) {
                     return Err("EFAULT");
                 }
                 let mut termios = [0u8; core::mem::size_of::<Termios>()];
@@ -389,6 +409,9 @@ impl VnodeOps for TtyDevice {
                 if arg == 0 {
                     return Err("EFAULT");
                 }
+                if !crate::task::user_range_valid(arg, core::mem::size_of::<Winsize>(), true) {
+                    return Err("EFAULT");
+                }
                 let mut ws = [0u8; core::mem::size_of::<Winsize>()];
                 self.get_winsize(&mut ws)?;
                 unsafe {
@@ -402,6 +425,9 @@ impl VnodeOps for TtyDevice {
             }
             TIOCSWINSZ => {
                 if arg == 0 {
+                    return Err("EFAULT");
+                }
+                if !crate::task::user_range_valid(arg, core::mem::size_of::<Winsize>(), false) {
                     return Err("EFAULT");
                 }
                 let mut ws = [0u8; core::mem::size_of::<Winsize>()];
@@ -426,6 +452,9 @@ impl VnodeOps for TtyDevice {
                 if arg == 0 {
                     return Err("EFAULT");
                 }
+                if !crate::task::user_range_valid(arg, 4, true) {
+                    return Err("EFAULT");
+                }
                 let pgrp = self.get_fg_pgrp();
                 unsafe {
                     *(arg as *mut i32) = pgrp;
@@ -434,6 +463,9 @@ impl VnodeOps for TtyDevice {
             }
             TIOCSPGRP => {
                 if arg == 0 {
+                    return Err("EFAULT");
+                }
+                if !crate::task::user_range_valid(arg, 4, false) {
                     return Err("EFAULT");
                 }
                 let pgrp = unsafe { *(arg as *const i32) };

@@ -780,6 +780,10 @@ pub fn init() {
     
     // Map LAPIC region (0xFEE00000, 4KB) - required for xAPIC access
     map_lapic_region();
+    // Map IOAPIC region (0xFEC00000, 4KB) - required to route PCI interrupts
+    // without the 8259. See apic::ioapic for why device IRQs must not go
+    // through the PIC on this machine.
+    map_ioapic_region();
     crate::serial::write_str("PAGING: init done\n");
     // Dump first few PML4 entries  
     let pml4_addr = kernel_pml4();
@@ -884,6 +888,91 @@ fn map_trampoline_page() {
         map_one(pml4, STACK_VIRT + i * 0x1000, phys);
         map_one(pml4, phys, phys);
     }
+}
+
+/// Map the IOAPIC region (0xFEC00000, 4KB) in kernel page tables.
+///
+/// Same shape as the LAPIC mapping but the IOAPIC is a different physical
+/// window and, unlike the LAPIC, we must not assume it is present: a machine
+/// without one still boots, it just keeps using the 8259 for PCI interrupts.
+/// So this is best-effort -- a failure here downgrades interrupt routing, it
+/// does not stop the kernel.
+fn map_ioapic_region() {
+    const IOAPIC_PHYS: u64 = 0xFEC0_0000;
+    const IOAPIC_VIRT: u64 = 0xFFFF_8000_FEC0_0000;
+
+    // Same flags the LAPIC region is mapped with: Present | Writable | Global.
+    // Reuse the verified value rather than deriving one -- the paging code in
+    // this kernel does not implement NX (there is no EFER.NXE setup and no
+    // PTE_NX constant outside this file), so passing a nominal NX bit would
+    // only set a bit the rest of the pager ignores. Global is required for a
+    // kernel mapping that must survive CR3 switches.
+    const FLAGS: u64 = 0x83;
+
+    match PageTableManager::map_kernel_page(IOAPIC_VIRT, IOAPIC_PHYS, FLAGS) {
+        Ok(_) => {
+            crate::serial::write_str("PAGING: IOAPIC region mapped\n");
+        }
+        Err(e) => {
+            crate::serial::write_str("PAGING: IOAPIC map failed: ");
+            crate::serial::write_str(e);
+            crate::serial::write_str("\n");
+        }
+    }
+    // Also identity map the same window, as a discriminator: if the higher-half
+    // read returns zeros but the identity read does not, the fault is in this
+    // pager's walk; if both return zeros, the window itself is not reaching the
+    // device. Guessing which of the two costs an hour per round trip.
+    let _ = PageTableManager::map_kernel_page(IOAPIC_PHYS, IOAPIC_PHYS, FLAGS);
+    dump_leaf_pte(IOAPIC_VIRT, "IOAPIC");
+}
+
+/// Walk the kernel page tables for `virt` and print every level down to the leaf
+/// PTE. Diagnostic only.
+///
+/// This exists because "the mapping reports success" and "the mapping is right"
+/// are different claims, and when a device window reads as all zeros the only
+/// way to tell which one is false is to look at the entries.
+pub fn dump_leaf_pte(virt: u64, label: &str) {
+    let vpn = [
+        ((virt >> 39) & 0x1FF) as usize,
+        ((virt >> 30) & 0x1FF) as usize,
+        ((virt >> 21) & 0x1FF) as usize,
+        ((virt >> 12) & 0x1FF) as usize,
+    ];
+    crate::serial::write_str("PAGING: ");
+    crate::serial::write_str(label);
+    crate::serial::write_str(" vpn=");
+    for i in 0..4 {
+        crate::serial::write_dec(vpn[i] as u64);
+        if i < 3 {
+            crate::serial::write_str(",");
+        }
+    }
+    crate::serial::write_str(" -> ");
+
+    let pml4 = KERNEL_PML4.load(core::sync::atomic::Ordering::Relaxed) as *mut PageTable;
+    if pml4.is_null() {
+        crate::serial::write_str("no PML4\n");
+        return;
+    }
+    let mut addr = pml4 as u64;
+    for (level, idx) in vpn.iter().enumerate() {
+        let e = unsafe { (*(addr as *const PageTable)).0[*idx] };
+        crate::serial::write_str("l");
+        crate::serial::write_dec(level as u64);
+        crate::serial::write_str("=");
+        crate::serial::write_hex(e);
+        crate::serial::write_str(" ");
+        if level < 3 {
+            if e & 1 == 0 {
+                crate::serial::write_str("(NOT PRESENT)\n");
+                return;
+            }
+            addr = e & 0x000F_FFFF_FFFF_F000;
+        }
+    }
+    crate::serial::write_str("\n");
 }
 
 // Map the LAPIC region (0xFEE00000, 4KB) in kernel page tables

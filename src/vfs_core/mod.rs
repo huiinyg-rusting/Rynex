@@ -597,6 +597,21 @@ pub fn vnode_get(id: u16) -> Option<Vnode> {
     vt.get(id).copied()
 }
 
+/// True when the vnode is backed by ramfs: the only backend whose read(2) is
+/// guaranteed non-blocking in this kernel (it is a plain copy out of kernel
+/// memory). This is the discriminator poll(2) needs, because POSIX says a
+/// regular file is always ready while a character device waits for real
+/// input — and here both kinds arrive through the same flat table.
+pub fn vnode_is_ramfs(vn_id: u16) -> bool {
+    match vnode_get(vn_id) {
+        Some(v) => core::ptr::eq(
+            v.ops as *const dyn VnodeOps,
+            &ramfs::RAMFS as *const dyn VnodeOps,
+        ),
+        None => false,
+    }
+}
+
 pub fn vnode_alloc(ino: u64, fs_id: FsId, mount_id: u64, ops: &'static dyn VnodeOps) -> Option<u16> {
     VNODE_TABLE.lock().alloc(ino, fs_id, mount_id, ops)
 }
@@ -644,6 +659,14 @@ pub fn dispatch(msg: &mut VfsMessage) -> i64 {
                 Some(v) => v,
                 None => { msg.result = -1; return -1; }
             };
+            // The caller must attach a buffer sized for a full Stat. The
+            // services.rs handler points msg.data into its IPC request payload
+            // and sets data_len from it, so a short request would make the
+            // write below run past the end of the message buffer.
+            if msg.data_len < core::mem::size_of::<Stat>() {
+                msg.result = -1;
+                return -1;
+            }
             match vnode.ops.stat(vnode.ino) {
                 Ok(st) => unsafe {
                     core::ptr::write(msg.data as *mut Stat, st);

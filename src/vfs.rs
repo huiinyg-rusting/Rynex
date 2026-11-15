@@ -54,6 +54,13 @@ static mut FD_TABLES: [[FileDesc; MAX_FDS_PER_TASK]; super::task::MAX_TASKS] =
 static NEXT_FLAT_INODE: AtomicU64 = AtomicU64::new(1);
 
 fn alloc_flat_inode(name: &[u8], size: usize) -> Option<usize> {
+    // Inode.name is a 64-byte slot (63 chars + NUL). A longer name cannot be
+    // stored faithfully: truncating to 63 would make the entry unmatchable by
+    // the full query, so every open would allocate a fresh inode, and two
+    // names sharing the first 63 bytes would alias onto one entry. Refuse.
+    if name.len() > 63 {
+        return None;
+    }
     unsafe {
         // Pseudo-inode slots at the top of the table are reserved for pipes
         // (see task::PIPE_INODE_BASE); real files must never take them or a
@@ -62,7 +69,7 @@ fn alloc_flat_inode(name: &[u8], size: usize) -> Option<usize> {
             if !INODES[i].used {
                 INODES[i] = Inode::empty();
                 INODES[i].used = true;
-                let name_len = core::cmp::min(name.len(), 63);
+                let name_len = name.len(); // <= 63, checked at fn entry
                 for j in 0..name_len {
                     INODES[i].name[j] = name[j];
                 }
@@ -173,8 +180,10 @@ pub fn normalize_path(input: &[u8], out: &mut [u8]) -> Option<usize> {
 
 pub fn resolve_or_register(name: &[u8]) -> Option<usize> {
     let mut buf = [0u8; 512];
-    let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
-    let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
+    // Same rule as find_inode: refuse un-normalized input rather than matching
+    // it against normalized table entries (over-cap path => None).
+    let norm_len = normalize_path(name, &mut buf)?;
+    let norm = &buf[..norm_len];
     find_inode(norm).or_else(|| {
         // Dynamic procfs PID files: /proc/<pid>/stat, /proc/<pid>/cmdline.
         if let Some(idx) = maybe_bind_proc_pid(norm) {
@@ -332,8 +341,12 @@ pub fn create_external_file(name: &[u8], data: *mut u8, size: usize) -> Option<u
 
 pub fn find_inode(name: &[u8]) -> Option<usize> {
     let mut buf = [0u8; 512];
-    let norm_len = normalize_path(name, &mut buf).unwrap_or(0);
-    let norm = if norm_len > 0 { &buf[..norm_len] } else { name };
+    // Normalization must succeed: if it fails (over the 512-byte cap) the raw
+    // name has not had `.`/`..`/`//` folded out, so comparing it against the
+    // normalized names in the table would resolve the wrong inode. Fail the
+    // lookup rather than fall back to the un-normalized string.
+    let norm_len = normalize_path(name, &mut buf)?;
+    let norm = &buf[..norm_len];
     // Exact match: the stored name must be byte-identical to the normalized
     // query AND end right where the query ends (name[j] == 0 terminator).
     // A prefix-match here would let a parent directory's entry shadow all
@@ -372,6 +385,24 @@ pub fn inode_size(idx: usize) -> Option<usize> {
             return None;
         }
         Some(INODES[idx].size)
+    }
+}
+
+/// poll(2) clustering of inodes by whether their reads can block.
+///
+/// Everything is vnode-backed in this kernel (the flat table only caches),
+/// so `data_ptr` cannot discriminate; the fs *backend* the vnode cites can:
+/// ramfs nodes are kernel memory and their read(2) is plain copyout, while
+/// devfs/procfs/tty etc. may block inside their own implementation. Which is
+/// what POSIX asks: poll on a regular file is "always ready", poll on a
+/// character device waits for real input.
+pub fn inode_poll_is_file(idx: usize) -> bool {
+    unsafe {
+        if idx >= MAX_INODES || !INODES[idx].used {
+            return false;
+        }
+        let vn = INODES[idx].vnode_id;
+        vn != 0 && crate::vfs_core::vnode_is_ramfs(vn)
     }
 }
 
@@ -475,6 +506,10 @@ pub fn close_fd(fd: usize) -> bool {
     // Release this task's reference on a pipe end (frees the pipe slot once
     // the last reader AND last writer have closed, across all tasks).
     crate::task::pipe_close(table[fd].inode_idx);
+    // Same choke point for sockets: tell netd to tear the connection down and
+    // free the kernel slot. Task exit lands here too, so a crashed `wget`
+    // cannot leave half-open connections pinned in netd.
+    crate::netsock::sock_close_inode(table[fd].inode_idx);
     table[fd].used = false;
     true
 }

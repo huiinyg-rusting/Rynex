@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering, AtomicBool};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, AtomicBool};
 
 use crate::memory::buddy::PAGE_SIZE;
 use crate::paging::PageTableManager;
@@ -146,6 +146,27 @@ pub const fn prio_to_nice(prio: u8) -> i32 {
     (prio as i32) - 20
 }
 
+/// Ticks of CPU per scheduling round, at 100Hz. One tick is 10ms.
+///
+/// Originally `8 - prio*5/40`, giving 7 ticks (70ms) to a prio-10 task, and it
+/// is back to that. An intermediate version cut it to 2 ticks while chasing
+/// wake latency, which did cut latency -- but for the wrong reason, and at a
+/// cost.
+///
+/// What the gate counters showed, once they could attribute latency to a
+/// specific early return in `timer_schedule`, was that the slice mattered only
+/// because a woken task could not pre-empt into it: 12-17 of the 16-19 ticks
+/// between an edge and the driver running sat under "slice has not expired".
+/// Cutting the slice cuts that term proportionally, but it also multiplies the
+/// number of context switches by the same factor -- and each one goes through
+/// the preempt-frame path whose fragility is documented at the build site. BAD
+/// PREEMPT warnings went from 63-84 to 467.
+///
+/// The two changes that actually address the wake -- `NEED_RESCHED` bypassing
+/// this gate, and a woken task going to the front of its priority queue -- make
+/// the slice length irrelevant to wake latency: the switch now happens at the
+/// next tick rather than when the slice runs out, so there should be no reason
+/// to keep the quantum short.
 fn initial_time_slice(prio: u8) -> u32 {
     let t = 8u32.saturating_sub((prio as u32) * 5 / 40);
     if t < 2 { 2 } else { t }
@@ -325,6 +346,12 @@ pub struct Task {
     // For sleep syscall
     pub wakeup_tick: u64,
 
+    // ITIMER_REAL (alarm(2)/setitimer(2)): absolute PIT tick and reload
+    // interval in ticks. 0 deadline means disarmed. The timer ISR sets
+    // SIGALRM pending when the deadline passes.
+    pub alarm_deadline: u64,
+    pub alarm_interval: u64,
+
     // Preserved user context when blocking in a syscall (sys_sleep, futex_wait, etc.)
     // context_switch saves kernel context to regs, overwriting user context.
     // We save user regs here before blocking, and restore on wakeup.
@@ -404,6 +431,8 @@ blocked_on: 0,
             cwd_len: 0,
             privileges: 0,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: false,
@@ -458,7 +487,7 @@ fn task_mut(tid: u64) -> &'static mut Task {
 // SMP: maximum number of logical CPUs the scheduler is built for. The BSP is CPU 0;
 // APIC IDs above the physical count simply stay unwired. Each CPU has its OWN current
 // task, runqueue, and runqueue lock (per-CPU scheduling).
-pub const MAX_CPUS: usize = 2;
+pub const MAX_CPUS: usize = crate::percpu::MAX_CPUS;
 static mut RUNQUEUE: [RunQueue; MAX_CPUS] = [const { RunQueue::new() }; MAX_CPUS];
 // Serializes all runqueue mutations. IRQ-safe so the timer ISR and syscalls can
 // both touch the runqueue without corrupting the linked lists / bitmap. One lock per CPU.
@@ -668,6 +697,51 @@ fn enqueue_task(tid: u64, prio: u8) {
             TASKS[task_idx(tail_id)].runqueue_next = Some(tid);
             rq.tails[p] = Some(tid);
         }
+        rq.nr_running += 1;
+    }
+}
+
+/// Enqueue at the *front* of the priority queue rather than the tail.
+///
+/// Used only on the wake path. Within a priority level `enqueue_task` is FIFO,
+/// so a task that blocks on I/O and is then woken lands behind every task
+/// already queued at that level -- and it then has to wait for each of them to
+/// consume a whole time slice. Measured: netd queued behind three runit
+/// children, and the resulting wait was the dominant part of driver wake
+/// latency even after the slice itself was cut from 7 ticks to 2.
+///
+/// The task that has been waiting for data has had nothing to do while it
+/// waited; the tasks ahead of it have been running. Putting the waiter first is
+/// what wake-time preemption means in a round-robin scheme, and it is what
+/// makes an interrupt-driven driver respond to its own interrupt. It is not a
+/// general-purpose reorder -- ordinary re-queues stay FIFO -- and it cannot
+/// starve anyone, because a task only reaches this path by having blocked first.
+fn enqueue_task_front(tid: u64, prio: u8) {
+    let cpu = task_ref(tid).cpu as usize;
+    let _g = RUNQUEUE_LOCK[cpu].lock();
+    unsafe {
+        let rq = &mut RUNQUEUE[cpu];
+        let idx = task_idx(tid);
+        let p = prio as usize;
+        // Guard against linking the same task twice: a second copy would mean a
+        // task competing against itself in the runqueue, and nr_running would
+        // be counted twice. Checking only the head would miss a task already
+        // sitting further down the list. Wake paths hand us Blocked tasks that
+        // were removed on blocking, so this scan normally finds nothing -- it is
+        // here so that correctness does not depend on that.
+        let mut seen = rq.heads[p];
+        while let Some(sid) = seen {
+            if sid == tid {
+                return;
+            }
+            seen = TASKS[task_idx(sid)].runqueue_next;
+        }
+        TASKS[idx].runqueue_next = rq.heads[p];
+        rq.heads[p] = Some(tid);
+        if rq.tails[p].is_none() {
+            rq.tails[p] = Some(tid);
+        }
+        rq.bitmap |= 1u64 << p;
         rq.nr_running += 1;
     }
 }
@@ -1656,6 +1730,14 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbp",
         "test byte ptr [rsp + 8], 3",
         "jnz 3f",
+        // Kernel→kernel resume via the preempt trampoline. RFLAGS are
+        // deliberately NOT restored here (see schedule_inner's IF=0 design):
+        // re-enabling IF inside this tail would let a nested tick rebuild the
+        // same global TIMER_FRAME_SCRATCH mid-restore and hand the `ret` a
+        // corrupted RIP (observed: rip=0x64, kernel-mode jump to garbage).
+        // Kernel contexts run with IF=0 until they return to user mode or hit
+        // a blocking wait; wake paths front-enqueue with NEED_RESCHED so
+        // deadline-critical tasks are picked promptly despite that.
         "mov rdx, [rsp + 24]",
         "mov rax, [rsp + 0]",
         "mov rsp, rdx",
@@ -1667,6 +1749,23 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         inc_ticks = sym inc_ticks,
         timer_schedule = sym timer_schedule,
     )
+}
+
+// Bounds of the kernel's own .text, from linker.ld. A kernel-mode resume RIP
+// must land inside them; outside means the interrupted stream was already
+// corrupt (ret/jump landed in .data/.rodata). The end bound used to be a
+// hardcoded address that drifted as the kernel grew — every binary with more
+// than ~86 KiB of .text flagged legitimate tail-of-.text RIPs — so read the
+// real section limits from the link instead.
+extern "Rust" {
+    static _kernel_text_start: u64;
+    static _kernel_text_end: u64;
+}
+
+fn rip_in_kernel_text(rip: u64) -> bool {
+    let start = unsafe { &_kernel_text_start as *const _ as u64 };
+    let end = unsafe { &_kernel_text_end as *const _ as u64 };
+    rip >= start && rip < end
 }
 
 #[no_mangle]
@@ -1744,12 +1843,13 @@ pub extern "C" fn save_interrupt_context(frame: *mut u64) {
             regs.ss     = KERNEL_DATA_SELECTOR;
 
             // Diagnostics: flag kernel-mode RIPs that fall outside .text
-            // (0x106000..0x11AF6F). A kernel task should never be "running"
+            // (start/end come from the linker script, see rip_in_kernel_text).
+            // A kernel task should never be "running"
             // from .data/.rodata — this indicates the interrupted stream was
             // already corrupt (ret/jump landed in data). Captured via klog so
             // it is queryable (klog::dump()) and hideable by console level.
             let rip = regs.rip;
-            let in_text = rip >= 0x106000 && rip < 0x11AF6F;
+            let in_text = rip_in_kernel_text(rip);
             if !in_text {
                 crate::klog::begin(crate::klog::LOG_ERR, crate::klog::FAC_SCHED);
                 crate::klog::s("[BADKERNELRIP] task=");
@@ -1909,7 +2009,38 @@ pub fn wakeup_expired_sleepers() {
                 // Resume on the live regs saved by the last context_switch; do NOT
                 // stamp the zeroed saved_user_regs snapshot (would clobber r15).
                 let _ = TASKS[i].saved_user_regs.take();
-                enqueue_task(TASKS[i].id, TASKS[i].prio);
+                // Front-enqueue + NEED_RESCHED, same as futex_wake: a deadline
+                // wake is latency-critical. Tail-enqueueing behind the runner
+                // fleet let a woken daemon sit 30-40 ticks (observed) before
+                // its first pickup, because the runners cycle the queue and
+                // nothing drains to the tail until their slices all expire.
+                enqueue_task_front(TASKS[i].id, TASKS[i].prio);
+                NEED_RESCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // ITIMER_REAL expiry. busybox ping re-arms a one-shot timer before each
+        // probe; the ISR raises SIGALRM, which the syscall-exit path turns into
+        // a handler call. Without this, only the first ping ever leaves.
+        for i in 0..MAX_TASKS {
+            let h;
+            {
+                let t = &TASKS[i];
+                if t.id == 0 || t.alarm_deadline == 0 || t.alarm_deadline > now {
+                    continue;
+                }
+                h = t.sig_handlers[SIGALRM as usize].handler;
+            }
+            let interval = TASKS[i].alarm_interval;
+            TASKS[i].alarm_deadline = if interval != 0 { now + interval } else { 0 };
+            if h == SIG_IGN as u64 {
+                continue;
+            }
+            if h == SIG_DFL as u64 {
+                let _g = crate::spinlock::RawSpin::lock(&SIGNAL_LOCK);
+                TASKS[i].sig_pending |= 1u64 << (SIGALRM as usize);
+            } else {
+                let _ = sig_deliver_to_task(i, SIGALRM);
             }
         }
     }
@@ -1948,6 +2079,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
     let current = cur_task().load(Ordering::SeqCst);
     if current == 0 {
+        TIMER_GATES[GATE_NONE].fetch_add(1, Ordering::Relaxed);
         return 0;
     }
 
@@ -1958,6 +2090,7 @@ pub extern "C" fn timer_schedule() -> u64 {
     // the CPU-pushed interrupt frame (iretq), letting the syscall continue
     // unperturbed.
     if in_syscall() {
+        TIMER_GATES[GATE_SYSCALL].fetch_add(1, Ordering::Relaxed);
         return 0;
     }
 
@@ -1966,6 +2099,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         // Kernel tasks: return 0 to signal handler to use CPU-pushed frame directly
         if TASKS[idx].user_stack == 0 {
+            TIMER_GATES[GATE_KERNEL_TASK].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
@@ -1978,6 +2112,7 @@ pub extern "C" fn timer_schedule() -> u64 {
         // iretq preserves the interrupted kernel context exactly, and is what
         // the kernel-task path below already does.
         if TASKS[idx].user_stack != 0 && (TASKS[idx].regs.cs & 3) == 0 {
+            TIMER_GATES[GATE_KERNEL_MODE].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
@@ -1988,30 +2123,93 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         // If task not running, don't reschedule — resume it as-is
         if TASKS[idx].state != TaskState::Running {
+            TIMER_GATES[GATE_NOT_RUNNING].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
         // Time slice still positive → keep running current task
-        if TASKS[idx].time_slice > 0 {
+        //
+        // ...unless someone asked to be rescheduled. `futex_wake` makes a
+        // blocked task Ready and enqueues it, and then iretq returns to
+        // whatever held the CPU; nothing else drains the runqueue, so the
+        // woken task waits out the incumbent's whole slice. Measured: that was
+        // 12-17 of the 16-19 ticks between an edge and the driver running, and
+        // with the slice cut to 2 ticks the remaining cost is the number of
+        // same-priority tasks queued ahead of it -- `dequeue_task` is FIFO per
+        // priority, so a task readied at equal priority goes to the back.
+        //
+        // This flag is the wake-implies-schedule mechanism. It is checked here
+        // rather than in the interrupt stub because this is the only place that
+        // can safely build a preempt frame: the three gates above are all
+        // documented as unable to, and bypassing them would resume a syscall
+        // mid-call or iretq out of kernel mode. Only the slice gate is bypassed,
+        // which is exactly the gate that was doing the damage.
+        //
+        // Bypassing it means `dequeue_task` now runs while the incumbent still
+        // has slice left, and that pick does not compare priorities against the
+        // task being displaced -- so a wake can hand the CPU to a
+        // lower-priority ready task sooner than the slice would have. That is
+        // not a new kind of switch: this scheduler makes exactly that pick when
+        // a slice expires too, and a task requeued at a better priority is the
+        // first thing `dequeue_task` will find at the following switch point.
+        // What changes is only when it happens, not how the CPU is ultimately
+        // shared. Making the wake path priority-aware while the expiry path is
+        // not would mean two different policies at two switch points, which is
+        // a worse inconsistency than either one alone.
+        let resched = NEED_RESCHED.swap(false, Ordering::Relaxed);
+        if TASKS[idx].time_slice > 0 && !resched {
+            TIMER_GATES[GATE_SLICE_LEFT].fetch_add(1, Ordering::Relaxed);
             return 0;
         }
 
         // Time slice expired — give a fresh time slice
         TASKS[idx].time_slice = initial_time_slice(TASKS[idx].prio);
 
-        // Try to find a different task; if only current task is waiting, just keep running
-        let next_id = match dequeue_task() {
+        // Find a different task to run.
+        //
+        // `dequeue_task` returns the highest-priority *ready* task, and the
+        // running task is frequently also sitting in the runqueue -- so the
+        // first pick is often the task whose slice just expired. Taking that
+        // pick and giving up hands it a brand-new full slice for the privilege
+        // of being at the front of its own queue, and that doubles the slice
+        // period for every wake.
+        //
+        // This is not a rounding error. It is the dominant term in device-wake
+        // latency: `futex_wake` makes the driver ready and enqueues it, then
+        // iretq returns to whatever held the CPU, and the runqueue is only
+        // drained here. With init (prio 10) ahead of the driver (prio 20), the
+        // measured delay from edge to driver running was k+7 ticks at 100Hz --
+        // one to two whole slices, k being whatever was left of the incumbent's
+        // slice. Measured driver RTT was 70-120ms, and the 7 was pure waste.
+        //
+        // So: skip picks of `current` and look again. Deliberately *not*
+        // re-enqueueing current on the way -- the switch path below already
+        // requeues it, and putting a Running task into the runqueue here would
+        // create a second copy of it competing with itself.
+        let mut next_id = None;
+        for _ in 0..2 {
+            match dequeue_task() {
+                Some(id) if id != current => {
+                    next_id = Some(id);
+                    break;
+                }
+                // Discarded, not requeued: see above.
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        let next_id = match next_id {
             Some(id) => id,
             None => {
+                // Nothing else runnable. current is off the runqueue and stays
+                // Running, which is the same state the single-pick version left
+                // behind.
                 TASKS[idx].state = TaskState::Running;
+                TIMER_GATES[GATE_NOTHING_READY].fetch_add(1, Ordering::Relaxed);
                 return 0;
             }
         };
-
-        if next_id == current {
-            TASKS[idx].state = TaskState::Running;
-            return 0;
-        }
 
         // Switch to a different task — requeue current first
         TASKS[idx].state = TaskState::Ready;
@@ -2019,6 +2217,7 @@ pub extern "C" fn timer_schedule() -> u64 {
 
         let new_idx = task_idx(next_id);
         TASKS[new_idx].state = TaskState::Running;
+        TIMER_GATES[GATE_SWITCHED].fetch_add(1, Ordering::Relaxed);
         cur_task().store(next_id, Ordering::SeqCst);
         { CURRENT_TASK_ID = next_id; }
         pt_mgr().switch_to(TASKS[new_idx].pml4);
@@ -2075,13 +2274,13 @@ fn build_kernel_preempt_frame(kernel_stack: u64, task_ptr: *const Task) -> u64 {
     let regs = unsafe { &(*task_ptr).regs };
     unsafe {
         // Guard: a kernel-mode (cs.RPL==0) preempt frame whose resume RIP is
-        // outside .text (0x106000..0x11AF6F) means the interrupted stream was
+        // outside .text (bounds from linker.ld, see rip_in_kernel_text) means the interrupted stream was
         // already corrupt (ret/jump landed in .data/.rodata). Captured via klog
         // (WARNING) so it is queryable via klog::dump() and hideable by console
         // level; user-mode RIPs legitimately exceed .text, so only warn for
         // kernel code.
         let rip = regs.rip;
-        let in_text = rip >= 0x106000 && rip < 0x11AF6F;
+        let in_text = rip_in_kernel_text(rip);
         if (regs.cs & 3) == 0 && !in_text {
             crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SCHED);
             crate::klog::s("[BADPREEMPT] task=");
@@ -2197,6 +2396,27 @@ pub const SYS_dup: u64 = 32;
 pub const SYS_dup2: u64 = 33;
 pub const SYS_nanosleep: u64 = 35;
 pub const SYS_getpid: u64 = 39;
+
+// Sockets. There is no TCP/IP in the kernel — these are a facade that
+// marshals each call to netd over IPC (see `netsock.rs`). The numbers are
+// Linux x86-64 so static musl binaries reach them unmodified.
+pub const SYS_socket: u64 = 41;
+pub const SYS_connect: u64 = 42;
+pub const SYS_accept: u64 = 43;
+pub const SYS_sendto: u64 = 44;
+pub const SYS_recvfrom: u64 = 45;
+pub const SYS_sendmsg: u64 = 46;
+pub const SYS_recvmsg: u64 = 47;
+pub const SYS_shutdown: u64 = 48;
+pub const SYS_bind: u64 = 49;
+pub const SYS_listen: u64 = 50;
+pub const SYS_getsockname: u64 = 51;
+pub const SYS_getpeername: u64 = 52;
+pub const SYS_setsockopt: u64 = 54;
+pub const SYS_getsockopt: u64 = 55;
+pub const SYS_alarm: u64 = 37;
+pub const SYS_setitimer: u64 = 38;
+
 pub const SYS_clone: u64 = 56;
 pub const SYS_fork: u64 = 57;
 pub const SYS_vfork: u64 = 58;
@@ -2314,6 +2534,7 @@ pub const SYS_rynex_pci_read: u64 = 2032;
 pub const SYS_rynex_pci_write: u64 = 2033;
 pub const SYS_rynex_pci_find: u64 = 2034;
 pub const SYS_rynex_request_firmware: u64 = 2035;
+pub const SYS_rynex_ipc_peek: u64 = 2036;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -2352,6 +2573,28 @@ pub extern "C" fn syscall_handler(
         SYS_write => sys_write(arg1 as u32, arg2 as *const u8, arg3 as usize),
         SYS_open => sys_open(arg1 as *const u8, arg2 as i32),
         SYS_close => sys_close(arg1 as u32),
+        // Socket facade: no protocol lives here, each call is one IPC round
+        // trip to netd. See `netsock.rs`.
+        SYS_socket => crate::netsock::sock_socket(arg1 as i32, arg2 as i32, arg3 as i32),
+        SYS_connect => sys_connect(arg1 as u32, arg2 as *const u8, arg3 as u32),
+        SYS_accept => crate::netsock::sock_accept(arg1 as u32),
+        SYS_sendto => sys_sendto(arg1 as u32, arg2 as *const u8, arg3 as usize, arg4 as i32,
+                                  arg5 as *const u8, arg6 as u32),
+        SYS_recvfrom => sys_recvfrom(arg1 as u32, arg2 as *mut u8, arg3 as usize, arg4 as i32,
+                                      arg5 as *mut u8, arg6 as *mut u32),
+        SYS_sendmsg => sys_sendmsg(arg1 as u32, arg2 as *const u8, arg3 as i32),
+        SYS_recvmsg => sys_recvmsg(arg1 as u32, arg2 as *mut u8, arg3 as i32),
+        SYS_getsockname => sys_getsockname(arg1 as u32, arg2 as *mut u8, arg3 as *mut u32),
+        SYS_getpeername => sys_getpeername(arg1 as u32, arg2 as *mut u8, arg3 as *mut u32),
+        SYS_setsockopt => sys_setsockopt(arg1 as u32, arg2 as i32, arg3 as i32,
+                                         arg4 as *const u8, arg5 as u32),
+        SYS_getsockopt => sys_getsockopt(arg1 as u32, arg2 as i32, arg3 as i32,
+                                         arg4 as *mut u8, arg5 as *mut u32),
+        SYS_alarm => sys_alarm(arg1 as u32),
+        SYS_setitimer => sys_setitimer(arg1 as i32, arg2 as *const u8, arg3 as *mut u8),
+        SYS_shutdown => crate::netsock::sock_shutdown(arg1 as u32, arg2 as u32),
+        SYS_bind => sys_bind(arg1 as u32, arg2 as *const u8, arg3 as u32),
+        SYS_listen => crate::netsock::sock_listen(arg1 as u32, arg2 as u32),
         SYS_stat => sys_stat(arg1 as *const u8, arg2 as *mut u8),
         SYS_fstat => sys_fstat(arg1 as u32, arg2 as *mut u8),
         SYS_lstat => sys_stat(arg1 as *const u8, arg2 as *mut u8), // lstat = stat in flat fs
@@ -2457,7 +2700,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_ipc_close => crate::ipc::ipc_close(arg1 as u64),
         SYS_rynex_ipc_call => crate::ipc::ipc_call(arg1 as u64, arg2 as *const u8, arg3 as usize, arg4 as *mut u8, arg5 as usize),
         SYS_rynex_ipc_recv_ex => crate::ipc::ipc_recv_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
-        SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize),
+        SYS_rynex_ipc_reply => crate::ipc::ipc_reply(arg1 as u64, arg2 as *const u8, arg3 as usize) as i64,
         SYS_rynex_fs_register => sys_fs_register(arg1 as u64),
         SYS_rynex_fs_mount => sys_fs_mount(arg1 as *const u8),
         SYS_rynex_phys_map => sys_phys_map(arg1 as u64, arg2 as u64),
@@ -2468,6 +2711,13 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         SYS_rynex_pci_find => sys_pci_find(arg1 as u16),
         SYS_rynex_request_firmware =>
             crate::firmware::sys_request_firmware(arg1 as *const u8, arg2 as usize, arg3 as *mut u8, arg4 as usize),
+        // Non-blocking receive: returns immediately with 0 when the mailbox is
+        // empty, rather than sleeping until a message arrives. A service that
+        // has other work to do in its main loop (netd drives virtio itself and
+        // cannot sleep in recv) needs this; a client that wants to block uses
+        // SYS_rynex_ipc_recv_ex instead. Packed identically to recv_ex: the
+        // reply token in the high 32 bits, the length in the low 32.
+        SYS_rynex_ipc_peek => crate::ipc::ipc_peek_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -2563,6 +2813,10 @@ fn sys_write(fd: u32, buf: *const u8, count: usize) -> i64 {
         Some(f) => f,
         None => return -EBADF,
     };
+    // Socket fd? netd transmits; this is a single IPC round trip.
+    if crate::netsock::sock_idx_of(inode_fd.inode_idx).is_some() {
+        return crate::netsock::sock_send(fd, buf, count, 0);
+    }
     // Pipe write end?
     if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
         if pipe_is_write_end(inode_fd.inode_idx) {
@@ -2645,7 +2899,8 @@ fn pipe_wake_waiters() {
             // saved by the last context switch, not the zeroed saved_user_regs.
             let _ = TASKS[i].saved_user_regs.take();
             let prio = TASKS[i].prio;
-            enqueue_task(TASKS[i].id, prio);
+            enqueue_task_front(TASKS[i].id, prio);
+            NEED_RESCHED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2714,12 +2969,28 @@ fn sys_port_out(port: u16, width: u32, value: u64) -> i64 {
     0
 }
 
-// IRQ delivery: each registered IRQ gets a user-space counter word. The kernel
-// bumps the counter and futex-wakes the driver task on each edge. Drivers wait
-// with rynex_irq_wait (a futex wait on the same word) so they can block
-// cleanly instead of spinning.
+// IRQ delivery: the kernel keeps one counter per registered IRQ, bumps it on
+// each edge, and futex-wakes the driver task. Drivers wait with rynex_irq_wait
+// (a futex wait on the same counter) so they can block cleanly instead of
+// spinning.
 const MAX_DRIVER_IRQS: usize = 16;
 static mut DRIVER_IRQ_WORD: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
+
+/// The counters themselves live here, in kernel memory, not in the driver's
+/// user page.
+///
+/// The user's pointer is still validated and recorded -- it is part of the ABI
+/// and netd may inspect it -- but it is not the synchronisation object. Storing
+/// the state in a user page means the kernel's "address of the counter" quietly
+/// stops being a stable reference: the page can be swapped out, unmapped and
+/// rebuilt, or collide with a later mapping, and the same virtual address then
+/// reads back a different physical page's contents. That showed up as a counter
+/// that stepped 0->1, then read back as 0 again at the same address, so the wait
+// never saw its own snapshot change and fell through to its 1000ms timeout
+// every single time. A counter whose whole job is to be compared against a
+// value read moments earlier has to live somewhere that cannot move underneath
+/// the comparison.
+static mut DRIVER_IRQ_COUNT: [u32; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
 
 /// Driver task registers a user-space u32 counter for `irq`. Returns 0.
 fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
@@ -2732,7 +3003,20 @@ fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
     }
     unsafe {
         DRIVER_IRQ_WORD[irq as usize] = counter as u64;
-        crate::pic::unmask(irq);
+        // Start the kernel-side count from what the user page already holds, so
+        // a re-register does not make a fresh snapshot look like an edge.
+        DRIVER_IRQ_COUNT[irq as usize] = core::ptr::read_volatile(counter);
+        // Unmask only on the controller that will actually deliver this IRQ.
+        // If it is routed through the IOAPIC, the 8259 stays masked: unmasking
+        // both would deliver one interrupt twice by two routes, and the 8259
+        // route is the edge-triggered one we moved off of in the first place.
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::unmask(irq);
+        }
+        // Print the mask state right after the change: if the cascade bit is
+        // still set here, no slave IRQ can be delivered no matter what else is
+        // correct, and that is invisible everywhere else.
+        crate::pic::dump_state("after-unmask");
     }
     0
 }
@@ -2750,26 +3034,169 @@ fn sys_irq_wait(irq: u8, timeout_ms: u64) -> i64 {
         if word == 0 {
             return -EINVAL;
         }
-        let first = core::ptr::read_volatile(word as *const u32);
+        // Synchronise on the kernel-side counter, not on the user word.
+        let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
+        // Snapshot the counter BEFORE reopening the line. The order is load-bearing,
+        // and getting it backwards is silent rather than loud:
+        //
+        // The counter is the synchronisation point, not the interrupt. So the
+        // snapshot must come first and the arm second -- anything the device
+        // does after the snapshot is visible to the comparison below. Arming
+        // first means the edge lands in the gap, gets counted into `first`, and
+        // is then reported as "nothing happened" while the handler has already
+        // masked the line and no further edge can ever arrive to correct it.
+        // Measured: every single wait consumed exactly one edge that way and
+        // then sat out its full 1000ms, so ICMP RTT never left 1.0-1.3s.
+        //
+        // With the snapshot first, the same race resolves in our favour: the
+        // handler bumps the counter, the check below sees it differ, and the
+        // wait returns without ever blocking.
+        let first = core::ptr::read_volatile(ctr);
         let deadline = if timeout_ms == 0 {
             0
         } else {
             crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) + timeout_ms / 10
         };
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::unmask(irq);
+        }
+        // Every exit path is logged at LOG_DEBUG, which the console filter drops
+        // by default. netd's loop is `r = irq_wait(irq, 1000); if (ISR & 1)
+        // poll();` so a ~1000ms round trip is the signature of the timeout
+        // branch, not of a slow delivery -- and only these tell the two apart.
+        // Kept at DEBUG rather than deleted because they are what localised the
+        // cascade and masking bugs; they cost nothing until someone raises the
+        // level, and netd's own 1000ms poll means the rate is bounded anyway.
+        crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+        crate::klog::s("[IRQWAIT] enter irq=");
+        crate::klog::dec(irq as u64);
+        crate::klog::s(" word=0x");
+        crate::klog::hex(word);
+        crate::klog::s(" first=0x");
+        crate::klog::hex(first as u64);
+        crate::klog::s(" tick=");
+        crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+        crate::klog::end();
+        let mut spins = 0u32;
         loop {
-            let now = core::ptr::read_volatile(word as *const u32);
+            let now = core::ptr::read_volatile(ctr);
             if now != first {
+                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+                crate::klog::s("[IRQWAIT] ret-counter irq=");
+                crate::klog::dec(irq as u64);
+                crate::klog::s(" first=0x");
+                crate::klog::hex(first as u64);
+                crate::klog::s(" now=0x");
+                crate::klog::hex(now as u64);
+                crate::klog::s(" spins=");
+                crate::klog::dec(spins as u64);
+                crate::klog::s(" tick=");
+                crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+                crate::klog::end();
+                // Wake latency: ticks from the edge reaching the handler to
+                // this wait observing it and returning. This is the one
+                // measurement that separates "the edge took a while to arrive"
+                // from "the edge was already here and the woken task waited to
+                // be picked" -- the two are indistinguishable from netd's RTT,
+                // which is what made the earlier "one to two full time slices"
+                // explanation so hard to confirm or refute.
+                //
+                // Suppressed unless it is bad; see the threshold below.
+                let edge = WAKE_EDGE_TICK[irq as usize].load(Ordering::Relaxed);
+                if edge != 0 {
+                    let t = crate::pit::TICKS.load(Ordering::Relaxed);
+                    let i = irq as usize;
+                    WAKE_EDGE_TICK[i].store(0, Ordering::Relaxed);
+                    // Only when slow. A healthy wake is 1-3 ticks at 100Hz,
+                    // and printing on every one would put an unbounded line on
+                    // the serial port from inside a syscall, with interrupts
+                    // disabled while it waits -- exactly the failure this
+                    // session had to undo once already.
+                    //
+                    // So the good case prints nothing and this line *is* the
+                    // regression signal: if wake latency comes back, the
+                    // gates= breakdown below attributes it to a specific early
+                    // return in timer_schedule instead of leaving RTT as the
+                    // only symptom. Raise the threshold only with a reason;
+                    // 5 is enough headroom over 1-3 that noise does not
+                    // mask a real regression.
+                    let lat = t.wrapping_sub(edge);
+                    if lat > 5 {
+                        crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SCHED);
+                        crate::klog::s("[WAKE] irq=");
+                        crate::klog::dec(irq as u64);
+                        crate::klog::s(" edge_tick=");
+                        crate::klog::dec(edge);
+                        crate::klog::s(" ret_tick=");
+                        crate::klog::dec(t);
+                        crate::klog::s(" lat=");
+                        crate::klog::dec(t.wrapping_sub(edge));
+                        crate::klog::s(" | inc=");
+                        crate::klog::dec(WAKE_INC_TASK[i].load(Ordering::Relaxed));
+                        crate::klog::s(" inc_prio=");
+                        crate::klog::dec(WAKE_INC_PRIO[i].load(Ordering::Relaxed));
+                        crate::klog::s(" inc_slice=");
+                        crate::klog::dec(WAKE_INC_SLICE[i].load(Ordering::Relaxed));
+                        crate::klog::s(" rq=");
+                        crate::klog::hex(WAKE_RQ_BITMAP[i].load(Ordering::Relaxed));
+                        crate::klog::s(" | ret_task=");
+                        crate::klog::dec(cur_task().load(Ordering::Relaxed));
+                        crate::klog::s(" ret_prio=");
+                        crate::klog::dec(
+                            TASKS[task_idx(cur_task().load(Ordering::Relaxed))].prio as u64,
+                        );
+                        // Which gate held the CPU during the wait. One letter per
+                        // gate so the line stays short: 0=none (BSP hlt),
+                        // S=syscall, K=kernel-task, M=kernel-mode, N=not-running,
+                        // L=slice-left, .=nothing-ready, X=switched.
+                        if WAKE_GATE_IRQ[i].load(Ordering::Relaxed) != 0 {
+                            WAKE_GATE_IRQ[i].store(0, Ordering::Relaxed);
+                            crate::klog::s(" gates=");
+                            for g in 0..GATE_COUNT {
+                                let d = TIMER_GATES[g]
+                                    .load(Ordering::Relaxed)
+                                    .wrapping_sub(WAKE_GATE_SNAP[g].load(Ordering::Relaxed));
+                                if d != 0 {
+                                    crate::klog::s(match g {
+                                        GATE_NONE => "0",
+                                        GATE_SYSCALL => "S",
+                                        GATE_KERNEL_TASK => "K",
+                                        GATE_KERNEL_MODE => "M",
+                                        GATE_NOT_RUNNING => "N",
+                                        GATE_SLICE_LEFT => "L",
+                                        GATE_NOTHING_READY => ".",
+                                        _ => "X",
+                                    });
+                                    crate::klog::dec(d);
+                                }
+                            }
+                        }
+                        crate::klog::end();
+                    }
+                }
                 return 0;
             }
             if deadline != 0
                 && crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) >= deadline
             {
+                crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+                crate::klog::s("[IRQWAIT] timeout irq=");
+                crate::klog::dec(irq as u64);
+                crate::klog::s(" ctr=");
+                crate::klog::dec(now as u64);
+                crate::klog::s(" spins=");
+                crate::klog::dec(spins as u64);
+                crate::klog::end();
                 return -EAGAIN;
             }
             // Arm the task's wakeup tick so the timer path re-enters this loop
             // at the deadline; without it the block below could only ever be
             // released by an IRQ edge and `timeout_ms` would be a lie.
-            if !block_on_futex_until(word as *const u32, deadline) {
+            // Wait on ctr (the kernel counter), not the user's word: it is the
+            // address driver_irq_edge futex-wakes on, so an edge arriving
+            // before the deadline releases the wait immediately.
+            spins += 1;
+            if !block_on_futex_until(ctr, deadline) {
                 return -EAGAIN;
             }
         }
@@ -2787,11 +3214,154 @@ pub fn driver_irq_edge(irq: u8) {
         if word == 0 {
             return;
         }
-        let now = core::ptr::read_volatile(word as *const u32);
-        core::ptr::write_volatile(word as *mut u32, now.wrapping_add(1));
-        crate::task::futex_wake(word as *const u32, 1);
+        // Bump the kernel-side counter -- the object the driver synchronises on -- and
+        // mirror it into the user's word, which stays live for a driver that
+        // chooses to read it.
+        let now = DRIVER_IRQ_COUNT[irq as usize];
+        DRIVER_IRQ_COUNT[irq as usize] = now.wrapping_add(1);
+        core::ptr::write_volatile(word as *mut u32, DRIVER_IRQ_COUNT[irq as usize]);
+        let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
+        let woken = crate::task::futex_wake(ctr, 1);
+        // Stamp the edge only when it woke somebody. sys_irq_wait clears the
+        // stamp as it reads it, so an edge that wakes nobody cannot be charged
+        // to a later, unrelated wait.
+        if woken > 0 {
+            let i = irq as usize;
+            WAKE_EDGE_TICK[i].store(
+                crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            let inc = cur_task().load(Ordering::Relaxed);
+            WAKE_INC_TASK[i].store(inc, Ordering::Relaxed);
+            if inc != 0 {
+                let ii = task_idx(inc);
+                WAKE_INC_SLICE[i].store(TASKS[ii].time_slice as u64, Ordering::Relaxed);
+                WAKE_INC_PRIO[i].store(TASKS[ii].prio as u64, Ordering::Relaxed);
+            }
+            // Read under the runqueue lock, as dequeue_task does. Racy without
+            // it, and the value is only a snapshot for the log line.
+            {
+                let cpu = current_cpu();
+                let _g = RUNQUEUE_LOCK[cpu].lock();
+                let b = unsafe { RUNQUEUE[cpu].bitmap };
+                WAKE_RQ_BITMAP[i].store(b, Ordering::Relaxed);
+            }
+            for g in 0..GATE_COUNT {
+                WAKE_GATE_SNAP[g].store(TIMER_GATES[g].load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            WAKE_GATE_IRQ[i].store(1, Ordering::Relaxed);
+        }
+
+        // Stop re-delivering until the driver has drained the device.
+        //
+        // The device holds INTA# asserted until the driver reads its interrupt
+        // status register, and netd only does that after this wait returns. So
+        // between an edge and the driver's drain there is a window in which the
+        // line is still up -- and because the 8259's request latch outlives the
+        // EOI, every EOI hands another interrupt straight back. Measured: 67
+        // million deliveries, the CPU pinned in this stub, and netd starved out
+        // of a single loop turn, so it never got to clear the line and the
+        // flood never ended.
+        //
+        // Masking here closes that window. No edge is lost by doing so: the
+        // counter above is what the driver synchronises on, not the interrupt,
+        // and `sys_irq_wait` reopens the line before it blocks again. This is
+        // the same disable/re-enable discipline a real driver uses around a
+        // shared or self-clearing device interrupt.
+        if !crate::interrupts::irq_routed_via_ioapic(irq) {
+            crate::pic::mask(irq);
+        }
+
+        // The wake count distinguishes the two things that look identical from
+        // netd's side: an edge that finds nobody blocked means the driver was
+        // running (it will re-read the counter), an edge that wakes someone
+        // means the wait returned because of the interrupt. Rate limited,
+        // because a flooding line must not fill the serial port and destroy the
+        // log needed to diagnose it.
+        let n = IRQ_DBG_EDGES[irq as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n % 512 == 0 {
+            crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_SCHED);
+            crate::klog::s("[IRQEDGE] irq=");
+            crate::klog::dec(irq as u64);
+            crate::klog::s(" word=0x");
+            crate::klog::hex(word);
+            crate::klog::s(" ctr 0x");
+            crate::klog::hex(now as u64);
+            crate::klog::s("->0x");
+            crate::klog::hex(now.wrapping_add(1) as u64);
+            crate::klog::s(" woken=");
+            crate::klog::dec(woken as u64);
+            // When the edge arrived, in PIT ticks. The wait's own enter/RET
+            // prints carry the same clock, so comparing them separates "the
+            // interrupt was slow to be delivered" from "the edge was already
+            // here and the wake took this long to reach the driver" -- two
+            // faults that look identical as a round-trip time.
+            crate::klog::s(" tick=");
+            crate::klog::dec(crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed));
+            crate::klog::end();
+        }
     }
 }
+
+/// Per-IRQ delivery count, for the `[IRQEDGE]` trace only.
+///
+/// Atomic because it is incremented from interrupt context while other CPUs can
+/// be doing the same: the IDT is shared, so a plain `static mut` read-modify-
+/// write here is a data race under the Rust model, not merely untidy. It is
+/// debug state, so paying for an atomic is free.
+static IRQ_DBG_EDGES: [AtomicU32; MAX_DRIVER_IRQS] = [const { AtomicU32::new(0) }; MAX_DRIVER_IRQS];
+
+/// PIT tick at which an edge last woke a waiter on this IRQ; 0 when none
+/// outstanding. Written in interrupt context, read and cleared by the waiter,
+/// so it is atomic rather than a bare cell. Paired with the `[WAKE]` line to
+/// measure edge-to-dispatch latency without turning on debug output globally.
+static WAKE_EDGE_TICK: [AtomicU64; MAX_DRIVER_IRQS] =
+    [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// State of the machine at the instant the edge was delivered: who held the
+/// CPU, how much of their slice was left, and what was queued. Printed next to
+/// the latency figure, because the latency alone cannot distinguish "the
+/// incumbent's slice had N ticks left" (which would show a wide spread) from
+/// "something re-checks on a fixed period" (which shows a tight cluster, as
+/// measured: 16-20 ticks every time).
+static WAKE_INC_TASK: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_INC_SLICE: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_INC_PRIO: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+static WAKE_RQ_BITMAP: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// Why `timer_schedule` declined to switch, counted per gate. Every tick lands
+/// in exactly one of these, so the sum over a wake window is the number of
+/// ticks that passed -- and the breakdown says which condition was holding the
+/// woken task off the CPU. Without this the only way to tell "the incumbent's
+/// slice had not expired" from "the incumbent is inside a syscall and cannot be
+/// preempted at all" is to read every gate and guess.
+pub const GATE_NONE: usize = 0; // current == 0: BSP bare hlt loop
+pub const GATE_SYSCALL: usize = 1; // in_syscall(): preempt frame unsafe
+pub const GATE_KERNEL_TASK: usize = 2; // user_stack == 0
+pub const GATE_KERNEL_MODE: usize = 3; // user task interrupted in kernel mode
+pub const GATE_NOT_RUNNING: usize = 4; // state != Running
+pub const GATE_SLICE_LEFT: usize = 5; // slice not yet expired
+pub const GATE_NOTHING_READY: usize = 6; // queue held nothing else
+pub const GATE_SWITCHED: usize = 7; // switched away
+pub const GATE_COUNT: usize = 8;
+
+static TIMER_GATES: [AtomicU64; GATE_COUNT] = [const { AtomicU64::new(0) }; GATE_COUNT];
+
+/// Snapshot of TIMER_GATES taken at the edge, diffed when the wait returns.
+static WAKE_GATE_SNAP: [AtomicU64; GATE_COUNT] = [const { AtomicU64::new(0) }; GATE_COUNT];
+static WAKE_GATE_IRQ: [AtomicU64; MAX_DRIVER_IRQS] = [const { AtomicU64::new(0) }; MAX_DRIVER_IRQS];
+
+/// Set when `futex_wake` put a task into the runqueue, cleared by the next
+/// `timer_schedule` that gets far enough to honour it.
+///
+/// This is the wake-implies-schedule request. Without it a task made Ready has
+/// to wait out the incumbent's entire slice, because iretq returns to whatever
+/// held the CPU and nothing else drains the runqueue -- measured at 12-17 of
+/// the 16-19 ticks of driver wake latency. It is a request, not a mandate:
+/// `timer_schedule` still refuses to switch from a syscall or kernel mode, so a
+/// set flag that meets those gates stays set for the next attempt rather than
+/// switching where it is unsafe to.
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
 /// User-space FS service registers its IPC port with the kernel. From then on
 /// every userfs mount forwards vnode ops to that port.
@@ -3490,7 +4060,8 @@ pub fn futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
                 // Resume on the live regs from the last context_switch; do NOT
                 // stamp the zeroed saved_user_regs snapshot (would clobber r15).
                 let _ = TASKS[i].saved_user_regs.take();
-                enqueue_task(TASKS[i].id, TASKS[i].prio);
+                enqueue_task_front(TASKS[i].id, TASKS[i].prio);
+                NEED_RESCHED.store(true, Ordering::Relaxed);
                 woken += 1;
             }
         }
@@ -3702,6 +4273,16 @@ pub const ETIMEDOUT: i64 = 110;
 pub const ENOTEMPTY: i64 = 39;
 pub const EMSGSIZE: i64 = 90;
 pub const EADDRNOTAVAIL: i64 = 99;
+pub const ESOCKTYPE: i64 = 94;
+pub const ENOPROTOOPT: i64 = 92;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const ENETUNREACH: i64 = 101;
+pub const ENETDOWN: i64 = 100;
+pub const ECONNRESET: i64 = 104;
+pub const ENOTCONN: i64 = 107;
+pub const ECONNREFUSED: i64 = 111;
+pub const EHOSTUNREACH: i64 = 113;
+pub const EINPROGRESS: i64 = 115;
 
 // ── Privileges (bug 15) ─────────────────────────────────────────
 // Bitmask of privileged operations a task is allowed to perform. Gates the
@@ -3860,6 +4441,10 @@ fn sys_read(fd: u32, buf: *mut u8, count: usize) -> i64 {
         Some(f) => f,
         None => return -EBADF,
     };
+    // Socket fd? netd owns the receive buffer; this is a single IPC round trip.
+    if crate::netsock::sock_idx_of(inode_fd.inode_idx).is_some() {
+        return crate::netsock::sock_recv(fd, buf, count, 0);
+    }
     // Pipe read end?
     if let Some(p) = pipe_idx_of(inode_fd.inode_idx) {
         if pipe_is_write_end(inode_fd.inode_idx) { return -EBADF; }
@@ -4300,9 +4885,14 @@ fn sys_fork() -> i64 {
         if let Some(pfds) = parent_fds {
             let cfds = crate::vfs::fd_table_for(child_tid);
             { core::ptr::copy_nonoverlapping(pfds.as_ptr(), cfds.as_ptr() as *mut crate::vfs::FileDesc, crate::vfs::MAX_FDS_PER_TASK); }
-            // Child now holds its own references on any inherited pipe ends.
+            // Child now holds its own references on any inherited pipe ends
+            // and socket slots, so a child's close(2) cannot free a resource
+            // the parent still holds.
             for i in 0..crate::vfs::MAX_FDS_PER_TASK {
-                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+                if cfds[i].used {
+                    pipe_inc_refs(cfds[i].inode_idx);
+                    crate::netsock::sock_inc_refs(cfds[i].inode_idx);
+                }
             }
         }
 
@@ -4335,6 +4925,18 @@ fn sys_fork() -> i64 {
         child_regs.rsp = SYSCALL_USER_RSP;
         child_regs.rflags = SYSCALL_USER_RFLAGS;
         child_regs.fs_base = SYSCALL_USER_FS_BASE;
+        // The child must resume in USER mode (RING 3), not inherit the CS/SS
+        // that parent.regs may still hold from a kernel-mode context switch.
+        // If the parent happened to be last sampled in kernel mode (regs.cs=0x8)
+        // when it made this fork call, leaving cs untouched makes the child
+        // resume at a user RIP with a ring-0 CS: context_switch takes the
+        // kernel->kernel preempt path, the resumed stream runs user code in
+        // ring 0 (or faults on its first user-memory access), and the scheduler
+        // logs [BADPREEMPT] for it. sys_clone already forces this; sys_fork
+        // was missing it. A fork child always returns to user mode, so pin the
+        // selectors unconditionally.
+        child_regs.cs = USER_CODE_SELECTOR | 3;
+        child_regs.ss = USER_DATA_SELECTOR | 3;
         child_regs.rax = 0; // Child gets 0 from fork
         // parent.regs holds stale callee-saved regs (last context switch);
         // use the live values captured by syscall_entry instead.
@@ -4392,6 +4994,8 @@ fn sys_fork() -> i64 {
             cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: 0,
             addr_space_private: true,
@@ -4467,9 +5071,14 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
                 cfds.as_ptr() as *mut crate::vfs::FileDesc,
                 crate::vfs::MAX_FDS_PER_TASK,
             );
-            // Child now holds its own references on any inherited pipe ends.
+            // Child now holds its own references on any inherited pipe ends
+            // and socket slots, so a child's close(2) cannot free a resource
+            // the parent still holds.
             for i in 0..crate::vfs::MAX_FDS_PER_TASK {
-                if cfds[i].used { pipe_inc_refs(cfds[i].inode_idx); }
+                if cfds[i].used {
+                    pipe_inc_refs(cfds[i].inode_idx);
+                    crate::netsock::sock_inc_refs(cfds[i].inode_idx);
+                }
             }
         }
 
@@ -4599,6 +5208,8 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
             cwd_len: parent.cwd_len,
             privileges: parent.privileges,
             wakeup_tick: 0,
+            alarm_deadline: 0,
+            alarm_interval: 0,
             futex_deadline: 0,
             child_tidptr: if flags & CLONE_CHILD_CLEARTID != 0 {
                 child_tidptr as u64
@@ -5356,9 +5967,17 @@ fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 
 
 // ── Sleep ─────────────────────────────────────────────────────────
 
-fn sys_sleep(ticks: u64) -> i64 {
+pub fn sys_sleep(ticks: u64) -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
+
+    // Drop any stale runqueue entry BEFORE marking the task Blocked. The
+    // current task can still be linked into its runqueue (a prior timer tick
+    // re-enqueued it as Ready and a syscall then ran on its slice); leaving
+    // the entry behind lets the scheduler later dequeue a Blocked task and
+    // "resurrect" it with stale kernel regs, corrupting whatever it was
+    // mid-syscall (observed: PIT tick stream died seconds later).
+    remove_from_runqueue(id);
 
     let now = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
 
@@ -5482,9 +6101,339 @@ fn sys_brk(addr: u64) -> i64 {
     }
 }
 
+// ── Socket address decoding ────────────────────────────────────────
+
+/// Decode a user-space `struct sockaddr_in` into (IPv4 address in network
+/// byte order, port in host byte order).
+///
+/// ```c
+/// struct sockaddr_in {
+///     sa_family_t sin_family;   /* u16, little-endian on x86 */
+///     in_port_t   sin_port;     /* u16, NETWORK byte order  */
+///     struct in_addr sin_addr;  /* u32, NETWORK byte order  */
+///     char        sin_zero[8];
+/// };
+/// ```
+fn parse_sockaddr_in(sa: *const u8, len: u32) -> Result<(u32, u16), i64> {
+    const AF_INET: u16 = 2;
+    // family + port + addr is the minimum that carries anything useful.
+    if sa.is_null() || (len as usize) < 8 {
+        return Err(-EINVAL);
+    }
+    if !user_range_valid(sa as u64, 8, false) {
+        return Err(-EFAULT);
+    }
+    let mut b = [0u8; 8];
+    unsafe { core::ptr::copy_nonoverlapping(sa, b.as_mut_ptr(), 8); }
+    let family = u16::from_le_bytes([b[0], b[1]]);
+    if family != AF_INET {
+        return Err(-EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    let addr = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+    Ok((addr, port))
+}
+
+/// `connect(2)`. musl also reaches this through `sendto`/`recvfrom` with a
+/// non-null address, so the two share the decode helper.
+fn sys_connect(fd: u32, sa: *const u8, len: u32) -> i64 {
+    match parse_sockaddr_in(sa, len) {
+        Ok((addr, port)) => crate::netsock::sock_connect(fd, addr, port),
+        Err(e) => e,
+    }
+}
+
+/// `bind(2)`.
+fn sys_bind(fd: u32, sa: *const u8, len: u32) -> i64 {
+    match parse_sockaddr_in(sa, len) {
+        Ok((addr, port)) => crate::netsock::sock_bind(fd, addr, port),
+        Err(e) => e,
+    }
+}
+
+/// `sendto(2)`. A null `dest` means "the connected peer"; an explicit
+/// destination is used by datagram/raw sockets (DNS, ICMP ping).
+fn sys_sendto(fd: u32, buf: *const u8, len: usize, flags: i32,
+              dest: *const u8, destlen: u32) -> i64 {
+    if dest.is_null() {
+        return crate::netsock::sock_send(fd, buf, len, flags as u16);
+    }
+    match parse_sockaddr_in(dest, destlen) {
+        Ok((addr, port)) => {
+            crate::netsock::sock_sendto(fd, buf, len, flags as u16, addr, port)
+        }
+        Err(e) => e,
+    }
+}
+
+/// `recvfrom(2)`. netd reports the packet's source (or the connected peer for
+/// TCP) in the reply header, so the caller's sockaddr is filled accurately.
+fn sys_recvfrom(fd: u32, buf: *mut u8, len: usize, flags: i32,
+                from: *mut u8, fromlen: *mut u32) -> i64 {
+    let mut saddr = 0u32;
+    let mut sport = 0u16;
+    let n = crate::netsock::sock_recvfrom(
+        fd, buf, len, flags as u16, &mut saddr, &mut sport,
+    );
+    if n >= 0 && !from.is_null() && !fromlen.is_null()
+        && user_range_valid(from as u64, 16, true)
+        && user_range_valid(fromlen as u64, 4, true)
+    {
+        let mut sa = [0u8; 16];
+        sa[0] = 2; // AF_INET, little-endian u16
+        sa[1] = 0;
+        sa[2..4].copy_from_slice(&sport.to_be_bytes());
+        sa[4..8].copy_from_slice(&saddr.to_be_bytes());
+        unsafe {
+            core::ptr::copy_nonoverlapping(sa.as_ptr(), from, 16);
+            let want = core::ptr::read_volatile(fromlen);
+            let clipped = core::cmp::min(want, 16u32);
+            core::ptr::write_volatile(fromlen, clipped);
+        }
+    }
+    n
+}
+
+/// Write an IPv4 sockaddr into a user buffer, the common tail of
+/// getsockname/getpeername.
+fn write_sockaddr_in(dst: *mut u8, lenp: *mut u32, addr: u32, port: u16) -> i64 {
+    if dst.is_null() || lenp.is_null() {
+        return -EFAULT;
+    }
+    if !user_range_valid(dst as u64, 16, true)
+        || !user_range_valid(lenp as u64, 4, true)
+    {
+        return -EFAULT;
+    }
+    let mut sa = [0u8; 16];
+    sa[0] = 2;
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&addr.to_be_bytes());
+    unsafe {
+        core::ptr::copy_nonoverlapping(sa.as_ptr(), dst, 16);
+        let want = core::ptr::read_volatile(lenp);
+        core::ptr::write_volatile(lenp, core::cmp::min(want, 16u32));
+    }
+    0
+}
+
+fn sys_getsockname(fd: u32, addr: *mut u8, lenp: *mut u32) -> i64 {
+    let mut a = 0u32;
+    let mut p = 0u16;
+    let r = crate::netsock::sock_name(fd, false, &mut a, &mut p);
+    if r < 0 { return r; }
+    write_sockaddr_in(addr, lenp, a, p)
+}
+
+fn sys_getpeername(fd: u32, addr: *mut u8, lenp: *mut u32) -> i64 {
+    let mut a = 0u32;
+    let mut p = 0u16;
+    let r = crate::netsock::sock_name(fd, true, &mut a, &mut p);
+    if r < 0 { return r; }
+    write_sockaddr_in(addr, lenp, a, p)
+}
+
+/// `setsockopt(2)`. The stack has no tunable options a program depends on for
+/// correctness (busybox ping sets SO_RCVBUF/IP_TTL and ignores failures), so
+/// accept and ignore rather than failing the whole program.
+fn sys_setsockopt(_fd: u32, _level: i32, _optname: i32,
+                  _optval: *const u8, _optlen: u32) -> i64 {
+    0
+}
+
+fn sys_getsockopt(_fd: u32, _level: i32, _optname: i32,
+                  _optval: *mut u8, optlen: *mut u32) -> i64 {
+    if !optlen.is_null() && user_range_valid(optlen as u64, 4, true) {
+        unsafe { core::ptr::write_volatile(optlen, 0); }
+    }
+    -ENOPROTOOPT
+}
+
+// ── sendmsg(2) / recvmsg(2) ────────────────────────────────────────
+
+/// x86-64 `struct msghdr` prefix: name, namelen, iov, iovlen, control,
+/// controllen. Only the first three fields are decoded; ancillary data is not
+/// produced or consumed by the facade.
+fn sys_sendmsg(fd: u32, msg: *const u8, flags: i32) -> i64 {
+    if msg.is_null() || !user_range_valid(msg as u64, 32, false) {
+        return -EFAULT;
+    }
+    let mut h = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(msg, h.as_mut_ptr(), 32); }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap()) as *const u8;
+    let namelen = u32::from_le_bytes(h[8..12].try_into().unwrap());
+    let iov = u64::from_le_bytes(h[16..24].try_into().unwrap()) as *const u8;
+    let iovcnt = u64::from_le_bytes(h[24..32].try_into().unwrap()) as usize;
+
+    // Flatten the iovec into one contiguous request. netd's send path is a
+    // single datagram/stream write, so scattered buffers have to be joined.
+    let mut total = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        let e = unsafe { iov.add(i * 16) };
+        if !user_range_valid(e as u64, 16, false) { return -EFAULT; }
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        total += u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+    }
+    if total > crate::netsock::MAX_XFER { total = crate::netsock::MAX_XFER; }
+
+    let mut flat = [0u8; crate::netsock::MAX_XFER];
+    let mut off = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        if off >= total { break; }
+        let e = unsafe { iov.add(i * 16) };
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        let base = u64::from_le_bytes(ie[0..8].try_into().unwrap()) as *const u8;
+        let l = u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        let take = core::cmp::min(l, total - off);
+        if take == 0 { continue; }
+        if !user_range_valid(base as u64, take, false) { return -EFAULT; }
+        unsafe { core::ptr::copy_nonoverlapping(base, flat.as_mut_ptr().add(off), take); }
+        off += take;
+    }
+
+    let dest = if name.is_null() {
+        None
+    } else {
+        match parse_sockaddr_in(name, namelen) {
+            Ok((a, p)) => Some((a, p)),
+            Err(e) => return e,
+        }
+    };
+    match dest {
+        Some((a, p)) => crate::netsock::sock_sendto(fd, flat.as_ptr(), off, flags as u16, a, p),
+        None => crate::netsock::sock_send(fd, flat.as_ptr(), off, flags as u16),
+    }
+}
+
+/// `recvmsg(2)`. The facade has no ancillary data, so this is recvfrom plus a
+/// scatter into the caller's iovec.
+fn sys_recvmsg(fd: u32, msg: *mut u8, flags: i32) -> i64 {
+    if msg.is_null() || !user_range_valid(msg as u64, 32, true) {
+        return -EFAULT;
+    }
+    let mut h = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(msg, h.as_mut_ptr(), 32); }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap()) as *mut u8;
+    let namelenp = u64::from_le_bytes(h[8..16].try_into().unwrap()) as *mut u32;
+    let iov = u64::from_le_bytes(h[16..24].try_into().unwrap()) as *mut u8;
+    let iovcnt = u64::from_le_bytes(h[24..32].try_into().unwrap()) as usize;
+
+    // Sum what fits, capped by the facade's single-shot limit.
+    let mut total = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        let e = unsafe { iov.add(i * 16) };
+        if !user_range_valid(e as u64, 16, false) { return -EFAULT; }
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        total += u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        if total >= crate::netsock::MAX_XFER { total = crate::netsock::MAX_XFER; break; }
+    }
+
+    let mut tmp = [0u8; crate::netsock::MAX_XFER];
+    let mut saddr = 0u32;
+    let mut sport = 0u16;
+    let n = crate::netsock::sock_recvfrom(
+        fd, tmp.as_mut_ptr(), total, flags as u16, &mut saddr, &mut sport,
+    );
+    if n <= 0 { return n; }
+
+    let mut left = n as usize;
+    let mut off = 0usize;
+    for i in 0..core::cmp::min(iovcnt, 16) {
+        if left == 0 { break; }
+        let e = unsafe { iov.add(i * 16) };
+        let mut ie = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
+        let base = u64::from_le_bytes(ie[0..8].try_into().unwrap()) as *mut u8;
+        let l = u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        let take = core::cmp::min(l, left);
+        if take == 0 { continue; }
+        unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr().add(off), base, take); }
+        off += take;
+        left -= take;
+    }
+    if !name.is_null() && !namelenp.is_null() {
+        let _ = write_sockaddr_in(name, namelenp, saddr, sport);
+    }
+    n
+}
+
+// ── Interval timers ────────────────────────────────────────────────
+
+/// `setitimer(2)` for ITIMER_REAL. busybox ping arms a one-shot timer per
+/// probe; the kernel records a tick deadline and the timer ISR raises
+/// SIGALRM, which is what lets `ping -c N` send more than one request.
+fn sys_setitimer(which: i32, new: *const u8, old: *mut u8) -> i64 {
+    const ITIMER_REAL: i32 = 0;
+    if which != ITIMER_REAL { return -EINVAL; }
+    if !old.is_null() && user_range_valid(old as u64, 32, true) {
+        let zero = [0u8; 32];
+        unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), old, 32); }
+    }
+    if new.is_null() { return 0; }
+    if !user_range_valid(new as u64, 32, false) { return -EFAULT; }
+
+    let mut b = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(new, b.as_mut_ptr(), 32); }
+    let iv_sec = i64::from_le_bytes(b[0..8].try_into().unwrap());
+    let iv_usec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    let v_sec = i64::from_le_bytes(b[16..24].try_into().unwrap());
+    let v_usec = i64::from_le_bytes(b[24..32].try_into().unwrap());
+    if iv_sec < 0 || iv_usec < 0 || iv_usec >= 1_000_000
+        || v_sec < 0 || v_usec < 0 || v_usec >= 1_000_000
+    {
+        return -EINVAL;
+    }
+    // PIT runs at 100 Hz: one tick is 10 ms.
+    let iv_us = (iv_sec as u64).saturating_mul(1_000_000) + iv_usec as u64;
+    let v_us = (v_sec as u64).saturating_mul(1_000_000) + v_usec as u64;
+    let interval = (iv_us + 9_999) / 10_000;
+    let value = (v_us + 9_999) / 10_000;
+
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        TASKS[idx].alarm_interval = interval;
+        TASKS[idx].alarm_deadline = if value == 0 { 0 } else { now + value };
+    }
+    0
+}
+
+fn sys_alarm(seconds: u32) -> i64 {
+    let id = current_task_id();
+    if id == 0 { return -EINVAL; }
+    let mut remaining = 0i64;
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        if TASKS[idx].alarm_deadline > now {
+            remaining = ((TASKS[idx].alarm_deadline - now) / 100) as i64;
+        }
+    }
+    let ticks = (seconds as u64) * 100; // 100 ticks per second
+    unsafe {
+        let idx = task_idx(id);
+        let now = crate::pit::TICKS.load(Ordering::Relaxed);
+        TASKS[idx].alarm_interval = 0;
+        TASKS[idx].alarm_deadline = if ticks == 0 { 0 } else { now + ticks };
+    }
+    remaining
+}
+
 // ── Close ──────────────────────────────────────────────────────────
 
+/// `FileDesc.flags` bit marking a socket fd. The VFS only ever stores small
+/// `O_*` values (0/1 today) in this field, so a high bit is unambiguous, and
+/// it lets `poll` and friends recognise a socket without re-entering the VFS.
+pub const FD_SOCK: i32 = 1 << 8;
+
 fn sys_close(fd: u32) -> i64 {
+    // Socket teardown happens inside `close_fd` (mirroring how it releases
+    // pipe ends), so exit and close share one path and cannot drift.
     if crate::vfs::close_fd(fd as usize) { 0 } else { -EBADF }
 }
 
@@ -5611,8 +6560,11 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
         if (newfd as usize) < crate::vfs::MAX_FDS_PER_TASK {
             table[newfd as usize] = table[oldfd as usize];
             table[newfd as usize].pos = 0;
-            // dup adds a new reference on a pipe end.
+            // dup adds a new reference on a pipe end and on a socket slot:
+            // the program is about to close oldfd, and the socket's life is
+            // now tied to newfd, not to the original entry.
             pipe_inc_refs(table[newfd as usize].inode_idx);
+            crate::netsock::sock_inc_refs(table[newfd as usize].inode_idx);
         }
         newfd as i64
     }
@@ -5622,9 +6574,16 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
 
 fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
     if req.is_null() { return -EFAULT; }
-    let ns = unsafe { core::ptr::read_volatile(req) };
+    // timespec is {tv_sec, tv_nsec} — the FIRST field is whole seconds, the
+    // second is the nanosecond remainder. Reading only the first field made
+    // every sub-second sleep (the only kind busy daemons like udevd issue)
+    // return instantly and the daemon spin at 100% CPU, starving everything
+    // else: a syscall-context task cannot be timer-preempted.
+    let sec = unsafe { core::ptr::read_volatile(req) };
+    let nsec = unsafe { core::ptr::read_volatile(req.add(1)) };
+    let total_ns = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
     // PIT ticks are 10ms each (100Hz)
-    let ticks = (ns + 9_999_999) / 10_000_000; // ceiling division
+    let ticks = (total_ns + 9_999_999) / 10_000_000; // ceiling division
     if ticks > 0 {
         sys_sleep(ticks);
     }
@@ -5682,6 +6641,17 @@ fn sys_wait4(pid: i64, status_ptr: *mut i32, _options: i32, _rusage: u64) -> i64
 }
 
 // ── Kill / signal delivery ────────────────────────────────────────
+
+/// True when the current task has a real SIGALRM handler installed. The
+/// socket facade uses this to tell netd that a blocking recv may return EINTR
+/// after a short wait, so the alarm handler regains control (ping).
+pub fn has_alarm_handler() -> bool {
+    let id = current_task_id();
+    if id == 0 { return false; }
+    let idx = task_idx(id);
+    let h = unsafe { TASKS[idx].sig_handlers[SIGALRM as usize].handler };
+    h != SIG_DFL as u64 && h != SIG_IGN as u64
+}
 
 /// Deliver `sig` to a single task slot. Returns 0 ok / -ESRCH.
 fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
@@ -6343,6 +7313,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
         match request {
             TCGETS => {
                 if arg3 != 0 {
+                    if !user_range_valid(arg3, 60, true) {
+                        return -EFAULT;
+                    }
                     let termios = [0u8; 60];
                     unsafe { core::ptr::copy_nonoverlapping(termios.as_ptr(), arg3 as *mut u8, 60); }
                 }
@@ -6350,6 +7323,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
             }
             TIOCGWINSZ => {
                 if arg3 != 0 {
+                    if !user_range_valid(arg3, 8, true) {
+                        return -EFAULT;
+                    }
                     let winsz = [0u16; 4];
                     unsafe { core::ptr::copy_nonoverlapping(winsz.as_ptr(), arg3 as *mut u16, 4); }
                 }
@@ -6367,6 +7343,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
             TIOCSPGRP | TIOCGPGRP => {
                 if request == TIOCSPGRP {
                     if arg3 != 0 {
+                        if !user_range_valid(arg3, 4, false) {
+                            return -EFAULT;
+                        }
                         let pg = unsafe { *(arg3 as *const i32) };
                         crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
                     }
@@ -6384,6 +7363,9 @@ fn sys_ioctl(fd: u32, request: u64, arg3: u64) -> i64 {
                         crate::tty::TTY_DEVICE.set_fg_pgrp(pg);
                     }
                     if arg3 != 0 {
+                        if !user_range_valid(arg3, 4, true) {
+                            return -EFAULT;
+                        }
                         unsafe { *(arg3 as *mut i32) = pg; }
                     }
                     return 0;
@@ -6455,8 +7437,11 @@ fn sys_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
                         }
                         table[newfd] = table[fd as usize];
                         table[newfd].pos = 0;
-                        // dup adds another reference on a pipe end.
+                        // dup adds another reference on a pipe end and on a
+                        // socket slot alike (nc's xmove_fd is dup2+close; the
+                        // close must not reach netd over the dup's head).
                         pipe_inc_refs(table[newfd].inode_idx);
+                        crate::netsock::sock_inc_refs(table[newfd].inode_idx);
                     }
                     return newfd as i64;
                 }
@@ -6893,6 +7878,14 @@ const S_IRWXU: u32 = 0o700;
 const S_IRUSR: u32 = 0o400;
 
 fn fill_stat_from_vnode(vnode_id: u16, statbuf: *mut u8) -> i64 {
+    // statbuf is a raw user pointer from stat/fstat; writing LinuxStat through
+    // it without a range check is the same hole the ioctl fix closed — a user
+    // task could pass any kernel address and have the kernel scribble a stat
+    // struct over it.
+    if statbuf.is_null()
+        || !user_range_valid(statbuf as u64, core::mem::size_of::<LinuxStat>(), true) {
+        return -EFAULT;
+    }
     let st = match crate::vfs_core::stat(vnode_id) {
         Ok(s) => s,
         Err(_) => return -EIO,
@@ -7113,10 +8106,20 @@ fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
     let mut revents = 0i16;
     let inode_idx = inode_fd.inode_idx;
 
-    // Pipe ends (pseudo-inodes in the reserved range): report REAL readiness
-    // from that pipe's buffer positions, so a poller actually blocks until
-    // data/space exists instead of returning always-ready.
-    if let Some(p) = pipe_idx_of(inode_idx) {
+    // Socket ends (pseudo-inodes in the reserved range): ask netd what the
+    // connection can do right now. One synchronous round trip per fd; the
+    // caller re-scans every tick, so the answer is only ever 20ms stale.
+    if crate::netsock::sock_idx_of(inode_idx).is_some() {
+        match crate::netsock::poll_readiness(fd, events) {
+            b if b >= 0 => revents |= b as i16,
+            _ => {
+                // netd does not know this socket (freed or reused): the fd
+                // is not usable, which POLLNVAL exists to report.
+                unsafe { core::ptr::write_volatile(revents_ptr, POLLNVAL); }
+                return POLLNVAL;
+            }
+        }
+    } else if let Some(p) = pipe_idx_of(inode_idx) {
         unsafe {
             if events & POLLIN != 0 && PIPES[p].rpos < PIPES[p].wpos {
                 revents |= POLLIN;
@@ -7126,13 +8129,27 @@ fn poll_fd_readiness(fd: u32, events: i16, revents_ptr: *mut i16) -> i16 {
             }
         }
     } else {
-        // TTY / console / other character device: become ready on pending
-        // keyboard input only. POLLOUT on a tty is always ready.
-        if events & POLLIN != 0 && crate::keyboard::has_pending_input() {
-            revents |= POLLIN;
-        }
-        if events & POLLOUT != 0 {
-            revents |= POLLOUT;
+        // This branch is everything that is neither a pipe nor a socket.
+        // Two very different kinds land here, and poll(2) owes them
+        // different answers:
+        //
+        // Regular files (bytes in kernel memory) can only yield data or EOF,
+        // so POSIX says they are always ready. nc polls its stdin, which is
+        // exactly such a file — gating it made the newline waiting for the
+        // console, and nc hung before sending a thing.
+        if crate::vfs::inode_poll_is_file(inode_idx) {
+            if events & POLLIN != 0 { revents |= POLLIN; }
+            if events & POLLOUT != 0 { revents |= POLLOUT; }
+        } else {
+            // Char device (console): become ready on pending keyboard input
+            // only, so a tty poller blocks instead of spinning. POLLOUT on
+            // a tty is always ready.
+            if events & POLLIN != 0 && crate::keyboard::has_pending_input() {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
         }
     }
 
@@ -7152,10 +8169,26 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
     // timeout < 0 polls forever (event wakeups only); timeout == 0 is
     // non-blocking; timeout > 0 is an absolute deadline in ticks.
     let infinite = timeout < 0;
+    // A poller watching a socket fd has no wake-on-data path (data arrival
+    // resumes a blocked reader, not a poll sleeper), so cap its sleep at one
+    // tick: the re-scan issues a fresh readiness query and picks the data up
+    // within 20ms. Piping-only pollers (runit free of sockets) keep their
+    // deadline event-driven as before.
+    let mut sleeps_socket = false;
+    for i in 0..nfds as usize {
+        let fd = unsafe { core::ptr::read_volatile((fds + i as u64 * 8) as *const u32) };
+        if let Some(f) = crate::vfs::fd_to_inode(fd as usize) {
+            if crate::netsock::sock_idx_of(f.inode_idx).is_some() {
+                sleeps_socket = true;
+                break;
+            }
+        }
+    }
     let deadline = if timeout == 0 {
         0
-    } else if infinite {
-        u64::MAX
+    } else if infinite || sleeps_socket {
+        let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        now + 1
     } else {
         let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         // ms -> ticks at 50Hz; clamp so a sub-tick timeout still sleeps >= 1 tick.
@@ -7246,13 +8279,58 @@ fn sys_lseek(_fd: u32, _offset: i64, _whence: i32) -> i64 {
     -ENOSYS
 }
 
-fn sys_readv(_fd: u32, _iov: u64, _iovcnt: i32) -> i64 {
-    -ENOSYS
+/// `readv(2)` on a scatter list. musl stdio builds every buffered read as a
+/// two-entry readv {user buffer, FILE internal buffer}, so there is no facing
+/// ordinary programs that use `<stdio.h>` over a socket without it.
+///
+/// One syscall fills one destination: the first iovec with room. The caller
+/// (stdio) treats a partial fill as a short read, which is exactly right for
+/// a stream, and touching the second iovec too would need a second blocking
+/// round trip for data that may not be there yet.
+fn sys_readv(fd: u32, iov: u64, iovcnt: i32) -> i64 {
+    if iov == 0 {
+        return -EFAULT;
+    }
+    if iovcnt <= 0 {
+        return 0;
+    }
+    if iovcnt > 1024 {
+        return -EINVAL;
+    }
+    if !user_range_valid(iov, iovcnt as usize * 16, false) {
+        return -EFAULT;
+    }
+    for i in 0..iovcnt as usize {
+        let base: u64;
+        let len: usize;
+        unsafe {
+            base = core::ptr::read_volatile((iov + i as u64 * 16) as *const u64);
+            len = core::ptr::read_volatile((iov + i as u64 * 16 + 8) as *const usize);
+        }
+        if base == 0 || len == 0 {
+            continue;
+        }
+        if !user_range_valid(base, len, true) {
+            return -EFAULT;
+        }
+        return sys_read(fd, base as *mut u8, len);
+    }
+    0
 }
 
 fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
-    if fd != 1 && fd != 2 { return -ENOSYS; }
-    if iovcnt <= 0 { return 0; }
+    if iov == 0 {
+        return -EFAULT;
+    }
+    if iovcnt <= 0 {
+        return 0;
+    }
+    if iovcnt > 1024 {
+        return -EINVAL;
+    }
+    if !user_range_valid(iov, iovcnt as usize * 16, false) {
+        return -EFAULT;
+    }
     let mut total = 0i64;
     for i in 0..iovcnt as usize {
         let base: u64;
@@ -7264,6 +8342,9 @@ fn sys_writev(fd: u32, iov: u64, iovcnt: i32) -> i64 {
         if base == 0 || len == 0 { continue; }
         let r = sys_write(fd, base as *const u8, len);
         if r < 0 {
+            // Record what actually failed (stdio swallows the errno into its
+            // error flag, and a silent ENOSYS here is indistinguishable from
+            // "the peer never answered").
             crate::klog::begin(crate::klog::LOG_WARNING, crate::klog::FAC_SYSCALL);
             crate::klog::s("writev fd=");
             crate::klog::dec(fd as u64);
@@ -7306,18 +8387,15 @@ fn sys_clock_nanosleep(clk_id: u64, flags: u32, req: *const u64, _rem: *mut u64)
     } else {
         (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64)
     };
-    let ticks = (total_ns + 19_999_999) / 20_000_000;
-    // serial::write_str("CLKNS req=");
-    // serial::write_dec(sec as u64);
-    // serial::write_str(".");
-    // serial::write_dec(nsec as u64);
-    // serial::write_str(" ns ticks=");
-    // serial::write_dec(ticks);
-    // serial::write_str("\n");
+    // PIT ticks are 10ms each (100Hz). Round up, and never skip the sleep
+    // entirely: a sub-tick request (e.g. udevd's nanosleep of the remainder of
+    // its poll interval) used to return instantly and the caller would spin
+    // -- and a syscall-context task cannot be timer-preempted, so one spinning
+    // daemon starved the whole system.
+    let ticks = (total_ns + 9_999_999) / 10_000_000;
     if ticks > 0 {
         sys_sleep(ticks);
     }
-    // serial::write_str("CLKNS woke\n");
     0
 }
 
@@ -7344,6 +8422,9 @@ fn create_applet_links() {
         b"dd", b"cp", b"mv", b"rm", b"mkdir", b"rmdir", b"ln", b"touch",
         b"chmod", b"md5sum", b"sha1sum", b"hexdump", b"tee", b"which", b"grep",
         b"sed", b"awk", b"find", b"stat", b"uptime",
+        // Network applets: these are the reason the socket facade exists, and
+        // without the links `wget http://...` is just "not found".
+        b"wget", b"nc", b"nslookup", b"ping",
     ];
     let mut path_buf = [0u8; 64];
     for a in APPLETS {

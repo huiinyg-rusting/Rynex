@@ -27,7 +27,13 @@ impl TaskStateSegment {
             ist: [0; 7],
             reserved3: 0,
             reserved4: 0,
-            io_map_base: 0,
+            // io_map_base == sizeof(TSS): the I/O permission bitmap starts
+            // exactly at the TSS limit+1, so EVERY byte of it is beyond the
+            // descriptor limit and any ring-3 IN/OUT #GPs. A 0 here puts the
+            // bitmap at offset 0 and, with limit 103, silently grants userland
+            // access to ports 0..~823 (PIC 0x20/21, PIT 0x40, PS2 0x60/64,
+            // RTC 0x70). User processes do port I/O through syscalls only.
+            io_map_base: core::mem::size_of::<TaskStateSegment>() as u16,
         }
     }
 }
@@ -63,7 +69,9 @@ static mut TSS: TaskStateSegment = TaskStateSegment {
     ist: [0; 7],
     reserved3: 0,
     reserved4: 0,
-    io_map_base: 0,
+    // Same reasoning as TaskStateSegment::new(): bitmap beyond the TSS limit
+    // denies all ring-3 port I/O; see the constructor for the details.
+    io_map_base: core::mem::size_of::<TaskStateSegment>() as u16,
 };
 
 /// Top of the *current* task's kernel stack. syscall_entry (context_switch.asm)
@@ -177,6 +185,10 @@ pub fn setup_percpu_gdt(gdt: &mut [u64; 7], tss: &mut TaskStateSegment, ist_stac
     tss.ist[1] = ist_stacks[1];
     tss.ist[2] = ist_stacks[2];
     tss.ist[3] = ist_stacks[3];
+    // Per-CPU TSS storage starts zeroed in BSS, so io_map_base would default
+    // to 0 — which, with the TSS limit at size-1, okays ~824 low I/O ports to
+    // ring 3. Pin it past the limit like TaskStateSegment::new() does.
+    tss.io_map_base = core::mem::size_of::<TaskStateSegment>() as u16;
 
     gdt[0] = 0;
     gdt[1] = KERNEL_CODE;

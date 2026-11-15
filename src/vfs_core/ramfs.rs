@@ -479,6 +479,15 @@ impl VnodeOps for RamFs {
     }
 
     fn truncate(&self, ino: u64, size: u64) -> Result<(), &'static str> {
+        // ftruncate passes an arbitrary u64: a size beyond the blocks[] array
+        // capacity would set block_count past MAX_BLOCKS_PER_INODE, and every
+        // later blocks[block_idx] access (read/write/stat) would walk off the
+        // end of the 1024-entry array. Cap before the block math (which, with
+        // the cap in place, can no longer overflow either).
+        let max_size = MAX_BLOCKS_PER_INODE as u64 * RAMFS_BLOCK as u64;
+        if size > max_size {
+            return Err("EFBIG");
+        }
         let inode_ptr = get_ino(ino).ok_or("bad ino")?;
         let inode = unsafe { &mut *inode_ptr };
         let new_blocks = ((size + RAMFS_BLOCK as u64 - 1) / RAMFS_BLOCK as u64) as usize;
