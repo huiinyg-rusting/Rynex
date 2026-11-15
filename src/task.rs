@@ -1730,6 +1730,14 @@ pub unsafe extern "C" fn timer_interrupt_handler() -> ! {
         "pop rbp",
         "test byte ptr [rsp + 8], 3",
         "jnz 3f",
+        // Kernel→kernel resume via the preempt trampoline. RFLAGS are
+        // deliberately NOT restored here (see schedule_inner's IF=0 design):
+        // re-enabling IF inside this tail would let a nested tick rebuild the
+        // same global TIMER_FRAME_SCRATCH mid-restore and hand the `ret` a
+        // corrupted RIP (observed: rip=0x64, kernel-mode jump to garbage).
+        // Kernel contexts run with IF=0 until they return to user mode or hit
+        // a blocking wait; wake paths front-enqueue with NEED_RESCHED so
+        // deadline-critical tasks are picked promptly despite that.
         "mov rdx, [rsp + 24]",
         "mov rax, [rsp + 0]",
         "mov rsp, rdx",
@@ -2001,7 +2009,13 @@ pub fn wakeup_expired_sleepers() {
                 // Resume on the live regs saved by the last context_switch; do NOT
                 // stamp the zeroed saved_user_regs snapshot (would clobber r15).
                 let _ = TASKS[i].saved_user_regs.take();
-                enqueue_task(TASKS[i].id, TASKS[i].prio);
+                // Front-enqueue + NEED_RESCHED, same as futex_wake: a deadline
+                // wake is latency-critical. Tail-enqueueing behind the runner
+                // fleet let a woken daemon sit 30-40 ticks (observed) before
+                // its first pickup, because the runners cycle the queue and
+                // nothing drains to the tail until their slices all expire.
+                enqueue_task_front(TASKS[i].id, TASKS[i].prio);
+                NEED_RESCHED.store(true, core::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -2885,7 +2899,8 @@ fn pipe_wake_waiters() {
             // saved by the last context switch, not the zeroed saved_user_regs.
             let _ = TASKS[i].saved_user_regs.take();
             let prio = TASKS[i].prio;
-            enqueue_task(TASKS[i].id, prio);
+            enqueue_task_front(TASKS[i].id, prio);
+            NEED_RESCHED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -5949,9 +5964,17 @@ fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 
 
 // ── Sleep ─────────────────────────────────────────────────────────
 
-fn sys_sleep(ticks: u64) -> i64 {
+pub fn sys_sleep(ticks: u64) -> i64 {
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
+
+    // Drop any stale runqueue entry BEFORE marking the task Blocked. The
+    // current task can still be linked into its runqueue (a prior timer tick
+    // re-enqueued it as Ready and a syscall then ran on its slice); leaving
+    // the entry behind lets the scheduler later dequeue a Blocked task and
+    // "resurrect" it with stale kernel regs, corrupting whatever it was
+    // mid-syscall (observed: PIT tick stream died seconds later).
+    remove_from_runqueue(id);
 
     let now = { crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed) };
 
@@ -6548,9 +6571,16 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> i64 {
 
 fn sys_nanosleep(req: *const u64, _rem: *mut u64) -> i64 {
     if req.is_null() { return -EFAULT; }
-    let ns = unsafe { core::ptr::read_volatile(req) };
+    // timespec is {tv_sec, tv_nsec} — the FIRST field is whole seconds, the
+    // second is the nanosecond remainder. Reading only the first field made
+    // every sub-second sleep (the only kind busy daemons like udevd issue)
+    // return instantly and the daemon spin at 100% CPU, starving everything
+    // else: a syscall-context task cannot be timer-preempted.
+    let sec = unsafe { core::ptr::read_volatile(req) };
+    let nsec = unsafe { core::ptr::read_volatile(req.add(1)) };
+    let total_ns = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
     // PIT ticks are 10ms each (100Hz)
-    let ticks = (ns + 9_999_999) / 10_000_000; // ceiling division
+    let ticks = (total_ns + 9_999_999) / 10_000_000; // ceiling division
     if ticks > 0 {
         sys_sleep(ticks);
     }
@@ -8354,18 +8384,15 @@ fn sys_clock_nanosleep(clk_id: u64, flags: u32, req: *const u64, _rem: *mut u64)
     } else {
         (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64)
     };
-    let ticks = (total_ns + 19_999_999) / 20_000_000;
-    // serial::write_str("CLKNS req=");
-    // serial::write_dec(sec as u64);
-    // serial::write_str(".");
-    // serial::write_dec(nsec as u64);
-    // serial::write_str(" ns ticks=");
-    // serial::write_dec(ticks);
-    // serial::write_str("\n");
+    // PIT ticks are 10ms each (100Hz). Round up, and never skip the sleep
+    // entirely: a sub-tick request (e.g. udevd's nanosleep of the remainder of
+    // its poll interval) used to return instantly and the caller would spin
+    // -- and a syscall-context task cannot be timer-preempted, so one spinning
+    // daemon starved the whole system.
+    let ticks = (total_ns + 9_999_999) / 10_000_000;
     if ticks > 0 {
         sys_sleep(ticks);
     }
-    // serial::write_str("CLKNS woke\n");
     0
 }
 

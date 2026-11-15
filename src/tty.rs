@@ -331,7 +331,6 @@ impl VnodeOps for TtyDevice {
             return Ok(0);
         }
         crate::serial::write_str("");
-        let mut wait_count = 0u64;
         loop {
             let n = self.pop_input(buf);
             if n > 0 {
@@ -348,12 +347,13 @@ impl VnodeOps for TtyDevice {
             // syscall (syscall_entry cli + timer_schedule's in_syscall() guard),
             // so a bare spin here would monopolize the CPU and starve every
             // other task (observed: a blocking console read in the runit shell
-            // service froze wthit's threads forever). Yield periodically so the
-            // scheduler runs other tasks; we re-check input on every resume.
-            wait_count += 1;
-            if wait_count % 100000 == 0 {
-                crate::task::yield_now_force();
-            }
+            // service froze with its threads forever). Sleep one PIT tick per
+            // iteration and re-check input on every resume -- and, critically,
+            // a BLOCKED reader lets the scheduler reach its idle loop
+            // (sti; hlt), which is what actually delivers the pending PIT
+            // edge: with only spinners on the CPU, IF stayed 0 and every
+            // timed wakeup in the system froze.
+            crate::task::sys_sleep(1);
         }
     }
 
