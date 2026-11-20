@@ -2535,6 +2535,7 @@ pub const SYS_rynex_pci_write: u64 = 2033;
 pub const SYS_rynex_pci_find: u64 = 2034;
 pub const SYS_rynex_request_firmware: u64 = 2035;
 pub const SYS_rynex_ipc_peek: u64 = 2036;
+pub const SYS_rynex_mmio_map: u64 = 2037;
 
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -2718,6 +2719,7 @@ SYS_gettimeofday => sys_gettimeofday(arg1 as *mut u64, arg2 as *mut u64),
         // SYS_rynex_ipc_recv_ex instead. Packed identically to recv_ex: the
         // reply token in the high 32 bits, the length in the low 32.
         SYS_rynex_ipc_peek => crate::ipc::ipc_peek_ex_user(arg1 as u64, arg2 as *mut u8, arg3 as usize),
+        SYS_rynex_mmio_map => sys_mmio_map(arg1, arg2),
         SYS_rynex_port_in => sys_port_in(arg1 as u16, arg2 as u32),
         SYS_rynex_port_out => sys_port_out(arg1 as u16, arg2 as u32, arg3 as u64),
         SYS_rynex_irq_register => sys_irq_register(arg1 as u8, arg2 as *mut u32),
@@ -3782,6 +3784,77 @@ fn sys_dma_free(packed: u64) -> i64 {
     let alloc = { &mut *crate::memory::allocator() };
     alloc.free(phys << 12, order);
     0
+}
+
+/// Map a device MMIO range into the caller's address space. arg1 = physical
+/// base (page-aligned), arg2 = page count. Returns the same packed encoding
+/// as sys_dma_alloc: (phys_page_number << 32) | user_va, so the caller can
+/// both reach the registers at the VA and hand the PA back to hardware code
+/// paths that expect one.
+///
+/// This is infrastructure, not a driver: it deliberately knows nothing about
+/// any device. Drivers stay in user space (netd's virtio/e1000 backends);
+/// the kernel only supplies the primitives — port I/O, DMA pages, PCI config
+/// and now uncachable device-memory windows (PTE_CACHE_DISABLE, since device
+/// memory must not be cached the way RAM is).
+fn sys_mmio_map(pa: u64, pages: u64) -> i64 {
+    if !have_priv(PRIV_DMA_ALLOC) { return -EPERM; }
+    let id = cur_task().load(Ordering::SeqCst);
+    if id == 0 { return -EINVAL; }
+    if pa == 0 || pa & 0xFFF != 0 { return -EINVAL; }
+    let pages = if pages == 0 { 1 } else { pages.min(64) };
+    let size = pages * 0x1000;
+
+    let pml4 = task_ref(id).pml4;
+    let base = 0x5000_0000u64;
+    let limit = 0x6000_0000u64;
+    let mut chosen = 0u64;
+    {
+        let mut candidate = base;
+        'search: while candidate + size <= limit {
+            match vma_first_overlap_end(pml4, candidate, candidate + size) {
+                Some(e) => {
+                    candidate = e;
+                    continue 'search;
+                }
+                None => {
+                    chosen = candidate;
+                    break 'search;
+                }
+            }
+        }
+    }
+    if chosen == 0 { return -ENOMEM; }
+
+    // Device memory: present, user, writable, but NOT cacheable.
+    let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER
+              | crate::paging::PTE_WRITABLE | crate::paging::PTE_CACHE_DISABLE;
+    let mut off = 0u64;
+    while off < size {
+        if crate::paging::PageTableManager::map_into(pml4, chosen + off, pa + off, flags).is_err() {
+            // roll back what was mapped
+            let mut back = 0u64;
+            while back < off {
+                let _ = crate::paging::PageTableManager::unmap_into(pml4, chosen + back);
+                unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + back), options(nostack, preserves_flags)); }
+                back += 0x1000;
+            }
+            return -ENOMEM;
+        }
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + off), options(nostack, preserves_flags)); }
+        off += 0x1000;
+    }
+    // Register a VMA so teardown/CLONE_VM bookkeeping sees the window.
+    if !vma_register(pml4, chosen, chosen + size, flags) {
+        let mut back = 0u64;
+        while back < size {
+            let _ = crate::paging::PageTableManager::unmap_into(pml4, chosen + back);
+            unsafe { core::arch::asm!("invlpg [{}]", in(reg) (chosen + back), options(nostack, preserves_flags)); }
+            back += 0x1000;
+        }
+        return -ENOMEM;
+    }
+    ((pa >> 12) << 32 | (chosen & 0xFFFF_FFFF)) as i64
 }
 
 const PCI_CONFIG_ADDR: u16 = 0xCF8;
