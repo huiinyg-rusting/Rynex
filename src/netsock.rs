@@ -250,17 +250,23 @@ pub fn sock_socket(domain: i32, ty: i32, proto: i32) -> i64 {
     const SOCK_STREAM: i32 = 1;
     const SOCK_DGRAM: i32 = 2;
     const SOCK_RAW: i32 = 3;
+    // glibc/musl (notably musl's DNS resolver) OR these Linux flags into the
+    // socket type. We have no close-on-exec or nonblocking socket state in
+    // the facade, so accept them and keep the base type for dispatch.
+    const SOCK_NONBLOCK: i32 = 0x800;
+    const SOCK_CLOEXEC: i32 = 0x8_0000;
     if domain != AF_INET {
         return -task::EAFNOSUPPORT;
     }
-    if ty != SOCK_STREAM && ty != SOCK_DGRAM && ty != SOCK_RAW {
+    let base_ty = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if base_ty != SOCK_STREAM && base_ty != SOCK_DGRAM && base_ty != SOCK_RAW {
         return -task::ESOCKTYPE;
     }
 
     let mut out = [0u8; 0];
     // For OP_SOCKET the addr field carries the protocol (OP_RAW needs it),
     // since a newly created socket has no peer address yet.
-    let ret = netd_call(OP_SOCKET, 0, proto as u32, 0, ty as u16, &[], &mut out);
+    let ret = netd_call(OP_SOCKET, 0, proto as u32, 0, base_ty as u16, &[], &mut out);
     if ret < 0 {
         return ret;
     }
@@ -375,11 +381,11 @@ pub fn poll_readiness(fd: u32, events: i16) -> i64 {
 /// `recvfrom(2)` on a connected socket. `from`/`fromlen` are ignored for now:
 /// netd's proxy does not report peer addresses back through the facade.
 pub fn sock_recv(fd: u32, buf: *mut u8, len: usize, _flags: u16) -> i64 {
+    // `buf` is a kernel buffer here (sys_read validates the user pointer at
+    // its own boundary). Do NOT validate it as a user address: sys_recvmsg
+    // passes its own kernel-stack scratch buffer through this helper.
     if buf.is_null() || len == 0 {
         return 0;
-    }
-    if !task::user_range_valid(buf as u64, len, true) {
-        return -task::EFAULT;
     }
     let idx = match slot_of(fd) {
         Some(i) => i,
@@ -415,11 +421,13 @@ pub fn sock_recvfrom(
     out_addr: &mut u32,
     out_port: &mut u16,
 ) -> i64 {
+    // `buf` is a kernel buffer supplied by the caller (sys_recvfrom forwards
+    // the validated user pointer, sys_recvmsg passes a kernel-stack scratch
+    // buffer). Validating it here as a user address wrongly rejects
+    // recvmsg's internal buffer, which lives in the identity-mapped kernel
+    // half with US=0.
     if buf.is_null() || len == 0 {
         return 0;
-    }
-    if !task::user_range_valid(buf as u64, len, true) {
-        return -task::EFAULT;
     }
     let idx = match slot_of(fd) {
         Some(i) => i,

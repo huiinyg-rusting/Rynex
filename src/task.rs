@@ -4799,9 +4799,6 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         // crate::serial::write_str(" len=0x");
         // crate::serial::write_hex(size);
         // crate::serial::write_str(" -> 0x");
-        // crate::serial::write_hex(final_addr);
-        // crate::serial::write_str("\n");
-
         // Register in the global pool (keyed by pml4, so every CLONE_VM
         // sibling sees it). Fail with ENOMEM if the pool is exhausted.
         if !vma_register(pml4, final_addr, final_addr + size, pte_flags) {
@@ -6243,6 +6240,12 @@ fn sys_sendto(fd: u32, buf: *const u8, len: usize, flags: i32,
 /// TCP) in the reply header, so the caller's sockaddr is filled accurately.
 fn sys_recvfrom(fd: u32, buf: *mut u8, len: usize, flags: i32,
                 from: *mut u8, fromlen: *mut u32) -> i64 {
+    // Validate the user buffer at the syscall boundary. The netsock transport
+    // helper takes kernel buffers (notably sys_recvmsg's scratch buffer) and
+    // must not apply this check itself.
+    if !buf.is_null() && !user_range_valid(buf as u64, len, true) {
+        return -EFAULT;
+    }
     let mut saddr = 0u32;
     let mut sport = 0u16;
     let n = crate::netsock::sock_recvfrom(
@@ -6389,18 +6392,27 @@ fn sys_recvmsg(fd: u32, msg: *mut u8, flags: i32) -> i64 {
     let mut h = [0u8; 32];
     unsafe { core::ptr::copy_nonoverlapping(msg, h.as_mut_ptr(), 32); }
     let name = u64::from_le_bytes(h[0..8].try_into().unwrap()) as *mut u8;
-    let namelenp = u64::from_le_bytes(h[8..16].try_into().unwrap()) as *mut u32;
+    // msghdr.msg_namelen is a socklen_t VALUE, not a pointer (see sys_sendmsg).
+    // Treating 16 as a pointer makes write_sockaddr_in validate address 0x10.
+    let namelen = u32::from_le_bytes(h[8..12].try_into().unwrap());
     let iov = u64::from_le_bytes(h[16..24].try_into().unwrap()) as *mut u8;
     let iovcnt = u64::from_le_bytes(h[24..32].try_into().unwrap()) as usize;
 
-    // Sum what fits, capped by the facade's single-shot limit.
+    // Sum what fits, capped by the facade's single-shot limit. Validate every
+    // destination buffer here, before consuming a datagram, so a bad iovec
+    // cannot silently drop data.
     let mut total = 0usize;
     for i in 0..core::cmp::min(iovcnt, 16) {
         let e = unsafe { iov.add(i * 16) };
         if !user_range_valid(e as u64, 16, false) { return -EFAULT; }
         let mut ie = [0u8; 16];
         unsafe { core::ptr::copy_nonoverlapping(e, ie.as_mut_ptr(), 16); }
-        total += u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        let base = u64::from_le_bytes(ie[0..8].try_into().unwrap()) as *mut u8;
+        let l = u64::from_le_bytes(ie[8..16].try_into().unwrap()) as usize;
+        if l > 0 && (base.is_null() || !user_range_valid(base as u64, l, true)) {
+            return -EFAULT;
+        }
+        total += l;
         if total >= crate::netsock::MAX_XFER { total = crate::netsock::MAX_XFER; break; }
     }
 
@@ -6427,8 +6439,12 @@ fn sys_recvmsg(fd: u32, msg: *mut u8, flags: i32) -> i64 {
         off += take;
         left -= take;
     }
-    if !name.is_null() && !namelenp.is_null() {
-        let _ = write_sockaddr_in(name, namelenp, saddr, sport);
+    if !name.is_null() && namelen as usize >= 16 && user_range_valid(name as u64, 16, true) {
+        let mut sa = [0u8; 16];
+        sa[0] = 2; // AF_INET
+        sa[2..4].copy_from_slice(&sport.to_be_bytes());
+        sa[4..8].copy_from_slice(&saddr.to_be_bytes());
+        unsafe { core::ptr::copy_nonoverlapping(sa.as_ptr(), name, 16); }
     }
     n
 }
@@ -8151,10 +8167,8 @@ pub fn user_range_valid(addr: u64, len: usize, want_write: bool) -> bool {
         // Check user + writable flags (handles 2M huge pages via the PDE).
         match crate::paging::resolve_phys_flags(pml4, page) {
             Some((_, flags)) => {
-                if flags & crate::paging::PTE_USER == 0
-                    || (want_write && flags & crate::paging::PTE_WRITABLE == 0) {
-                    return false;
-                }
+                if flags & crate::paging::PTE_USER == 0 { return false; }
+                if want_write && flags & crate::paging::PTE_WRITABLE == 0 { return false; }
             }
             None => return false,
         }
@@ -8257,11 +8271,16 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
             }
         }
     }
-    let deadline = if timeout == 0 {
+    // The give-up deadline is always the caller's requested timeout. A socket
+    // poller additionally wakes every tick to re-scan (netd cannot push "data
+    // arrived" at a poll sleeper), but that is a wake *interval*, not the
+    // deadline. Conflating the two made every socket poll with a timeout
+    // return 0 after a single 20ms tick — which broke, among others, musl's
+    // DNS resolver: it polls for seconds, we answered "timed out" in 20ms.
+    let hard_deadline = if timeout == 0 {
         0
-    } else if infinite || sleeps_socket {
-        let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        now + 1
+    } else if infinite {
+        u64::MAX
     } else {
         let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         // ms -> ticks at 50Hz; clamp so a sub-tick timeout still sleeps >= 1 tick.
@@ -8300,9 +8319,20 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
         }
 
         let now = crate::pit::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        if !infinite && now >= deadline {
+        if !infinite && now >= hard_deadline {
             return 0;
         }
+
+        // Wake at the deadline; a socket poller wakes every tick instead so it
+        // can issue a fresh readiness query, but it keeps looping until the
+        // real deadline above. Infinite pollers wake every tick as before.
+        let wake = if infinite {
+            now + 1
+        } else if sleeps_socket {
+            core::cmp::min(hard_deadline, now + 1)
+        } else {
+            hard_deadline
+        };
 
         // Block until the deadline (or until pipe_wake_waiters events us in).
         let (ursp, urip, urfl, ufsb) = unsafe {
@@ -8323,7 +8353,7 @@ fn sys_poll(fds: u64, nfds: u64, timeout: i32) -> i64 {
             rip: urip, rflags: urfl,
             cs: 0x23, ss: 0x1B, fs_base: ufsb,
         });
-        t.wakeup_tick = deadline;
+        t.wakeup_tick = wake;
         // Publish the poll context for event-driven wakeups (pipe_wake_waiters):
         // while Blocked, poll_fds != 0 marks this task as a poll sleeper.
         t.poll_fds = fds;
