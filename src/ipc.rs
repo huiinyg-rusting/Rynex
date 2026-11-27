@@ -379,9 +379,12 @@ pub fn ipc_create(name_ptr: *const u8, name_len: usize) -> i64 {
     }
     let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let _g = RawSpin::lock(&IPC_LOCK);
-    // Reject duplicate names.
-    if port_idx_by_name_locked(name).is_some() {
-        return -crate::task::EEXIST;
+    // Named ports are singletons. A service that is replaced by a new process
+    // (the netd hot-swap path) re-creates its name after the old task dies;
+    // returning the *same* port id keeps clients that cached the id working
+    // and lets the new service drain any requests left in the mailbox.
+    if let Some(i) = port_idx_by_name_locked(name) {
+        return port_ref(i).id as i64;
     }
     for i in 0..MAX_PORTS {
         if !port_ref(i).used {

@@ -4401,6 +4401,11 @@ fn privileges_for_path(path: &[u8]) -> u32 {
     if path == b"/etc/service/netd/run" {
         return PRIV_ALL_DRIVER;
     }
+    // hotswapd is the user-space virtio-serial driver (same PCI/port/DMA/IRQ
+    // primitive surface as netd). runsv execs the service copy as "./run".
+    if path == b"/bin/hotswapd" || path == b"/etc/service/hotswapd/run" {
+        return PRIV_ALL_DRIVER;
+    }
     0
 }
 
@@ -4644,25 +4649,35 @@ fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     let oldn = &obuf[..olen];
     let newn = &nbuf[..nlen];
     if oldn == newn { return 0; }
+    // Remember the target inode before the VFS tree changes: after the move
+    // `newn` resolves to the *source* inode, so this is the only chance to
+    // release the old target's vnode.
+    let old_target_ino = crate::vfs_core::resolve_ino(newn).ok();
     match crate::vfs_core::rename(oldn, newn) {
         Ok(()) => {
-            // Keep the flat name table coherent with the VFS tree AND the
-            // vnode table balanced: the renamed-away inode keeps living under
-            // the new name, so drop its old flat entry (and any stale target
-            // flat) and rebind the new name exactly once. Dropping the old
-            // flat first orphans its vnode — free by ino, then re-allocate a
-            // single fresh binding, so the per-cycle pid/status churn does not
-            // leak vnodes (runit renames every respawn cycle).
-            if let Ok(mv_ino) = crate::vfs_core::resolve_ino(newn) {
-                crate::vfs_core::vnode_free_by_ino(mv_ino);
+            // The flat inode table holds the file's data pointer and size.
+            // Rebind the source entry to the new name instead of creating a
+            // fresh empty entry — the latter made every renamed-over file
+            // (e.g. a replaced service ./run) unexecutable.
+            let src_flat = crate::vfs::find_inode(oldn);
+            let tgt_flat = crate::vfs::find_inode(newn);
+            if let Some(ino) = old_target_ino {
+                crate::vfs_core::vnode_free_by_ino(ino);
             }
-            if let Some(old_f) = crate::vfs::find_inode(oldn) {
-                unsafe { crate::vfs::INODES[old_f].used = false; }
+            if let (Some(s), Some(t)) = (src_flat, tgt_flat) {
+                if s != t {
+                    unsafe { crate::vfs::INODES[t].used = false; }
+                }
             }
-            if let Some(tgt_f) = crate::vfs::find_inode(newn) {
-                unsafe { crate::vfs::INODES[tgt_f].used = false; }
+            if let Some(s) = src_flat {
+                unsafe {
+                    let e = &mut crate::vfs::INODES[s];
+                    e.name.fill(0);
+                    for (i, b) in newn.iter().take(e.name.len()).enumerate() {
+                        e.name[i] = *b;
+                    }
+                }
             }
-            let _ = crate::vfs::resolve_or_register(newn);
             0
         }
         Err(_) => -EACCES,
