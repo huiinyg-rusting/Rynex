@@ -4821,7 +4821,9 @@ const PROT_WRITE: i32 = 2;
 const PROT_EXEC: i32 = 4;
 const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 32;
+const USER_VA_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
 
 fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offset: u64) -> i64 {
     if fd != -1 && (flags & MAP_ANONYMOUS) == 0 {
@@ -4849,13 +4851,13 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         crate::klog::end();
     }
 
-    let page_addr = if addr.is_null() {
-        0 // We'll pick an address
-    } else {
-        (addr as u64) & !0xFFF
-    };
-
+    let requested = if addr.is_null() { 0 } else { (addr as u64) & !0xFFF };
+    if length == 0 { return -EINVAL; }
     let size = ((length + 0xFFF) & !0xFFF) as u64;
+    if requested >= USER_VA_LIMIT || size > USER_VA_LIMIT - requested {
+        return -ENOMEM;
+    }
+    let fixed = (flags & MAP_FIXED) != 0;
 
     // Build PTE flags from prot
     let mut pte_flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER;
@@ -4870,45 +4872,47 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
         let idx = task_idx(id);
         let pml4 = TASKS[idx].pml4;
 
-        // Find a free address if none specified
-        let final_addr = if page_addr == 0 {
-            // Scan for a free hole: start at 0x7000000000 (high enough to avoid ELF/stack)
+        // NULL = kernel picks a hole. A non-NULL address is a hint unless
+        // MAP_FIXED is set; in both cases we must not silently overlap an
+        // existing VMA (the old code did, corrupting mallocng's reservations).
+        let final_addr = if requested == 0 {
             let mut candidate = 0x7000_0000u64;
-            let mut found = false;
-            'search: while candidate + size <= 0x0000_7FFF_FFFF_F000 {
-                // Check if candidate overlaps with any VMA of this address space
+            loop {
+                if candidate + size > USER_VA_LIMIT { return -ENOMEM; }
                 match vma_first_overlap_end(pml4, candidate, candidate + size) {
-                    Some(e) => {
-                        candidate = e;
-                        continue 'search;
-                    }
-                    None => {
-                        found = true;
-                        break 'search;
-                    }
+                    Some(e) => candidate = e,
+                    None => break candidate,
                 }
             }
-            if !found {
-                if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
-                    crate::klog::begin(crate::klog::LOG_DEBUG, crate::klog::FAC_VFS);
-                    crate::klog::s("MMAP -> -ENOMEM\n");
-                    crate::klog::end();
-                }
-                return -ENOMEM;
-            }
-            candidate
+        } else if fixed {
+            requested
         } else {
-            page_addr
+            let mut candidate = requested;
+            loop {
+                if candidate + size > USER_VA_LIMIT { return -ENOMEM; }
+                match vma_first_overlap_end(pml4, candidate, candidate + size) {
+                    Some(e) => candidate = e,
+                    None => break candidate,
+                }
+            }
         };
-        // crate::serial::write_str("MMAP-RET req=0x");
-        // crate::serial::write_hex(page_addr);
-        // crate::serial::write_str(" len=0x");
-        // crate::serial::write_hex(size);
-        // crate::serial::write_str(" -> 0x");
+
+        if fixed {
+            // MAP_FIXED replaces whatever lived at the exact address.
+            let mut off = 0u64;
+            while off < size {
+                let _ = crate::paging::PageTableManager::unmap_into(pml4, final_addr + off);
+                core::arch::asm!("invlpg [{}]", in(reg) (final_addr + off),
+                                 options(nostack, preserves_flags));
+                off += 0x1000;
+            }
+            vma_clear_range(pml4, final_addr, final_addr + size);
+        }
+
         // Register in the global pool (keyed by pml4, so every CLONE_VM
         // sibling sees it). Fail with ENOMEM if the pool is exhausted.
         if !vma_register(pml4, final_addr, final_addr + size, pte_flags) {
-            return -ENOMEM; // Too many VMAs
+            return -ENOMEM;
         }
 
         return final_addr as i64;
