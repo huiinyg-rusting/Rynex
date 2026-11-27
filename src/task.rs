@@ -1472,6 +1472,16 @@ pub fn exit_task(code: i32) {
     // a service killed by a signal leaves its mailbox and pending replies
     // pinned until reboot (netd hot-swap churn made this reproducible).
     crate::ipc::cleanup_for_task(id);
+    // A dead driver must not leave a user counter pointer behind: a later IRQ
+    // on a shared line would otherwise write through a recycled address space.
+    unsafe {
+        for i in 0..MAX_DRIVER_IRQS {
+            if DRIVER_IRQ_OWNER[i] == id {
+                DRIVER_IRQ_WORD[i] = 0;
+                DRIVER_IRQ_OWNER[i] = 0;
+            }
+        }
+    }
 
     {
         task_mut(id).state = TaskState::Zombie;
@@ -2981,6 +2991,11 @@ fn sys_port_out(port: u16, width: u32, value: u64) -> i64 {
 // spinning.
 const MAX_DRIVER_IRQS: usize = 16;
 static mut DRIVER_IRQ_WORD: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
+/// Task whose address space `DRIVER_IRQ_WORD[i]` belongs to. QEMU shares IRQ
+/// lines (e1000 and virtio-serial both land on 11), and a later registrant
+/// overwrites the word: without the owner check an edge delivered while the
+/// *other* driver is running writes through the wrong CR3 and page-faults.
+static mut DRIVER_IRQ_OWNER: [u64; MAX_DRIVER_IRQS] = [0; MAX_DRIVER_IRQS];
 
 /// The counters themselves live here, in kernel memory, not in the driver's
 /// user page.
@@ -3009,6 +3024,7 @@ fn sys_irq_register(irq: u8, counter: *mut u32) -> i64 {
     }
     unsafe {
         DRIVER_IRQ_WORD[irq as usize] = counter as u64;
+        DRIVER_IRQ_OWNER[irq as usize] = cur_task().load(Ordering::SeqCst);
         // Start the kernel-side count from what the user page already holds, so
         // a re-register does not make a fresh snapshot look like an edge.
         DRIVER_IRQ_COUNT[irq as usize] = core::ptr::read_volatile(counter);
@@ -3225,7 +3241,11 @@ pub fn driver_irq_edge(irq: u8) {
         // chooses to read it.
         let now = DRIVER_IRQ_COUNT[irq as usize];
         DRIVER_IRQ_COUNT[irq as usize] = now.wrapping_add(1);
-        core::ptr::write_volatile(word as *mut u32, DRIVER_IRQ_COUNT[irq as usize]);
+        // The mirror write is only safe while the registering task's CR3 is
+        // active. The kernel-side counter and futex wake work for every owner.
+        if DRIVER_IRQ_OWNER[irq as usize] == cur_task().load(Ordering::Relaxed) {
+            core::ptr::write_volatile(word as *mut u32, DRIVER_IRQ_COUNT[irq as usize]);
+        }
         let ctr = &raw const DRIVER_IRQ_COUNT[irq as usize];
         let woken = crate::task::futex_wake(ctr, 1);
         // Stamp the edge only when it woke somebody. sys_irq_wait clears the
@@ -6946,6 +6966,12 @@ fn kill_task_zombie(idx: usize, code: i32) {
         if t.id != 0 {
             remove_from_runqueue(t.id);
             crate::ipc::cleanup_for_task(t.id);
+            for i in 0..MAX_DRIVER_IRQS {
+                if DRIVER_IRQ_OWNER[i] == t.id {
+                    DRIVER_IRQ_WORD[i] = 0;
+                    DRIVER_IRQ_OWNER[i] = 0;
+                }
+            }
         }
         // CLONE_CHILD_CLEARTID: clear the TID and wake futex joiners so a
         // signal-killed thread can be joined like a normally-exited one. Only
