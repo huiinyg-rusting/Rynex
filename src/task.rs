@@ -3521,7 +3521,20 @@ fn vma_clear_range(pml4: u64, start: u64, end: u64) {
             } else if end >= e && start > s && start < e {
                 rec.vma.end = start;
             } else if start > s && end < e {
-                rec.vma.end = start;
+                // Hole in the middle: keep [s,start) in this slot and move the
+                // still-live tail [end,e) into a fresh slot. The old code just
+                // shortened the record and silently leaked the tail VMA.
+                if VMA_USED < MAX_VMA_RECORDS {
+                    let flags = rec.vma.flags;
+                    VMAS[VMA_USED] = VmaRec {
+                        pml4,
+                        vma: Vma { start: end, end: e, flags },
+                    };
+                    VMA_USED += 1;
+                    rec.vma.end = start;
+                }
+                // If the pool is full, leave the record untouched rather than
+                // dropping a live mapping; the caller will see ENOMEM.
             }
         }
     }
