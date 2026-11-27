@@ -52,6 +52,10 @@ struct MsgHeader {
 struct Port {
     used: bool,
     id: u64,
+    /// Task that created (or last re-registered) this named port. Used by
+    /// cleanup_for_task so a service that dies without an explicit ipc_close
+    /// does not leave its mailbox and reply channels pinned forever.
+    owner: u64,
     name: [u8; NAME_LEN],
     // Physical pages, one per queued message.
     slots: [u64; PORT_SLOTS],
@@ -67,6 +71,7 @@ impl Port {
         Port {
             used: false,
             id: 0,
+            owner: 0,
             name: [0; NAME_LEN],
             slots: [0; PORT_SLOTS],
             head: 0,
@@ -150,6 +155,9 @@ const MAX_REPLIES: usize = 64;
 /// Acquire, so a set `done` always implies a visible `len`.
 struct ReplySlot {
     used: AtomicBool,
+    /// Owner of the reply token (the calling task). Lets task teardown free a
+    /// slot when the caller dies before the service answers.
+    owner: AtomicU64,
     page: AtomicU64,
     len: AtomicU32,
     done: AtomicBool,
@@ -160,6 +168,7 @@ impl ReplySlot {
     const fn empty() -> Self {
         ReplySlot {
             used: AtomicBool::new(false),
+            owner: AtomicU64::new(0),
             page: AtomicU64::new(0),
             len: AtomicU32::new(0),
             done: AtomicBool::new(false),
@@ -170,19 +179,20 @@ impl ReplySlot {
 
 static mut REPLIES: [ReplySlot; MAX_REPLIES] = [const { ReplySlot::empty() }; MAX_REPLIES];
 
-fn reply_alloc() -> Option<u64> {
+fn reply_alloc(owner: u64) -> Option<u64> {
     let _g = RawSpin::lock(&IPC_LOCK);
-    reply_alloc_locked()
+    reply_alloc_locked(owner)
 }
 
 /// IPC_LOCK must be held.
-fn reply_alloc_locked() -> Option<u64> {
+fn reply_alloc_locked(owner: u64) -> Option<u64> {
     let page = alloc_page()?;
     // Slot 0 is reserved: reply_id 0 means fire-and-forget (no reply
     // expected), so a real synchronous reply token must never be 0.
     for i in 1..MAX_REPLIES {
         if !reply_ref(i).used.load(Ordering::Relaxed) {
             let r = reply_ref(i);
+            r.owner.store(owner, Ordering::Relaxed);
             r.page.store(page, Ordering::Relaxed);
             r.len.store(0, Ordering::Relaxed);
             r.done.store(false, Ordering::Relaxed);
@@ -239,11 +249,11 @@ fn ipc_call_impl(
     kernel_buf: bool,
 ) -> i64 {
     if len > IPC_MSG_MAX { return -crate::task::EMSGSIZE; }
-    let reply_id = match reply_alloc() {
+    let src = crate::task::current_task_id();
+    let reply_id = match reply_alloc(src) {
         Some(id) => id,
         None => return -crate::task::ENOMEM,
     };
-    let src = crate::task::current_task_id();
 
     // Post the request message to the mailbox (block while it is full).
     loop {
@@ -383,7 +393,10 @@ pub fn ipc_create(name_ptr: *const u8, name_len: usize) -> i64 {
     // (the netd hot-swap path) re-creates its name after the old task dies;
     // returning the *same* port id keeps clients that cached the id working
     // and lets the new service drain any requests left in the mailbox.
+    let owner = crate::task::current_task_id();
     if let Some(i) = port_idx_by_name_locked(name) {
+        // A replacement service inherits ownership of the well-known port.
+        port_ref(i).owner = owner;
         return port_ref(i).id as i64;
     }
     for i in 0..MAX_PORTS {
@@ -391,6 +404,7 @@ pub fn ipc_create(name_ptr: *const u8, name_len: usize) -> i64 {
             let p = port_ref(i);
             p.used = true;
             p.id = unsafe { NEXT_PORT_ID };
+            p.owner = owner;
             unsafe { NEXT_PORT_ID += 1; }
             for (j, &c) in name.iter().enumerate() {
                 p.name[j] = c;
@@ -719,27 +733,258 @@ pub fn ipc_close(port_id: u64) -> i64 {
     -crate::task::ESRCH
 }
 
-// ── Legacy shared-memory shim (kept ABI-compatible) ─────────────
-// The old shm_* API was single-partner shared memory. It is retained as a thin
-// shim on top of a fixed port so existing callers keep working while new
-// clients migrate to the port API.
+/// Release IPC resources owned by a task that is exiting (or being killed).
+///
+/// A named port is deliberately kept alive: clients cache its id and a
+/// replacement service re-registers the same name. We only drop ownership and
+/// the messages that can no longer be answered — requests posted by the dying
+/// task, and everything queued on a port it owned — then wake any waiters so
+/// they observe ESRCH/empty instead of sleeping forever on a dead service.
+pub fn cleanup_for_task(pid: u64) {
+    if pid == 0 { return; }
+    let _g = RawSpin::lock(&IPC_LOCK);
+    for i in 0..MAX_PORTS {
+        let p = port_ref(i);
+        if !p.used { continue; }
+        let owned = p.owner == pid;
+        let mut kept = [0u64; PORT_SLOTS];
+        let mut n = 0usize;
+        for j in 0..p.count {
+            let page = p.slots[(p.head + j) % PORT_SLOTS];
+            if page == 0 { continue; }
+            let hdr = msg_hdr_ref(page);
+            if owned || hdr.src_pid == pid {
+                let reply_id = hdr.reply_id;
+                free_page(page);
+                if reply_id != 0 && reply_id < MAX_REPLIES as u64 {
+                    let wake = {
+                        let r = reply_ref(reply_id as usize);
+                        if r.used.load(Ordering::Relaxed) {
+                            Some((&raw const r.wake) as *const u32)
+                        } else {
+                            None
+                        }
+                    };
+                    reply_free_locked(reply_id);
+                    if let Some(w) = wake {
+                        crate::task::futex_wake(w, 1);
+                    }
+                }
+            } else {
+                kept[n] = page;
+                n += 1;
+            }
+        }
+        for j in 0..PORT_SLOTS { p.slots[j] = 0; }
+        for j in 0..n { p.slots[(p.head + j) % PORT_SLOTS] = kept[j]; }
+        p.count = n;
+        if owned {
+            p.owner = 0;
+            crate::task::futex_wake(&raw const p.wake_recv as *const u32, u32::MAX);
+            crate::task::futex_wake(&raw const p.wake_send as *const u32, u32::MAX);
+        }
+    }
+    // Caller died while waiting for an answer nobody can now produce.
+    for i in 1..MAX_REPLIES {
+        let r = reply_ref(i);
+        if r.used.load(Ordering::Relaxed) && r.owner.load(Ordering::Relaxed) == pid {
+            let wake = (&raw const r.wake) as *const u32;
+            reply_free_locked(i as u64);
+            crate::task::futex_wake(wake, 1);
+        }
+    }
+    shm_cleanup_locked(pid);
+}
+
+// ── Shared memory (same syscall ABI, now actually shared) ────────
+// The shm_* syscall numbers and arguments are unchanged; they used to be
+// no-ops. A segment is one physical page keyed by `partner_id`, mapped at a
+// caller-chosen page-aligned user address. Refcounting keeps the page alive
+// until the last mapper tears down or exits.
 
 pub const IPC_VADDR: u64 = 0x6000_0000_0000;
+const MAX_SHM: usize = 16;
 
-/// Map the shm port for a process. Because the new IPC copies through kernel
-/// pages there is no shared mapping needed; this returns success for
-/// compatibility.
-pub fn shm_setup(partner_id: u64, _vaddr: u64) -> i64 {
-    // New IPC needs no setup: keep a placeholder port-name binding by pid so
-    // the old syscall numbers remain harmless no-ops rather than failures.
-    if partner_id == 0 { return -crate::task::EINVAL; }
-    if crate::task::current_task_id() == 0 { return -crate::task::EINVAL; }
+struct ShmSeg {
+    used: bool,
+    key: u64,
+    phys: u64,
+    owner: u64,
+    refs: usize,
+    wake: AtomicU32,
+    /// vaddr used by each attached task (index = pid), 0 when unattached.
+    vaddrs: [u64; crate::task::MAX_TASKS],
+}
+
+impl ShmSeg {
+    const fn empty() -> Self {
+        ShmSeg {
+            used: false,
+            key: 0,
+            phys: 0,
+            owner: 0,
+            refs: 0,
+            wake: AtomicU32::new(0),
+            vaddrs: [0; crate::task::MAX_TASKS],
+        }
+    }
+}
+
+static mut SHMS: [ShmSeg; MAX_SHM] = [const { ShmSeg::empty() }; MAX_SHM];
+/// Last segment used by each task; `shm_wait(timeout)` has no key argument.
+static mut SHM_LAST: [u64; crate::task::MAX_TASKS] = [0; crate::task::MAX_TASKS];
+
+fn shm_idx_by_key_locked(key: u64) -> Option<usize> {
+    (0..MAX_SHM).find(|&i| unsafe { SHMS[i].used && SHMS[i].key == key })
+}
+
+/// IPC_LOCK must be held. Release this task's mapping; free the page only when
+/// no other task still maps it.
+fn shm_detach_locked(pid: u64, key: u64) -> Result<(), i64> {
+    if pid == 0 || pid as usize >= crate::task::MAX_TASKS { return Err(-crate::task::EINVAL); }
+    let i = shm_idx_by_key_locked(key).ok_or(-crate::task::ESRCH)?;
+    let seg = unsafe { &mut SHMS[i] };
+    let vaddr = seg.vaddrs[pid as usize];
+    if vaddr == 0 { return Err(-crate::task::EINVAL); }
+    crate::task::shm_unmap_page(pid, vaddr);
+    seg.vaddrs[pid as usize] = 0;
+    seg.refs = seg.refs.saturating_sub(1);
+    unsafe { SHM_LAST[pid as usize] = 0; }
+    if seg.refs == 0 {
+        free_page(seg.phys);
+        seg.phys = 0;
+        seg.used = false;
+        seg.key = 0;
+        seg.owner = 0;
+        seg.wake.store(0, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Called with IPC_LOCK already held from `cleanup_for_task`.
+fn shm_cleanup_locked(pid: u64) {
+    if pid == 0 || pid as usize >= crate::task::MAX_TASKS { return; }
+    for i in 0..MAX_SHM {
+        let key = unsafe { SHMS[i].key };
+        if unsafe { SHMS[i].used } && key != 0 && unsafe { SHMS[i].vaddrs[pid as usize] } != 0 {
+            let _ = shm_detach_locked(pid, key);
+        }
+    }
+}
+
+/// Attach to (or create) a one-page shared segment. `vaddr == 0` lets the
+/// kernel pick a free page and returns that address; a non-zero `vaddr` must be
+/// page-aligned and returns 0 on success (legacy ABI).
+pub fn shm_setup(partner_id: u64, vaddr: u64) -> i64 {
+    let pid = crate::task::current_task_id();
+    if partner_id == 0 || pid == 0 || vaddr & 0xFFF != 0 { return -crate::task::EINVAL; }
+    let chosen = if vaddr == 0 {
+        match crate::task::shm_pick_vaddr(pid) {
+            a if a > 0 => a as u64,
+            e => return e,
+        }
+    } else {
+        vaddr
+    };
+    let _g = RawSpin::lock(&IPC_LOCK);
+    let existing = shm_idx_by_key_locked(partner_id);
+    let (idx, created) = match existing {
+        Some(i) => (i, false),
+        None => {
+            let free = match (0..MAX_SHM).find(|&i| !unsafe { SHMS[i].used }) {
+                Some(i) => i,
+                None => return -crate::task::ENOMEM,
+            };
+            let page = match alloc_page() {
+                Some(p) => p,
+                None => return -crate::task::ENOMEM,
+            };
+            let seg = unsafe { &mut SHMS[free] };
+            seg.used = true;
+            seg.key = partner_id;
+            seg.phys = page;
+            seg.owner = pid;
+            seg.refs = 0;
+            seg.wake.store(0, Ordering::Relaxed);
+            seg.vaddrs.fill(0);
+            (free, true)
+        }
+    };
+    let flags = crate::paging::PTE_PRESENT | crate::paging::PTE_USER | crate::paging::PTE_WRITABLE;
+    let seg = unsafe { &mut SHMS[idx] };
+    if seg.vaddrs[pid as usize] != 0 {
+        return -crate::task::EBUSY;
+    }
+    if crate::task::shm_map_page(pid, chosen, seg.phys, flags) != 0 {
+        if created {
+            free_page(seg.phys);
+            *seg = ShmSeg::empty();
+        }
+        return -crate::task::ENOMEM;
+    }
+    seg.vaddrs[pid as usize] = chosen;
+    seg.refs += 1;
+    unsafe { SHM_LAST[pid as usize] = partner_id; }
+    if vaddr == 0 { chosen as i64 } else { 0 }
+}
+
+/// Wake every task waiting on the segment. The generation counter also lets a
+/// waiter detect a notify that landed just before it blocked.
+pub fn shm_notify(partner_id: u64) -> i64 {
+    let _g = RawSpin::lock(&IPC_LOCK);
+    let i = match shm_idx_by_key_locked(partner_id) {
+        Some(i) => i,
+        None => return -crate::task::ESRCH,
+    };
+    let wake = {
+        let seg = unsafe { &mut SHMS[i] };
+        seg.wake.fetch_add(1, Ordering::Release);
+        &raw const seg.wake as *const u32
+    };
+    crate::task::futex_wake(wake, u32::MAX);
     0
 }
 
-pub fn shm_notify(_partner_id: u64) -> i64 { 0 }
-pub fn shm_wait(_timeout_ms: u64) -> i64 { 0 }
-pub fn shm_teardown(_partner_id: u64) -> i64 { 0 }
+/// Wait for a notify on this task's last-attached segment. Poll in short slices
+/// so a notify arriving between the generation read and the futex block is not
+/// lost (our futex has no value-aware wait).
+pub fn shm_wait(timeout_ms: u64) -> i64 {
+    let pid = crate::task::current_task_id();
+    if pid == 0 || pid as usize >= crate::task::MAX_TASKS { return -crate::task::EINVAL; }
+    let (i, start) = {
+        let _g = RawSpin::lock(&IPC_LOCK);
+        let key = unsafe { SHM_LAST[pid as usize] };
+        if key == 0 { return -crate::task::EINVAL; }
+        let i = match shm_idx_by_key_locked(key) {
+            Some(i) => i,
+            None => return -crate::task::ESRCH,
+        };
+        (i, unsafe { SHMS[i].wake.load(Ordering::Acquire) })
+    };
+    let wake: *const u32 = unsafe { core::ptr::addr_of!(SHMS[i].wake) as *const u32 };
+    let deadline = if timeout_ms == 0 {
+        0
+    } else {
+        crate::pit::TICKS.load(Ordering::Relaxed)
+            .saturating_add(timeout_ms.saturating_add(9) / 10)
+    };
+    loop {
+        crate::task::block_on_futex_timeout_ms(wake, 10);
+        if unsafe { SHMS[i].wake.load(Ordering::Acquire) } != start { return 0; }
+        if deadline != 0 && crate::pit::TICKS.load(Ordering::Relaxed) >= deadline {
+            return 0; // legacy ABI reported success on timeout
+        }
+    }
+}
+
+pub fn shm_teardown(partner_id: u64) -> i64 {
+    let pid = crate::task::current_task_id();
+    let _g = RawSpin::lock(&IPC_LOCK);
+    match shm_detach_locked(pid, partner_id) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
 
 // Register a kernel service under a well-known name. Returns 0 on success.
 pub fn register_service(name: &[u8]) -> i64 {

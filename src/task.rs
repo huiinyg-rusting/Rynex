@@ -1468,6 +1468,10 @@ pub fn exit_task(code: i32) {
             i += 1;
         }
     }
+    // IPC ports and reply tokens are kernel-owned resources too: without this,
+    // a service killed by a signal leaves its mailbox and pending replies
+    // pinned until reboot (netd hot-swap churn made this reproducible).
+    crate::ipc::cleanup_for_task(id);
 
     {
         task_mut(id).state = TaskState::Zombie;
@@ -3523,6 +3527,75 @@ fn vma_clear_range(pml4: u64, start: u64, end: u64) {
     }
 }
 
+/// Pick a free page-aligned user address for an SHM attachment (`vaddr == 0`).
+pub fn shm_pick_vaddr(pid: u64) -> i64 {
+    if pid == 0 || pid as usize >= MAX_TASKS { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(pid);
+        if TASKS[idx].id != pid || TASKS[idx].state == TaskState::Empty { return -ESRCH; }
+        let pml4 = TASKS[idx].pml4;
+        let mut candidate = 0x7000_0000u64;
+        while candidate + 0x1000 <= 0x0000_7FFF_FFFF_F000 {
+            match vma_first_overlap_end(pml4, candidate, candidate + 0x1000) {
+                Some(e) => candidate = e,
+                None => return candidate as i64,
+            }
+        }
+    }
+    -ENOMEM
+}
+
+/// Map one physical page into `pid` at a page-aligned user address. Exposed
+/// for the real SHM syscall in `ipc.rs`; VMA bookkeeping stays private here.
+pub fn shm_map_page(pid: u64, vaddr: u64, phys: u64, flags: u64) -> i64 {
+    if pid == 0 || pid as usize >= MAX_TASKS { return -EINVAL; }
+    if vaddr == 0 || vaddr & 0xFFF != 0 || vaddr >= 0x0000_7FFF_FFFF_F000 || phys & 0xFFF != 0 {
+        return -EINVAL;
+    }
+    unsafe {
+        let idx = task_idx(pid);
+        if TASKS[idx].id != pid || TASKS[idx].state == TaskState::Empty { return -ESRCH; }
+        let pml4 = TASKS[idx].pml4;
+        if vma_find(pml4, vaddr).is_some() { return -ENOMEM; }
+        if crate::paging::PageTableManager::map_into(pml4, vaddr, phys, flags).is_err() {
+            return -ENOMEM;
+        }
+        core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+        if !vma_register(pml4, vaddr, vaddr + 0x1000, flags) {
+            let _ = crate::paging::PageTableManager::unmap_into(pml4, vaddr);
+            core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+            return -ENOMEM;
+        }
+    }
+    0
+}
+
+/// Undo `shm_map_page`. The physical page itself is owned by the SHM segment,
+/// not by this mapping, so it is not freed here.
+pub fn shm_unmap_page(pid: u64, vaddr: u64) -> i64 {
+    if pid == 0 || pid as usize >= MAX_TASKS || vaddr & 0xFFF != 0 { return -EINVAL; }
+    unsafe {
+        let idx = task_idx(pid);
+        if TASKS[idx].id != pid || TASKS[idx].state == TaskState::Empty { return -ESRCH; }
+        let pml4 = TASKS[idx].pml4;
+        let _ = crate::paging::PageTableManager::unmap_into(pml4, vaddr);
+        core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+        vma_clear_addr(pml4, vaddr);
+    }
+    0
+}
+
+/// Futex wait with a millisecond timeout, rounded up to PIT ticks (100 Hz).
+pub fn block_on_futex_timeout_ms(uaddr: *const u32, timeout_ms: u64) -> bool {
+    let ticks = timeout_ms.saturating_add(9) / 10;
+    let deadline = if ticks == 0 {
+        0
+    } else {
+        crate::pit::TICKS.load(Ordering::Relaxed).saturating_add(ticks)
+    };
+    block_on_futex_until(uaddr, deadline)
+}
+
 /// Duplicate every record of `from` under `to` (fork / non-CLONE_VM clone).
 fn vma_clone(from: u64, to: u64) {
     let _g = VMA_LOCK.lock();
@@ -4643,32 +4716,50 @@ fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     // resolve the parent from VFS ROOT and fail with EACCES.
     let mut obuf = [0u8; 512];
     let mut nbuf = [0u8; 512];
-    let olen = crate::vfs::normalize_path(old, &mut obuf).unwrap_or(0);
-    let nlen = crate::vfs::normalize_path(new, &mut nbuf).unwrap_or(0);
-    if olen == 0 || nlen == 0 { return -ENOENT; }
+    let olen = match crate::vfs::normalize_path(old, &mut obuf) {
+        Some(n) if n > 0 => n,
+        Some(_) => return -ENOENT,
+        None => return -ENAMETOOLONG,
+    };
+    let nlen = match crate::vfs::normalize_path(new, &mut nbuf) {
+        Some(n) if n > 0 => n,
+        Some(_) => return -ENOENT,
+        None => return -ENAMETOOLONG,
+    };
     let oldn = &obuf[..olen];
     let newn = &nbuf[..nlen];
-    if oldn == newn { return 0; }
-    // Remember the target inode before the VFS tree changes: after the move
-    // `newn` resolves to the *source* inode, so this is the only chance to
-    // release the old target's vnode.
-    let old_target_ino = crate::vfs_core::resolve_ino(newn).ok();
+    if oldn == newn {
+        // POSIX: same-path rename is a no-op only if the entry exists.
+        return if crate::vfs_core::resolve_ino(oldn).is_ok() { 0 } else { -ENOENT };
+    }
+    // Capture both sides before the VFS tree changes. After a successful move
+    // `newn` resolves to the source inode, so the old target is unreachable.
+    let src_ino = crate::vfs_core::resolve_ino(oldn).ok();
+    if src_ino.is_none() { return -ENOENT; }
+    let tgt_ino = crate::vfs_core::resolve_ino(newn).ok();
+    let src_flat = crate::vfs::find_inode(oldn);
+    let tgt_flat = crate::vfs::find_inode(newn);
     match crate::vfs_core::rename(oldn, newn) {
         Ok(()) => {
-            // The flat inode table holds the file's data pointer and size.
-            // Rebind the source entry to the new name instead of creating a
-            // fresh empty entry — the latter made every renamed-over file
-            // (e.g. a replaced service ./run) unexecutable.
-            let src_flat = crate::vfs::find_inode(oldn);
-            let tgt_flat = crate::vfs::find_inode(newn);
-            if let Some(ino) = old_target_ino {
-                crate::vfs_core::vnode_free_by_ino(ino);
+            // Free the replaced target's vnode only when it is a genuinely
+            // different inode. Freeing a shared inode would leave the source
+            // (and any open fd) pointing at a recycled vnode slot.
+            if let Some(ti) = tgt_ino {
+                if src_ino != Some(ti) {
+                    crate::vfs_core::vnode_free_by_ino(ti);
+                }
             }
-            if let (Some(s), Some(t)) = (src_flat, tgt_flat) {
-                if s != t {
+            // Drop the old target's flat entry even when the source has no flat
+            // entry: otherwise a stale data pointer stays visible at `newn`.
+            if let Some(t) = tgt_flat {
+                if Some(t) != src_flat {
                     unsafe { crate::vfs::INODES[t].used = false; }
                 }
             }
+            // The flat inode table holds the file's data pointer and size.
+            // Rebind the source entry to the new name instead of allocating a
+            // fresh empty entry — the latter made every renamed-over service
+            // (`./run`) unexecutable after the hot swap.
             if let Some(s) = src_flat {
                 unsafe {
                     let e = &mut crate::vfs::INODES[s];
@@ -6832,10 +6923,12 @@ fn sig_deliver_to_task(idx: usize, sig: i32) -> i64 {
 fn kill_task_zombie(idx: usize, code: i32) {
     unsafe {
         let t = &mut TASKS[idx];
+        let dead_pid = t.id;
         t.exit_code = code;
         t.state = TaskState::Zombie;
         if t.id != 0 {
             remove_from_runqueue(t.id);
+            crate::ipc::cleanup_for_task(t.id);
         }
         // CLONE_CHILD_CLEARTID: clear the TID and wake futex joiners so a
         // signal-killed thread can be joined like a normally-exited one. Only
