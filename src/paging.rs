@@ -1587,11 +1587,22 @@ let mut pdpt_user = false;
 }
 
 // Clone the current process's PML4 for fork.
+/// A virtual range whose PTEs must stay writable and shared across fork
+/// (MAP_SHARED anonymous mappings and the SHM syscall's segments).
+#[derive(Copy, Clone)]
+pub struct ForkSharedRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+pub const MAX_FORK_SHARED_VMAS: usize = 16;
+
 // Lazy sharing: only a new PML4 is allocated; user page tables (PDPT/PD/PT)
-// are shared with the child and reference-counted. All user 4K PTEs are marked
-// read-only (COW) in both parent and child. 2M/1G huge pages (kernel identity
-// map) stay shared writable.
-pub fn cow_fork_pml4(old_pml4: u64) -> Option<u64> {
+// are shared with the child and reference-counted. User 4K PTEs are marked
+// read-only (COW) in both parent and child, except pages inside `shared`,
+// which keep their physical page and writable bit in both address spaces.
+// Kernel identity huge pages stay shared writable.
+pub fn cow_fork_pml4(old_pml4: u64, shared: &[ForkSharedRange]) -> Option<u64> {
     // Serialize the entire COW page-table sharing walk against concurrent page
     // faults and any other page-table mutation (bug 14 / bug 5). PAGING_LOCK.
     let _cow = PAGING_LOCK.lock();
@@ -1705,7 +1716,21 @@ let old_pt_phys = pde & PTE_ADDR_MASK;
                     // must stay writable (PF/DF stacks, BSS, page tables). Only COW
                     // user pages so the parent/child share stays correct.
                     if pte & PTE_USER == 0 { continue; }
+                    let va = ((pml4_idx as u64) << 39)
+                           | ((pdpt_idx as u64) << 30)
+                           | ((pd_idx as u64) << 21)
+                           | ((pt_idx as u64) << 12);
+                    // Both private and shared pages need a reference count so
+                    // that either process exiting cannot free a page still in
+                    // use by the other. For private pages the count also drives
+                    // the COW copy on the next write.
                     fork_share_refc(pte & PTE_ADDR_MASK);
+                    if shared.iter().any(|r| va >= r.start && va < r.end) {
+                        // MAP_SHARED/SHM page: keep the PTE writable in both
+                        // address spaces. The page table itself is shared, so
+                        // a demand fault in either process is visible to both.
+                        continue;
+                    }
                     if pte & PTE_WRITABLE == 0 { continue; }
                     old_pt.0[pt_idx] = pte & !PTE_WRITABLE;
                 }

@@ -245,6 +245,12 @@ pub struct Vma {
 // (mallocng meta reservations no longer exhaust it under stress tests).
 pub const MAX_VMA_RECORDS: usize = 65536;
 
+/// Software-only VMA flag (not a PTE bit): pages in this range must stay
+/// writable and physically shared across fork, i.e. MAP_SHARED semantics.
+/// Bit 63 is PTE_NO_EXECUTE in this kernel, so use 62 for the software-only
+/// shared mapping marker. It is masked out before any PTE is written.
+pub const VMA_SHARED_FLAG: u64 = 1u64 << 62;
+
 #[derive(Copy, Clone)]
 pub struct VmaRec {
     pub pml4: u64,
@@ -3594,7 +3600,9 @@ pub fn shm_map_page(pid: u64, vaddr: u64, phys: u64, flags: u64) -> i64 {
             return -ENOMEM;
         }
         core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
-        if !vma_register(pml4, vaddr, vaddr + 0x1000, flags) {
+        // SHM pages are already shared physical memory; mark the VMA so a
+        // later fork does not silently turn them into private COW copies.
+        if !vma_register(pml4, vaddr, vaddr + 0x1000, flags | VMA_SHARED_FLAG) {
             let _ = crate::paging::PageTableManager::unmap_into(pml4, vaddr);
             core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
             return -ENOMEM;
@@ -3663,6 +3671,30 @@ fn vma_clone(from: u64, to: u64) {
             }
         }
     }
+}
+
+/// Snapshot the MAP_SHARED/SHM ranges so `cow_fork_pml4` can leave those PTEs
+/// writable and physically shared. Collected before taking PAGING_LOCK; the
+/// caller passes the slice by value, so no VMA lock is held during the fork.
+fn fork_shared_ranges(pml4: u64)
+    -> ([crate::paging::ForkSharedRange; crate::paging::MAX_FORK_SHARED_VMAS], usize)
+{
+    use crate::paging::{ForkSharedRange, MAX_FORK_SHARED_VMAS};
+    let mut out = [ForkSharedRange { start: 0, end: 0 }; MAX_FORK_SHARED_VMAS];
+    let mut n = 0usize;
+    let _g = VMA_LOCK.lock();
+    unsafe {
+        for i in 0..VMA_USED {
+            let rec = &VMAS[i];
+            if rec.pml4 == pml4 && (rec.vma.flags & VMA_SHARED_FLAG) != 0
+                && n < MAX_FORK_SHARED_VMAS
+            {
+                out[n] = ForkSharedRange { start: rec.vma.start, end: rec.vma.end };
+                n += 1;
+            }
+        }
+    }
+    (out, n)
 }
 
 /// Drop every record of `pml4` (address space teardown / exec).
@@ -4862,10 +4894,6 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
     if fd != -1 && (flags & MAP_ANONYMOUS) == 0 {
         return -ENOSYS; // File-backed mmap not yet supported
     }
-    if (flags & MAP_SHARED) != 0 {
-        return -ENOSYS; // Shared mmap not yet supported
-    }
-
     let id = cur_task().load(Ordering::SeqCst);
     if id == 0 { return -EINVAL; }
     if crate::klog::get_console_level() >= crate::klog::LOG_DEBUG {
@@ -4944,7 +4972,14 @@ fn sys_mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, _offse
 
         // Register in the global pool (keyed by pml4, so every CLONE_VM
         // sibling sees it). Fail with ENOMEM if the pool is exhausted.
-        if !vma_register(pml4, final_addr, final_addr + size, pte_flags) {
+        // MAP_SHARED is a software-only VMA flag: fork must keep these PTEs
+        // writable and share the physical pages instead of applying COW.
+        let vma_flags = if (flags & MAP_SHARED) != 0 {
+            pte_flags | VMA_SHARED_FLAG
+        } else {
+            pte_flags
+        };
+        if !vma_register(pml4, final_addr, final_addr + size, vma_flags) {
             return -ENOMEM;
         }
 
@@ -5119,8 +5154,9 @@ fn sys_fork() -> i64 {
             }
         };
 
-        // Clone PML4 with COW
-        let child_pml4 = match crate::paging::cow_fork_pml4(parent.pml4) {
+        // Clone PML4 with COW, except MAP_SHARED/SHM ranges.
+        let (shared, shared_n) = fork_shared_ranges(parent.pml4);
+        let child_pml4 = match crate::paging::cow_fork_pml4(parent.pml4, &shared[..shared_n]) {
             Some(p) => p,
             None => {
                 free_stack(kernel_stack, KERNEL_STACK_PAGES);
@@ -5323,7 +5359,8 @@ fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: *mut u64,
         let child_pml4 = if flags & CLONE_VM != 0 {
             parent.pml4
         } else {
-            match crate::paging::cow_fork_pml4(parent.pml4) {
+            let (shared, shared_n) = fork_shared_ranges(parent.pml4);
+            match crate::paging::cow_fork_pml4(parent.pml4, &shared[..shared_n]) {
                 Some(p) => p,
                 None => {
                     free_stack(kernel_stack, KERNEL_STACK_PAGES);
@@ -8274,7 +8311,9 @@ pub fn handle_demand_page(pml4: u64, cr2: u64) -> bool {
             // Zero the page so heap metadata (musl malloc) works correctly
             core::ptr::write_bytes(phys as *mut u8, 0, 4096);
             let page_addr = cr2 & !0xFFF;
-            if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, vma.flags).is_err() {
+            // VMA_SHARED_FLAG is a bookkeeping bit, never a valid PTE bit.
+            let pte_flags = vma.flags & !VMA_SHARED_FLAG;
+            if crate::paging::PageTableManager::map_into(pml4, page_addr, phys, pte_flags).is_err() {
                 return false;
             }
             return true;
